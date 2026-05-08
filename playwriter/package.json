@@ -1,7 +1,7 @@
 {
   "name": "playwriter",
   "description": "",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -11,7 +11,7 @@
     "prepublishOnly": "pnpm build",
     "watch": "tsc -w",
     "cli": "vite-node src/cli.ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc",
     "mcp": "vite-node src/mcp.ts",
     "test": "vitest run -u",
     "test:watch": "vitest"
