@@ -1249,16 +1249,18 @@ export class PlaywrightExecutor {
         // Ghost Browser API - only works in Ghost Browser, mirrors chrome.ghostPublicAPI etc
         chrome: chromeGhostBrowser,
         ...usefulGlobals,
-        // Override process.cwd() to return the session's cwd (where the CLI was invoked)
-        // instead of the relay server's cwd
-        process: this.sessionCwd
-          ? new Proxy(process, {
-              get(target, prop, receiver) {
-                if (prop === 'cwd') return () => self.sessionCwd!
-                return Reflect.get(target, prop, receiver)
-              },
-            })
-          : process,
+        // Expose process with safety overrides:
+        // - cwd() returns the session's cwd instead of the relay server's cwd
+        // - exit() is blocked to prevent killing the relay server
+        // - chdir() is blocked to prevent affecting other sessions
+        process: new Proxy(process, {
+          get(target, prop, receiver) {
+            if (prop === 'cwd') return () => self.sessionCwd || target.cwd()
+            if (prop === 'exit') return () => { throw new Error('process.exit() is not allowed in the sandbox') }
+            if (prop === 'chdir') return () => { throw new Error('process.chdir() is not allowed in the sandbox, use a new session with a different cwd instead') }
+            return Reflect.get(target, prop, receiver)
+          },
+        }),
       }
 
       const vmContext = vm.createContext(vmContextObj)
