@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0
+
+1. **New `sinceLastCall` option for `getLatestLogs()`** — inspect browser logs after every action without seeing duplicate messages:
+   ```bash
+   playwriter -s 1 -e 'console.log(await getLatestLogs({ page, sinceLastCall: true }))'
+   ```
+   The first call returns all buffered console logs and page errors for the page. Later calls return only new entries since the previous `sinceLastCall` read. Logs also persist across navigations, so hydration errors, redirect failures, and startup exceptions are not lost when the page changes.
+2. **CDP logs now rotate automatically** — `~/.playwriter/cdp.jsonl` is capped at 10,000 entries by default to prevent unbounded disk growth. Set `PLAYWRITER_CDP_LOG_MAX_ENTRIES` to tune the cap. Rotation keeps the newest half of the log and writes through an atomic temp-file rename to avoid corrupting the JSONL file.
+3. **More reliable `getLatestLogs({ page })` results** — page runtime errors and console messages emitted by related frame targets now appear in the returned log stream. This makes React and hydration failures visible through `pageerror` entries instead of requiring manual console listeners.
+4. **CLI-created sessions auto-open pages more reliably** — `playwriter session new` can auto-create an initial extension tab even when the shared relay was originally started by MCP. This avoids `No Playwright pages are available` after all enabled tabs have closed.
+5. **Remote status checks send bearer tokens** — `/extensions/status` and `/extension/status` requests now include the configured auth token, so remote relays using `--token` no longer reject status checks with 403 responses.
+6. **Concurrent relay startup no longer crashes on port races** — simultaneous CLI and MCP commands now deduplicate startup work and treat a competing process winning port `19988` as a clean handoff instead of surfacing `EADDRINUSE`.
+7. **Clearer multi-browser names in `playwriter session new`** — browser lists now use full user-agent client hints when available, so Chromium-family browsers such as Chrome Canary can show a more specific name.
+8. **Skill docs prefer `getLatestLogs()` for page diagnostics** — the generated Playwriter skill now tells agents to call `getLatestLogs({ page })` instead of adding manual console listeners that miss errors emitted before listener setup.
+
 ## 0.2.0
 
 1. **New `-f/--file` flag** — execute JavaScript from a file instead of inline `-e` strings:
