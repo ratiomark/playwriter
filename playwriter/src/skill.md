@@ -44,34 +44,6 @@ Reset a session if the browser connection is stale or broken:
 playwriter session reset <sessionId>
 ```
 
-### Direct CDP connection (--direct)
-
-Only use `--direct` when the user explicitly asks for it. This mode requires the user to accept a debugging approval dialog in Chrome, so it cannot be used autonomously.
-
-`--direct` connects to Chrome's DevTools Protocol without the extension. Unlike extension mode, it gives access to **all existing pages** in the browser — no need to enable per tab. Works with any Chromium browser (Chrome, Brave, Arc, Edge, etc.).
-
-The user must first enable debugging in Chrome:
-- Open `chrome://inspect/#remote-debugging` in Chrome, or
-- Launch Chrome with `chrome --remote-debugging-port=9222`
-
-Then create a session:
-
-```bash
-playwriter session new --direct
-```
-
-By default, `context` is bound to the first Chrome profile. If the user has multiple profiles open, use `browser.contexts()` to access other profiles' pages and cookies:
-
-```js
-const contexts = browser.contexts()
-// contexts[0] = first profile, contexts[1] = second profile, etc.
-const otherProfilePage = contexts[1].pages()[0]
-```
-
-`browser.contexts()` only makes sense when using `--direct`. in extension mode there is just one context for each session.
-
-**Limitations:** screen recording (`recording.start/stop`) is unavailable in direct mode.
-
 ### Remote access (control browser from another machine)
 
 Playwriter can control a Chrome browser running on a different machine over the internet. The host machine runs `playwriter serve` with a [traforo](https://traforo.dev) tunnel, and the remote machine connects through the tunnel URL.
@@ -88,6 +60,62 @@ playwriter -s 1 -e "await page.goto('https://example.com')"
 ```
 
 For the full guide (Docker, LAN, MCP config, security), see: https://playwriter.dev/docs/remote-access
+
+### Direct CDP connection (no extension needed)
+
+Playwriter can connect directly to a Chrome instance via the Chrome DevTools Protocol, bypassing the browser extension entirely. This is useful for:
+
+- Chrome running with remote debugging enabled (CI, Docker, headless environments)
+- Cloud browser providers that expose a CDP endpoint (e.g. `wss://xxx.cdp.browser-use.com`)
+- Any service or machine that gives you a `ws://` or `wss://` URL to a Chrome DevTools session
+
+**Prerequisites:** you need a CDP-enabled Chrome. Either:
+
+- Open `chrome://inspect/#remote-debugging` in Chrome
+- Launch Chrome with `--remote-debugging-port=9222`
+- Use `playwriter browser start` (enables debugging automatically)
+- Use a cloud browser provider URL (no local Chrome needed)
+
+**CLI usage:**
+
+```bash
+# Auto-discover local Chrome instances with debugging enabled
+playwriter session new --direct
+
+# Connect to a specific CDP endpoint (local or cloud browser provider)
+playwriter session new --direct ws://localhost:9222/devtools/browser/...
+playwriter session new --direct wss://xxx.cdp.browser-use.com
+
+# Connect to a remote Chrome instance (host:port auto-resolves to ws://)
+playwriter session new --direct 192.168.1.50:9222
+
+# Then use the session normally
+playwriter -s 1 -e "await page.goto('https://example.com')"
+```
+
+**MCP configuration** (for AI assistants): set the `PLAYWRITER_DIRECT` env var in your MCP client config. If the user provides a CDP URL (like `wss://xxx.cdp.browser-use.com`), use it as the value:
+
+```json
+{
+  "mcpServers": {
+    "playwriter": {
+      "command": "npx",
+      "args": ["-y", "playwriter@latest"],
+      "env": {
+        "PLAYWRITER_DIRECT": "wss://xxx.cdp.browser-use.com"
+      }
+    }
+  }
+}
+```
+
+`PLAYWRITER_DIRECT` accepts:
+
+- `1` — auto-discover Chrome on port 9222
+- `ws://` or `wss://` URL — explicit WebSocket endpoint (local or cloud browser provider)
+- `host:port` — resolves via HTTP probe to a ws:// URL
+
+**Limitations:** screen recording (`recording.start`/`recording.stop`) is not available in direct CDP mode since it relies on the extension's `chrome.tabCapture` API.
 
 ### Execute code
 
@@ -213,6 +241,24 @@ start chrome.exe --profile-directory=Default --allowlisted-extension-id=jfeammnj
 ```
 
 You can collaborate with the user - they can help with captchas, difficult elements, or reproducing bugs.
+
+**Direct CDP mode (no extension needed):** Playwriter can connect directly to Chrome's DevTools Protocol, bypassing the extension. This is useful in CI, Docker, headless environments, when Chrome has `--remote-debugging-port=9222`, or with cloud browser providers (e.g. `wss://xxx.cdp.browser-use.com`). If the user provides a CDP URL, set `PLAYWRITER_DIRECT` in the MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "playwriter": {
+      "command": "npx",
+      "args": ["-y", "playwriter@latest"],
+      "env": {
+        "PLAYWRITER_DIRECT": "wss://xxx.cdp.browser-use.com"
+      }
+    }
+  }
+}
+```
+
+`PLAYWRITER_DIRECT` accepts `1` (auto-discover Chrome on port 9222), a `ws://` or `wss://` endpoint (including cloud browser providers), or `host:port`. Screen recording is not available in direct CDP mode since it relies on the extension's `chrome.tabCapture` API.
 
 ## context variables
 
