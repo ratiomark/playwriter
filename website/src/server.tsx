@@ -9,9 +9,11 @@ import { Spiceflow, redirect, json } from 'spiceflow'
 import { router } from 'spiceflow/react'
 import { z } from 'zod'
 import { app as holocronApp } from '@holocron.so/vite/app'
-import { getAuth, getBaseUrl, getSession, requireSession, ensureOrg } from './db.ts'
-import { getActionRequest, parseFormData } from 'spiceflow'
+import { getAuth, getBaseUrl, getSession, requireSession, ensureOrg, getOrgSubscription } from './db.ts'
 import { normalizeAuthRedirectPath } from './auth-redirect.ts'
+import { cloudApp } from './cloud-api.ts'
+import { stripeWebhookApp } from './stripe-webhook.ts'
+import { approveDevice, denyDevice } from './actions.tsx'
 
 const loginQuerySchema = z.object({ callbackURL: z.string().optional() })
 
@@ -19,36 +21,6 @@ const devicePageQuerySchema = z.object({
   user_code: z.string().optional(),
   status: z.enum(['approved', 'denied']).optional(),
 })
-
-const deviceUserCodeSchema = z.object({ userCode: z.string().min(1) })
-
-// ── Server actions for device flow ──────────────────────────────────
-
-async function approveDevice(formData: FormData) {
-  'use server'
-  const actionRequest = getActionRequest()
-  await requireSession(actionRequest)
-  const { userCode } = parseFormData(deviceUserCodeSchema, formData)
-  const auth = getAuth()
-  await auth.api.deviceApprove({
-    body: { userCode },
-    headers: actionRequest.headers,
-  })
-  throw redirect(router.href('/device', { user_code: userCode, status: 'approved' }))
-}
-
-async function denyDevice(formData: FormData) {
-  'use server'
-  const actionRequest = getActionRequest()
-  await requireSession(actionRequest)
-  const { userCode } = parseFormData(deviceUserCodeSchema, formData)
-  const auth = getAuth()
-  await auth.api.deviceDeny({
-    body: { userCode },
-    headers: actionRequest.headers,
-  })
-  throw redirect(router.href('/device', { user_code: userCode, status: 'denied' }))
-}
 
 // ── OAuth redirect helper ───────────────────────────────────────────
 
@@ -134,7 +106,9 @@ export const app = new Spiceflow()
     if (!session) throw redirect('/login')
 
     const orgInfo = await ensureOrg(session.userId, session.user.name)
+    const subscription = await getOrgSubscription(orgInfo.id)
     const { SignOutButton } = await import('./components/sign-out-button.tsx')
+    const { BillingPanel } = await import('./components/billing-panel.tsx')
 
     return (
       <div className="mx-auto max-w-3xl px-6 py-10">
@@ -148,13 +122,7 @@ export const app = new Spiceflow()
           </p>
           <p className="text-sm text-muted-foreground mt-1">Organization: {orgInfo.name}</p>
         </div>
-        <div className="rounded-lg border border-border p-8 text-center">
-          <h2 className="text-lg font-semibold mb-1">Cloud Browsers</h2>
-          <p className="text-sm text-muted-foreground">
-            Cloud browser management coming soon.
-          </p>
-          {/* TODO(subscription): show subscription status and upgrade CTA */}
-        </div>
+        <BillingPanel subscription={subscription} />
       </div>
     )
   })
@@ -236,6 +204,13 @@ export const app = new Spiceflow()
       )
     },
   })
+
+  // Cloud browser API routes (/api/cloud/*)
+  .use(cloudApp)
+
+  // Stripe webhook (/api/stripe/webhook) — must be before holocron and
+  // outside auth middleware (Stripe authenticates via signature header)
+  .use(stripeWebhookApp)
 
   // Mount holocron last — it handles all docs pages
   .use(holocronApp)

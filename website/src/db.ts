@@ -15,6 +15,7 @@ import { deviceAuthorization, bearer } from 'better-auth/plugins'
 import { drizzleAdapter } from 'better-auth-drizzle-adapter'
 import { json } from 'spiceflow'
 import { ulid } from 'ulid'
+import { ACTIVE_SUBSCRIPTION_STATUSES, type BillingSubscription } from './lib/billing-rules.ts'
 
 // ── Drizzle client via D1 ───────────────────────────────────────────
 
@@ -95,6 +96,39 @@ export async function requireSession(request: RequestHeaders): Promise<Session> 
 }
 
 // ── Org helpers ─────────────────────────────────────────────────────
+
+/** Require session + ensure org in one call. Used by cloud API routes. */
+export async function requireOrgSession(request: RequestHeaders): Promise<{
+  session: Session
+  org: { id: string; name: string }
+}> {
+  const session = await requireSession(request)
+  const org = await ensureOrg(session.userId, session.user.name)
+  return { session, org }
+}
+
+// ── Subscription helpers ────────────────────────────────────────────
+
+/** Get the org's active subscription, if any. Returns a lightweight type
+ *  suitable for the dashboard billing UI. Must NOT be cached — billing
+ *  state must be immediately fresh after a webhook upserts a row. */
+export async function getOrgSubscription(orgId: string): Promise<BillingSubscription | null> {
+  const db = getDb()
+  const sub = await db.query.subscription.findFirst({
+    where: {
+      orgId,
+      status: { in: [...ACTIVE_SUBSCRIPTION_STATUSES] },
+    },
+  })
+  if (!sub) return null
+  return {
+    status: sub.status,
+    quantity: sub.quantity,
+    planName: sub.planName,
+    currentPeriodEnd: sub.currentPeriodEnd,
+    cancelAtPeriodEnd: sub.cancelAtPeriodEnd,
+  }
+}
 
 /** Get or create the user's org. Idempotent and race-safe:
  *  if two concurrent requests both try to create, the loser catches
