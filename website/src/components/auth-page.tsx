@@ -2,7 +2,7 @@
 // Also exposes the shared Playwriter logo used by auth pages.
 
 import type { ReactNode } from 'react'
-import { Head } from 'spiceflow/react'
+import { Head, Link } from 'spiceflow/react'
 import { cn } from '../lib/utils.ts'
 
 export function PlaywriterLogo({ className, imageClassName = 'h-7' }: { className?: string; imageClassName?: string }) {
@@ -39,6 +39,9 @@ export function AuthPage({
         <Head.Meta name="description" content={description} />
       </Head>
       <div className="flex w-full max-w-sm flex-col items-center gap-6 text-center">
+        <Link href="/dashboard">
+          <PlaywriterLogo imageClassName="h-8" />
+        </Link>
         <div className="flex flex-col gap-2">
           <h1 className="text-2xl font-semibold tracking-tight">{visualTitle ?? title}</h1>
           <p className="text-sm text-muted-foreground text-balance">{description}</p>
