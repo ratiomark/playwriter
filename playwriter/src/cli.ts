@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import util from 'node:util'
 import { fileURLToPath } from 'node:url'
-import { goke } from 'goke'
+import { goke, openInBrowser } from 'goke'
 import { z } from 'zod'
 import pc from 'picocolors'
 
@@ -24,6 +24,7 @@ import {
   type ExtensionStatus,
 } from './relay-client.js'
 import { discoverChromeInstances, resolveDirectInput, type DiscoveredInstance } from './chrome-discovery.js'
+import { getCloudClient, loadCloudAuth, saveCloudAuth, CloudClient } from './cloud-client.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -343,7 +344,7 @@ async function executeCode(options: {
 // Unified browser option type used in the multi-browser selection table
 interface BrowserOption {
   key: string
-  type: 'extension' | 'direct'
+  type: 'extension' | 'direct' | 'cloud'
   browser: string
   profile: string
   /** For extension entries */
@@ -352,6 +353,8 @@ interface BrowserOption {
   wsUrl?: string
   /** Raw profile data from discovery (for passing to relay) */
   profiles?: Array<{ name: string; email: string }>
+  /** For cloud entries — active BU session's cloud session ID (if VM is running) */
+  activeCloudSessionId?: string
 }
 
 cli
@@ -361,6 +364,10 @@ cli
   .option('--browser <key>', 'Browser key when multiple browsers are available')
   .option('--patchright', 'Use @playwriter/patchright-core for stealth mode (bypasses bot detection)')
   .option('--direct [endpoint]', 'Use direct CDP connection without the extension. Enable debugging first at chrome://inspect/#remote-debugging or launch Chrome with --remote-debugging-port=9222. Auto-discovers instances or accepts an explicit ws:// endpoint')
+  .option('--proxy <region>', 'Enable residential proxy for cloud browser (e.g. us, de, jp). Disabled by default. Use for anti-detection or geo-targeting.')
+  .option('--custom-proxy <url>', 'Custom proxy for cloud browser (host:port or user:pass@host:port)')
+  .option('--timeout <minutes>', 'Cloud browser timeout in minutes (1-240, default 60)')
+  .option('--disable-proxy-bandwidth-acceleration', 'Allow loading images, video, and fonts when proxy is enabled (they are blocked by default to save proxy bandwidth)')
   .action(async (options) => {
     if (options.patchright) {
       process.env.PLAYWRITER_PATCHRIGHT = '1'
@@ -473,8 +480,53 @@ cli
     }
 
     if (extensions.length === 0) {
+      // Before giving up, check if cloud browsers are available
+      const cloudOptions = await discoverCloudBrowsers()
+      if (cloudOptions.length > 0) {
+        // Cloud-only user: skip extension requirement, show cloud options
+        await ensureRelayForSessionCreation(isLocal)
+        const allOptions: BrowserOption[] = [...cloudOptions]
+
+        if (options.browser) {
+          const selected = allOptions.find((opt) => { return opt.key === options.browser })
+          if (!selected) {
+            console.error(`Browser not found: ${options.browser}`)
+            console.error('Available: ' + allOptions.map((opt) => opt.key).join(', '))
+            process.exit(1)
+          }
+          const serverUrl = await getServerUrl(options.host)
+          // Reuse existing running VM if selected, otherwise create new
+          const result = selected.activeCloudSessionId
+            ? await attachExistingCloudSession({
+              serverUrl,
+              cloudSessionId: selected.activeCloudSessionId,
+              blockProxyResources: computeBlockProxyResources(options),
+              token: options.token,
+            })
+            : await createCloudSession({
+              serverUrl,
+              proxyRegion: options.proxy,
+              customProxy: options.customProxy,
+              timeout: parseCloudTimeout(options.timeout),
+              blockProxyResources: computeBlockProxyResources(options),
+              token: options.token,
+            })
+          console.log(`Session ${result.id} created (cloud). Use with: playwriter -s ${result.id} -e "..."`)
+          if (result.liveUrl) {
+            console.log(pc.dim(`Live view: ${result.liveUrl}`))
+          }
+          return
+        }
+
+        console.log('\nNo local browsers detected, but cloud browsers are available:\n')
+        printBrowserTable(allOptions)
+        console.log('\nRun again with --browser <key>.')
+        process.exit(1)
+      }
+
       console.error('No connected browsers detected. Click the Playwriter extension icon.')
       console.error(pc.dim('Tip: Use --direct to connect via Chrome DevTools Protocol instead.'))
+      console.error(pc.dim('Tip: Run `playwriter cloud login` to use cloud browsers.'))
       process.exit(1)
     }
 
@@ -516,12 +568,15 @@ cli
       return
     }
 
-    // Multiple extensions: also discover direct CDP instances and show unified table.
-    // Only discover locally — remote relay can't reach local Chrome debug ports.
+    // Multiple extensions: also discover direct CDP instances and cloud browsers.
+    // Direct discovery only works locally — remote relay can't reach local Chrome debug ports.
     const directInstances = isLocal ? await (async () => {
       console.log(pc.dim('Discovering additional Chrome instances...'))
       return await discoverChromeInstances()
     })() : []
+
+    // Fetch cloud browser slots if user is logged in
+    const cloudOptions = await discoverCloudBrowsers()
 
     const allOptions: BrowserOption[] = [
       ...extensions.map((ext) => {
@@ -536,6 +591,7 @@ cli
       ...directInstances.map((instance) => {
         return instanceToBrowserOption(instance)
       }),
+      ...cloudOptions,
     ]
 
     if (options.browser) {
@@ -550,7 +606,28 @@ cli
 
       try {
         const serverUrl = await getServerUrl(options.host)
-        if (selected.type === 'direct') {
+        if (selected.type === 'cloud') {
+          // Reuse existing running VM if selected, otherwise create new
+          const result = selected.activeCloudSessionId
+            ? await attachExistingCloudSession({
+              serverUrl,
+              cloudSessionId: selected.activeCloudSessionId,
+              blockProxyResources: computeBlockProxyResources(options),
+              token: options.token,
+            })
+            : await createCloudSession({
+              serverUrl,
+              proxyRegion: options.proxy,
+              customProxy: options.customProxy,
+              timeout: parseCloudTimeout(options.timeout),
+              blockProxyResources: computeBlockProxyResources(options),
+              token: options.token,
+            })
+          console.log(`Session ${result.id} created (cloud). Use with: playwriter -s ${result.id} -e "..."`)
+          if (result.liveUrl) {
+            console.log(pc.dim(`Live view: ${result.liveUrl}`))
+          }
+        } else if (selected.type === 'direct') {
           const result = await createDirectSession({ serverUrl, cdpEndpoint: selected.wsUrl!, browser: selected.browser, profiles: selected.profiles, token: options.token })
           console.log(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
           console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
@@ -637,9 +714,231 @@ function formatInstanceProfiles(instance: DiscoveredInstance): string {
     .join(', ')
 }
 
+/** Discover cloud sessions from the website API, if logged in.
+ *  Also adds a "cloud-new" option to create a new cloud browser. */
+async function discoverCloudBrowsers(): Promise<BrowserOption[]> {
+  const client = getCloudClient()
+  if (!client) return []
+
+  try {
+    const { sessions } = await client.getStatus()
+    const options: BrowserOption[] = sessions.map((s) => {
+      return {
+        key: `cloud-${s.index}`,
+        type: 'cloud' as const,
+        browser: 'Chromium',
+        profile: `(running, expires ${new Date(s.timeoutAt).toLocaleTimeString()})`,
+        activeCloudSessionId: s.cloudSessionId,
+      }
+    })
+    // Always offer a "cloud-new" option to spin up a fresh VM
+    options.push({
+      key: 'cloud',
+      type: 'cloud' as const,
+      browser: 'Chromium',
+      profile: '(new cloud browser)',
+    })
+    return options
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    console.error(pc.dim(`Cloud browser discovery failed: ${msg}`))
+    return []
+  }
+}
+
+/** Compute whether to block images/video/fonts for proxy bandwidth savings.
+ *  Enabled by default when proxy or custom-proxy is set, disabled via
+ *  --disable-proxy-bandwidth-acceleration. */
+function computeBlockProxyResources(options: { proxy?: string; customProxy?: string; disableProxyBandwidthAcceleration?: boolean }): boolean | undefined {
+  const proxyEnabled = !!(options.proxy || options.customProxy)
+  if (!proxyEnabled) return undefined // no proxy, no blocking needed
+  if (options.disableProxyBandwidthAcceleration) return false
+  return true
+}
+
+/** Parse a custom proxy string (host:port or user:pass@host:port) into an object. */
+function parseCustomProxy(proxyStr: string): { host: string; port: number; username?: string; password?: string } {
+  // Format: [user:pass@]host:port
+  const atIdx = proxyStr.lastIndexOf('@')
+  let hostPort: string
+  let username: string | undefined
+  let password: string | undefined
+
+  if (atIdx !== -1) {
+    const userPass = proxyStr.slice(0, atIdx)
+    hostPort = proxyStr.slice(atIdx + 1)
+    const colonIdx = userPass.indexOf(':')
+    if (colonIdx !== -1) {
+      username = userPass.slice(0, colonIdx)
+      password = userPass.slice(colonIdx + 1)
+    } else {
+      username = userPass
+    }
+  } else {
+    hostPort = proxyStr
+  }
+
+  const lastColon = hostPort.lastIndexOf(':')
+  if (lastColon === -1) {
+    throw new Error(`Invalid proxy format: missing port in "${proxyStr}". Expected host:port or user:pass@host:port`)
+  }
+  const host = hostPort.slice(0, lastColon)
+  const port = parseInt(hostPort.slice(lastColon + 1), 10)
+  if (isNaN(port)) {
+    throw new Error(`Invalid proxy port in "${proxyStr}"`)
+  }
+
+  return { host, port, username, password }
+}
+
+/** Parse and validate the --timeout CLI option (integer 1-240). */
+function parseCloudTimeout(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined
+  if (!/^\d+$/.test(value)) {
+    throw new Error('--timeout must be an integer from 1 to 240')
+  }
+  const timeout = Number(value)
+  if (timeout < 1 || timeout > 240) {
+    throw new Error('--timeout must be between 1 and 240 minutes')
+  }
+  return timeout
+}
+
+/** Connect to a cloud browser and create a playwriter session via the relay. */
+async function createCloudSession({
+  serverUrl,
+  proxyRegion,
+  customProxy,
+  timeout,
+  blockProxyResources,
+  token,
+}: {
+  serverUrl: string
+  proxyRegion?: string
+  customProxy?: string
+  /** Cloud browser timeout in minutes (1-240, default 60) */
+  timeout?: number
+  /** Block images/video/fonts to save proxy bandwidth (default: true when proxy is enabled) */
+  blockProxyResources?: boolean
+  token?: string
+}): Promise<{ id: string; liveUrl: string | null }> {
+  const client = getCloudClient()
+  if (!client) {
+    throw new Error('Not logged in to cloud. Run `playwriter cloud login` first.')
+  }
+
+  const connectResult = await client.connect({
+    proxyRegion,
+    customProxy: customProxy ? parseCustomProxy(customProxy) : undefined,
+    timeout,
+  })
+
+  if (!connectResult.cdpUrl) {
+    throw new Error('Cloud browser returned no CDP URL. The VM may have failed to start.')
+  }
+
+  // Normalize https:// CDP URL to wss:// for the relay
+  const cdpEndpoint = await resolveDirectInput(connectResult.cdpUrl)
+
+  // Create a playwriter session via the relay using the CDP URL (same as --direct).
+  // Also pass cloud metadata so the relay can track idle timeout and auto-disconnect.
+  const auth = loadCloudAuth()!
+  const cwd = process.cwd()
+  let response: Response
+  try {
+    response = await fetch(`${serverUrl}/cli/session/new`, {
+      method: 'POST',
+      headers: buildAuthHeaders({ token, json: true }),
+      body: JSON.stringify({
+        cdpEndpoint,
+        cwd,
+        browser: 'Chromium (cloud)',
+        cloud: {
+          cloudSessionId: connectResult.cloudSessionId,
+          cloudBaseUrl: auth.baseUrl,
+          cloudToken: auth.token,
+          timeoutAt: connectResult.timeoutAt,
+          blockProxyResources,
+        },
+      }),
+    })
+  } catch (cause) {
+    // Relay session creation failed — stop the cloud VM so we don't leak a paid resource
+    await client.disconnect(connectResult.cloudSessionId).catch(() => {})
+    throw new Error('Failed to create relay session', { cause })
+  }
+
+  if (!response.ok) {
+    await client.disconnect(connectResult.cloudSessionId).catch(() => {})
+    const text = await response.text()
+    throw new Error(`${response.status} ${text}`)
+  }
+  const result = (await response.json()) as { id: string }
+
+  return { id: result.id, liveUrl: connectResult.liveUrl }
+}
+
+/** Reattach to an existing running cloud browser VM instead of creating a new one.
+ *  Fetches the session's cdpUrl from the cloud API and creates a relay session. */
+async function attachExistingCloudSession({
+  serverUrl,
+  cloudSessionId,
+  blockProxyResources,
+  token,
+}: {
+  serverUrl: string
+  cloudSessionId: string
+  blockProxyResources?: boolean
+  token?: string
+}): Promise<{ id: string; liveUrl: string | null }> {
+  const client = getCloudClient()
+  if (!client) {
+    throw new Error('Not logged in to cloud. Run `playwriter cloud login` first.')
+  }
+
+  const session = await client.getSessionStatus(cloudSessionId)
+  if (!session || session.status !== 'active') {
+    throw new Error('Cloud session is no longer active. It may have timed out.')
+  }
+  if (!session.cdpUrl) {
+    throw new Error('Cloud session has no CDP URL available.')
+  }
+
+  const cdpEndpoint = await resolveDirectInput(session.cdpUrl)
+  const auth = loadCloudAuth()!
+  const cwd = process.cwd()
+
+  const response = await fetch(`${serverUrl}/cli/session/new`, {
+    method: 'POST',
+    headers: buildAuthHeaders({ token, json: true }),
+    body: JSON.stringify({
+      cdpEndpoint,
+      cwd,
+      browser: 'Chromium (cloud)',
+      cloud: {
+        cloudSessionId,
+        cloudBaseUrl: auth.baseUrl,
+        cloudToken: auth.token,
+        timeoutAt: session.timeoutAt,
+        blockProxyResources,
+      },
+    }),
+  })
+
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(`${response.status} ${text}`)
+  }
+  const result = (await response.json()) as { id: string }
+
+  return { id: result.id, liveUrl: session.liveUrl }
+}
+
 function printBrowserTable(options: BrowserOption[]): void {
   const typeLabels = options.map((opt) => {
-    return opt.type === 'direct' ? '--direct' : opt.type
+    if (opt.type === 'direct') return '--direct'
+    if (opt.type === 'cloud') return 'cloud'
+    return opt.type
   })
   const keyWidth = Math.max(3, ...options.map((opt) => opt.key.length))
   const typeWidth = Math.max(4, ...typeLabels.map((t) => t.length))
@@ -944,6 +1243,8 @@ cli
       isLocal ? discoverChromeInstances() : Promise.resolve([] as DiscoveredInstance[]),
     ])
 
+    const cloudOptions = await discoverCloudBrowsers()
+
     const allOptions: BrowserOption[] = [
       ...extensions.map((ext) => {
         return {
@@ -955,12 +1256,14 @@ cli
         }
       }),
       ...directInstances.map(instanceToBrowserOption),
+      ...cloudOptions,
     ]
 
     if (allOptions.length === 0) {
       console.log('No browsers detected.\n')
       console.log('  Extension: click the Playwriter icon on a tab to connect')
       console.log('  Direct:    open chrome://inspect/#remote-debugging in Chrome')
+      console.log('  Cloud:     run `playwriter cloud login` to connect cloud browsers')
       return
     }
 
@@ -975,6 +1278,128 @@ cli
       console.log(pc.dim('Chrome may ask to approve the debugging connection.'))
     } else {
       console.log(pc.dim('Use with: playwriter session new [--browser <key>]'))
+    }
+  })
+
+// ── Cloud commands ──────────────────────────────────────────────────
+
+cli
+  .command('cloud login', 'Authenticate with playwriter.dev to use cloud browsers')
+  .option('--base-url <url>', 'Website base URL (default: https://playwriter.dev)')
+  .action(async (options) => {
+    const baseUrl = options.baseUrl || process.env.PLAYWRITER_CLOUD_URL || 'https://playwriter.dev'
+
+    console.log('Requesting device authorization...')
+    const authUrl = new URL('/api/auth/device-authorization/request', baseUrl).toString()
+    const requestRes = await fetch(authUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    if (!requestRes.ok) {
+      const text = await requestRes.text()
+      console.error(`Error: failed to request device code — ${requestRes.status} ${text}`)
+      process.exit(1)
+    }
+    const deviceData = (await requestRes.json()) as {
+      deviceCode: string
+      userCode: string
+      verificationUri: string
+      expiresIn: number
+      interval: number
+    }
+
+    const verificationUrl = `${baseUrl}/device?user_code=${deviceData.userCode}`
+    console.log(`\nOpen this URL in your browser:\n  ${verificationUrl}\n`)
+    console.log(`Code: ${deviceData.userCode}\n`)
+
+    await openInBrowser(verificationUrl)
+
+    console.log('Waiting for approval...')
+    const pollInterval = (deviceData.interval || 5) * 1000
+    const deadline = Date.now() + (deviceData.expiresIn || 300) * 1000
+    const tokenUrl = new URL('/api/auth/device-authorization/verify-device', baseUrl).toString()
+
+    while (Date.now() < deadline) {
+      await new Promise((r) => { setTimeout(r, pollInterval) })
+      const pollRes = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceCode: deviceData.deviceCode }),
+      })
+      if (pollRes.ok) {
+        const tokenData = (await pollRes.json()) as { token?: string }
+        if (tokenData.token) {
+          saveCloudAuth({ token: tokenData.token, baseUrl })
+          console.log(pc.green('\nLogged in successfully!'))
+          console.log('Cloud browsers will now appear in `playwriter session new`.')
+          return
+        }
+      }
+      // 428 = authorization_pending, keep polling
+      if (pollRes.status === 428) {
+        continue
+      }
+      // Other errors (403 denied, 410 expired, etc.)
+      const text = await pollRes.text()
+      console.error(`\nError: Device authorization failed — ${pollRes.status} ${text}`)
+      process.exit(1)
+    }
+
+    console.error('\nError: Device authorization timed out.')
+    process.exit(1)
+  })
+
+cli
+  .command('cloud subscribe', 'Open the subscription page to purchase cloud browser sessions')
+  .action(async () => {
+    const auth = loadCloudAuth()
+    if (!auth) {
+      console.error('Not logged in. Run `playwriter cloud login` first.')
+      process.exit(1)
+    }
+    const subscribeUrl = new URL('/dashboard', auth.baseUrl).toString()
+    console.log(`Open your browser to manage your subscription:\n  ${subscribeUrl}\n`)
+    await openInBrowser(subscribeUrl)
+  })
+
+cli
+  .command('cloud status', 'Show active cloud browser sessions')
+  .action(async () => {
+    const client = getCloudClient()
+    if (!client) {
+      console.error('Not logged in. Run `playwriter cloud login` first.')
+      process.exit(1)
+    }
+
+    try {
+      const { sessions } = await client.getStatus()
+
+      if (sessions.length === 0) {
+        console.log('No active cloud sessions.')
+        console.log(pc.dim('Start one with: playwriter session new --browser cloud'))
+        return
+      }
+
+      const keyWidth = Math.max(3, ...sessions.map((s) => `cloud-${s.index}`.length))
+      console.log('KEY'.padEnd(keyWidth) + '  ' + 'STATUS'.padEnd(10) + '  ' + 'DETAILS')
+      console.log('-'.repeat(keyWidth + 30))
+
+      for (const s of sessions) {
+        const key = `cloud-${s.index}`
+        const timeoutAt = new Date(s.timeoutAt).toLocaleTimeString()
+        console.log(
+          key.padEnd(keyWidth) +
+            '  ' +
+            pc.green('running'.padEnd(10)) +
+            '  ' +
+            `expires ${timeoutAt}`,
+        )
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      console.error(`Error: ${msg}`)
+      process.exit(1)
     }
   })
 

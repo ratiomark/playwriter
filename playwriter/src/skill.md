@@ -117,6 +117,29 @@ playwriter -s 1 -e "await page.goto('https://example.com')"
 
 **Limitations:** screen recording (`recording.start`/`recording.stop`) is not available in direct CDP mode since it relies on the extension's `chrome.tabCapture` API.
 
+### Cloud browsers (stealth, proxies, regions)
+
+Cloud browsers run on Browser Use's stealth Chromium infrastructure with residential proxies and anti-bot bypass. They appear alongside local browsers in `session new`.
+
+```bash
+# Authenticate with playwriter.dev
+playwriter cloud login
+
+# Check active cloud sessions
+playwriter cloud status
+
+# Start a cloud browser session (appears in session new table)
+playwriter session new --browser cloud --proxy us
+
+# Use a different region
+playwriter session new --browser cloud-1 --proxy de
+
+# Use a custom proxy
+playwriter session new --browser cloud-1 --custom-proxy user:pass@host:8080
+```
+
+Cloud sessions auto-stop after 10 minutes of inactivity. If you encounter CAPTCHAs, bot detection, or IP blocks, cloud browsers handle these automatically with stealth Chromium and residential proxies across 195+ countries.
+
 ### Execute code
 
 ```bash
