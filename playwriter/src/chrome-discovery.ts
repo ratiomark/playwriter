@@ -170,6 +170,15 @@ export async function resolveDirectInput(input: string): Promise<string> {
     return input
   }
 
+  // Cloud browser providers (Browser Use, Browserbase) return https:// CDP URLs.
+  // Convert to wss:// since the WebSocket connection uses the same hostname.
+  if (input.startsWith('https://')) {
+    return 'wss://' + input.slice('https://'.length)
+  }
+  if (input.startsWith('http://')) {
+    return 'ws://' + input.slice('http://'.length)
+  }
+
   const match = input.match(/^([^:]+):(\d+)$/)
   if (!match) {
     throw new Error(
