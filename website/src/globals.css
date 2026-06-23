@@ -3,7 +3,9 @@
 @reference "tailwindcss";
 @custom-variant dark (&:where(.dark, .dark *));
 
-:root {
+:root:root:root {
+  --primary: #ff9500;
+  --ring: var(--primary);
   scrollbar-width: thin;
   scrollbar-color: gray transparent;
   scrollbar-gutter: stable;

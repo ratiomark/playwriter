@@ -12,7 +12,9 @@
     "dark": "/favicon-32.png"
   },
   "colors": {
-    "primary": "#FF9500"
+    "primary": "#FF9500",
+    "light": "#FF9500",
+    "dark": "#FF9500"
   },
   "knownPaths": ["/README", "/api/*", "/login", "/dashboard", "/device"],
   "navigation": {
