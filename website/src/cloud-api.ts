@@ -395,12 +395,6 @@ export const cloudApp = new Spiceflow({ basePath: '/api/cloud' })
         )
       }
 
-      // Record creation timestamp for rate limiting before creating the VM.
-      // Done sequentially so we have vm.id for cleanup if anything fails.
-      await db.update(schema.org)
-        .set({ lastCloudCreateAt: Date.now(), updatedAt: Date.now() })
-        .where(orm.eq(schema.org.id, org.id))
-
       let vm: BrowserSession
       try {
         vm = await bu.createBrowser({
@@ -425,12 +419,17 @@ export const cloudApp = new Spiceflow({ basePath: '/api/cloud' })
         )
       }
 
-      // Update the placeholder with the real BU session ID.
-      const updateResult = await db
-        .update(schema.cloudSession)
-        .set({ browserUseSessionId: vm.id })
-        .where(orm.eq(schema.cloudSession.id, cloudSession.id))
-        .returning()
+      // Update placeholder with real BU session ID and record creation
+      // timestamp for rate limiting in one batch (no extra D1 round trip).
+      const [updateResult] = await db.batch([
+        db.update(schema.cloudSession)
+          .set({ browserUseSessionId: vm.id })
+          .where(orm.eq(schema.cloudSession.id, cloudSession.id))
+          .returning(),
+        db.update(schema.org)
+          .set({ lastCloudCreateAt: Date.now(), updatedAt: Date.now() })
+          .where(orm.eq(schema.org.id, org.id)),
+      ])
 
       if (!updateResult.length) {
         // Placeholder was deleted by concurrent stale cleanup; stop the VM.
