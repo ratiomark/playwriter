@@ -33,9 +33,8 @@ export async function enforceProxyBudgets(): Promise<void> {
   const db = getDb()
   const bu = getBrowserUse()
 
-  // 1. Single D1 read: all cloud sessions joined with org + subscription data.
-  //    Only non-pending sessions (real BU VMs) need cost checking.
-  const rows = await db
+   // 1. Single D1 read: all cloud sessions joined with org + subscription data.
+    const rows = await db
     .select({
       session: schema.cloudSession,
       orgId: schema.org.id,
@@ -50,10 +49,6 @@ export async function enforceProxyBudgets(): Promise<void> {
       orm.eq(schema.subscription.orgId, schema.org.id),
       orm.inArray(schema.subscription.status, [...ACTIVE_SUBSCRIPTION_STATUSES]),
     ))
-    .where(
-      // Skip pending placeholder rows (they have no real BU VM yet)
-      orm.not(orm.like(schema.cloudSession.browserUseSessionId, 'pending-%')),
-    )
 
   if (rows.length === 0) return
 
@@ -87,7 +82,7 @@ export async function enforceProxyBudgets(): Promise<void> {
     // so the next cron tick can retry.
     if (result.status === 'rejected') {
       const err = result.reason
-      if (err instanceof BrowserUseApiError && err.status === 404) {
+      if (err instanceof BrowserUseApiError && (err.status === 404 || err.status === 400)) {
         deadSessionIds.push(row.session.id)
       }
       continue

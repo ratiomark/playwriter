@@ -33,65 +33,37 @@ interface CloudSessionStatus {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-const PENDING_PREFIX = 'pending-'
-// Placeholder rows older than 2 minutes are considered stale (VM creation
-// should complete in under 60s). Fresh ones are counted as occupied slots.
-const PENDING_STALE_MS = 2 * 60_000
-
-function isPendingRow(row: typeof schema.cloudSession.$inferSelect): boolean {
-  return row.browserUseSessionId.startsWith(PENDING_PREFIX)
-}
-
 function isUniqueConstraintError(cause: unknown): boolean {
   const message = cause instanceof Error ? cause.message : String(cause)
   return message.includes('UNIQUE constraint failed') || message.includes('SQLITE_CONSTRAINT_UNIQUE')
 }
 
-async function claimCloudSessionSlot({
+/** Try to insert a cloud session row, claiming the first available slot.
+ *  The UNIQUE(orgId, slotIndex) constraint makes this atomic: only one
+ *  concurrent request can own each slot. Returns null if all slots are taken. */
+async function insertCloudSession({
   orgId,
   maxSessions,
+  browserUseSessionId,
 }: {
   orgId: string
   maxSessions: number
+  browserUseSessionId: string
 }): Promise<typeof schema.cloudSession.$inferSelect | null> {
   const db = getDb()
   for (let slotIndex = 1; slotIndex <= maxSessions; slotIndex++) {
-    const placeholderId = `${PENDING_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     try {
       const [row] = await db
         .insert(schema.cloudSession)
-        .values({
-          orgId,
-          slotIndex,
-          browserUseSessionId: placeholderId,
-        })
+        .values({ orgId, slotIndex, browserUseSessionId })
         .returning()
       if (row) return row
     } catch (cause) {
-      if (isUniqueConstraintError(cause)) {
-        continue
-      }
-      throw new Error('Failed to claim cloud session slot', { cause })
+      if (isUniqueConstraintError(cause)) continue
+      throw new Error('Failed to insert cloud session', { cause })
     }
   }
   return null
-}
-
-/** Check if a cloud session row represents an occupied slot.
- *  Returns true if occupied. Does NOT delete stale/dead rows itself;
- *  instead pushes their IDs into deadIds for the caller to batch-delete. */
-function checkSlotOccupied(
-  row: typeof schema.cloudSession.$inferSelect,
-  deadIds: string[],
-): 'occupied' | 'dead' | 'needs-api-check' {
-  if (isPendingRow(row)) {
-    if (Date.now() - row.createdAt < PENDING_STALE_MS) {
-      return 'occupied'
-    }
-    deadIds.push(row.id)
-    return 'dead'
-  }
-  return 'needs-api-check'
 }
 
 /** Parse Browser Use proxyCost string (e.g. "0.05") to integer cents. */
@@ -137,7 +109,7 @@ async function recordFinalCostAndDelete({
 }
 
 /** Check if a cloud session's BU VM is still alive. Returns null if dead.
- *  On confirmed 404: records final cost and pushes ID into deadIds for cleanup.
+ *  On confirmed 404 or 400 (invalid ID): marks as dead for cleanup.
  *  On transient errors (500, network): leaves the row for next cron/status retry. */
 async function resolveActiveSession(
   row: typeof schema.cloudSession.$inferSelect,
@@ -154,9 +126,10 @@ async function resolveActiveSession(
     deadIds.push(row.id)
     return null
   } catch (err) {
-    // Only treat confirmed 404 as dead. Transient errors (500, rate limit,
-    // network) leave the row intact so the next check can retry.
-    if (err instanceof BrowserUseApiError && err.status === 404) {
+    // Treat 404 (VM gone) and 400 (malformed ID, e.g. legacy pending-* rows)
+    // as dead. Transient errors (500, rate limit, network) leave the row
+    // intact so the next check can retry.
+    if (err instanceof BrowserUseApiError && (err.status === 404 || err.status === 400)) {
       deadIds.push(row.id)
     }
     return null
@@ -191,18 +164,15 @@ export const cloudApp = new Spiceflow({ basePath: '/api/cloud' })
     // Check each session against BU API in parallel, collecting dead IDs
     // for a single batch-delete at the end instead of N individual deletes.
     const deadIds: string[] = []
-    const nonPending = sessions.filter((row) => {
-      return !isPendingRow(row)
-    })
     const vmResults = await Promise.all(
-      nonPending.map((row) => {
+      sessions.map((row) => {
         return resolveActiveSession(row, bu, deadIds)
       }),
     )
 
     const result: CloudSessionStatus[] = []
-    for (let i = 0; i < nonPending.length; i++) {
-      const row = nonPending[i]!
+    for (let i = 0; i < sessions.length; i++) {
+      const row = sessions[i]!
       const vm = vmResults[i]
       if (vm) {
         result.push({
@@ -218,7 +188,7 @@ export const cloudApp = new Spiceflow({ basePath: '/api/cloud' })
       }
     }
 
-    // Batch-delete all dead/stale sessions in one D1 call
+    // Batch-delete all dead sessions in one D1 call
     await cleanupDeadSessions(deadIds)
 
     return { sessions: result }
@@ -301,27 +271,17 @@ export const cloudApp = new Spiceflow({ basePath: '/api/cloud' })
       }
 
       const maxSessions = activeSub.quantity
-      // Check each session, collecting dead IDs for batch cleanup.
-      // BU API checks run in parallel; stale pending rows are detected locally.
+
+      // Check each existing session against BU API in parallel, collecting
+      // dead IDs for batch cleanup so we get an accurate active count.
       const deadIds: string[] = []
-      let freshPendingCount = 0
-      const buCheckRows: typeof dbSessions = []
-      for (const row of dbSessions) {
-        const status = checkSlotOccupied(row, deadIds)
-        if (status === 'occupied') {
-          freshPendingCount++
-        } else if (status === 'needs-api-check') {
-          buCheckRows.push(row)
-        }
-      }
       const buResults = await Promise.all(
-        buCheckRows.map((row) => {
+        dbSessions.map((row) => {
           return resolveActiveSession(row, bu, deadIds)
         }),
       )
       await cleanupDeadSessions(deadIds)
-      const buOccupied = buResults.filter(Boolean).length
-      const activeCount = freshPendingCount + buOccupied
+      const activeCount = buResults.filter(Boolean).length
 
       if (activeCount >= maxSessions) {
         throw json(
@@ -332,70 +292,51 @@ export const cloudApp = new Spiceflow({ basePath: '/api/cloud' })
         )
       }
 
-      // Claim a quota slot before creating the paid VM. The unique index on
-      // (orgId, slotIndex) makes this atomic under concurrent requests: only
-      // one request can own each subscription slot.
-      const cloudSession = await claimCloudSessionSlot({ orgId: org.id, maxSessions })
-      if (!cloudSession) {
-        throw json(
-          { error: `Cloud session limit reached. Stop an existing session or upgrade your subscription quantity.` },
-          { status: 403 },
-        )
-      }
+      // Create the BU VM first, then claim a DB slot. If the slot insert
+      // fails (concurrent request took the last slot) or any other error
+      // occurs after VM creation, stop the VM so it doesn't leak.
+      // This trades a rare wasted VM creation for simpler code (one D1
+      // write instead of two) and no placeholder/pending concept.
+      const vm = await bu.createBrowser({
+        // Proxy disabled by default to save cost. Pass --proxy <region> to enable.
+        proxyCountryCode: body.proxyRegion ?? null,
+        timeout: body.timeout ?? 60,
+        customProxy: body.customProxy,
+      })
 
-      // Now create the BU VM. If this fails, clean up the placeholder row.
-      let vm: BrowserSession
       try {
-        vm = await bu.createBrowser({
-          // Proxy disabled by default to save cost. Pass --proxy <region> to enable.
-          proxyCountryCode: body.proxyRegion ?? null,
-          timeout: body.timeout ?? 60,
-          customProxy: body.customProxy,
+        if (!vm.cdpUrl) {
+          throw json(
+            { error: 'Browser Use returned no CDP URL. The VM may have failed to start.' },
+            { status: 502 },
+          )
+        }
+
+        // Claim a slot via UNIQUE(orgId, slotIndex). If all slots are taken
+        // (another request won the race), stop the VM and return 403.
+        const cloudSession = await insertCloudSession({
+          orgId: org.id,
+          maxSessions,
+          browserUseSessionId: vm.id,
         })
-      } catch (cause) {
-        await db
-          .delete(schema.cloudSession)
-          .where(orm.eq(schema.cloudSession.id, cloudSession.id))
-          .limit(1)
-          .catch(() => {})
-        throw new Error('Failed to create cloud browser', { cause })
-      }
+        if (!cloudSession) {
+          throw json(
+            { error: `Cloud session limit reached. Stop an existing session or upgrade your subscription quantity.` },
+            { status: 403 },
+          )
+        }
 
-      if (!vm.cdpUrl) {
-        // No CDP URL means the VM failed to start. Clean up both.
+        return {
+          cloudSessionId: cloudSession.id,
+          cdpUrl: vm.cdpUrl,
+          liveUrl: vm.liveUrl,
+          timeoutAt: vm.timeoutAt,
+        }
+      } catch (err) {
+        // Stop the VM if anything after creation fails (DB error, no CDP
+        // URL, all slots taken) so we don't leak paid Browser Use VMs.
         await bu.stopBrowser(vm.id).catch(() => {})
-        await db
-          .delete(schema.cloudSession)
-          .where(orm.eq(schema.cloudSession.id, cloudSession.id))
-          .limit(1)
-          .catch(() => {})
-        throw json(
-          { error: 'Browser Use returned no CDP URL. The VM may have failed to start.' },
-          { status: 502 },
-        )
-      }
-
-      // Update the placeholder with the real BU session ID.
-      // Verify the row still exists (wasn't deleted by a concurrent stale cleanup).
-      const updateResult = await db
-        .update(schema.cloudSession)
-        .set({ browserUseSessionId: vm.id })
-        .where(orm.eq(schema.cloudSession.id, cloudSession.id))
-        .limit(1)
-        .returning()
-
-      if (!updateResult.length) {
-        // Our placeholder was deleted (e.g. by a concurrent stale cleanup).
-        // Stop the VM since our slot is gone.
-        await bu.stopBrowser(vm.id).catch(() => {})
-        throw new Error('Cloud session slot was reclaimed during VM creation')
-      }
-
-      return {
-        cloudSessionId: cloudSession.id,
-        cdpUrl: vm.cdpUrl,
-        liveUrl: vm.liveUrl,
-        timeoutAt: vm.timeoutAt,
+        throw err
       }
     },
   })
