@@ -1167,7 +1167,22 @@ async function handleCommand(msg: ExtensionCommandMessage): Promise<any> {
   return await chrome.debugger.sendCommand(debuggerSession, msg.params.method, msg.params.params)
 }
 
+// CDP events dropped before sending over WebSocket to the relay.
+// Only events no Playwright API depends on. The relay also filters these server-side
+// for backwards compatibility with old extensions.
+// NOTE: *ExtraInfo events feed Playwright's ResponseExtraInfoTracker (request/response.allHeaders()).
+// webSocketFrame* events feed page.on('websocket'). Both must be forwarded.
+// See: https://github.com/remorses/playwriter/issues/96
+const DROPPED_CDP_EVENTS = new Set([
+  'Network.dataReceived',
+  'Network.resourceChangedPriority',
+])
+
 function onDebuggerEvent(source: chrome.debugger.DebuggerSession, method: string, params: any): void {
+  if (DROPPED_CDP_EVENTS.has(method)) {
+    return
+  }
+
   const tab = source.tabId ? store.getState().tabs.get(source.tabId) : undefined
   if (!tab) return
 

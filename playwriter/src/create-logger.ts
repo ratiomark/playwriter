@@ -7,6 +7,8 @@ import { LOG_FILE_PATH } from './utils.js'
 export type Logger = {
   log(...args: unknown[]): Promise<void>
   error(...args: unknown[]): Promise<void>
+  /** Flush buffered log lines to disk (call before process.exit) */
+  flush(): Promise<void>
   logFilePath: string
 }
 
@@ -20,19 +22,50 @@ export function createFileLogger({ logFilePath }: { logFilePath?: string } = {})
 
   let queue: Promise<void> = Promise.resolve()
 
+  // Batch buffer: accumulate log lines and flush periodically to reduce disk I/O
+  // under high CDP event throughput. See: https://github.com/remorses/playwriter/issues/96
+  const FLUSH_INTERVAL_MS = 500
+  let buffer: string[] = []
+  let flushTimer: ReturnType<typeof setInterval> | undefined
+
+  const flushBuffer = async (): Promise<void> => {
+    if (buffer.length === 0) {
+      return
+    }
+    const lines = buffer
+    buffer = []
+    await fs.promises.appendFile(resolvedLogFilePath, lines.join('\n') + '\n')
+  }
+
   const log = (...args: unknown[]): Promise<void> => {
     const message = args
       .map((arg) =>
         typeof arg === 'string' ? arg : util.inspect(arg, { depth: null, colors: false, maxStringLength: 1000 }),
       )
       .join(' ')
-    queue = queue.then(() => fs.promises.appendFile(resolvedLogFilePath, stripAnsi(message) + '\n'))
+    buffer.push(stripAnsi(message))
+    if (!flushTimer) {
+      flushTimer = setInterval(() => {
+        queue = queue.then(flushBuffer)
+      }, FLUSH_INTERVAL_MS)
+      flushTimer.unref()
+    }
     return queue
+  }
+
+  const flush = async (): Promise<void> => {
+    if (flushTimer) {
+      clearInterval(flushTimer)
+      flushTimer = undefined
+    }
+    queue = queue.then(flushBuffer)
+    await queue
   }
 
   return {
     log,
     error: log,
+    flush,
     logFilePath: resolvedLogFilePath,
   }
 }

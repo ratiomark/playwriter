@@ -66,6 +66,30 @@ function isRestrictedTarget(targetInfo: Protocol.Target.TargetInfo): boolean {
   return blockedPrefixes.some((prefix) => url.startsWith(prefix))
 }
 
+// CDP events dropped entirely (not forwarded to Playwright clients, not logged).
+// Only events that no Playwright API depends on. See: https://github.com/remorses/playwriter/issues/96
+// NOTE: *ExtraInfo events feed Playwright's ResponseExtraInfoTracker for request/response.allHeaders().
+// webSocketFrame* events feed page.on('websocket') frame events. Both must be forwarded.
+const DROPPED_CDP_EVENTS = new Set([
+  'Network.dataReceived',
+  'Network.resourceChangedPriority',
+])
+
+// Events filtered from human-readable logs and cdp.jsonl (superset of dropped events).
+// These are still forwarded to Playwright but excluded from disk logs to reduce I/O.
+const NOISY_LOG_EVENTS = new Set([
+  ...DROPPED_CDP_EVENTS,
+  'Network.requestWillBeSentExtraInfo',
+  'Network.responseReceivedExtraInfo',
+  'Network.requestServedFromCache',
+  'Network.webSocketFrameSent',
+  'Network.webSocketFrameReceived',
+  'Network.webSocketFrameError',
+  'Network.requestWillBeSent',
+  'Network.responseReceived',
+  'Network.loadingFinished',
+])
+
 export type RelayServer = {
   close(): void
   on<K extends keyof RelayServerEvents>(event: K, listener: RelayServerEvents[K]): void
@@ -222,16 +246,7 @@ export async function startPlayWriterCDPRelayServer({
     id?: number
     source?: 'extension' | 'server'
   }) {
-    const noisyEvents = [
-      'Network.requestWillBeSentExtraInfo',
-      'Network.responseReceived',
-      'Network.responseReceivedExtraInfo',
-      'Network.dataReceived',
-      'Network.requestWillBeSent',
-      'Network.loadingFinished',
-    ]
-
-    if (noisyEvents.includes(method)) {
+    if (NOISY_LOG_EVENTS.has(method)) {
       return
     }
 
@@ -1500,11 +1515,19 @@ export async function startPlayWriterCDPRelayServer({
 
             const { method, params, sessionId } = extensionEvent.params
 
-            logCdpJson({
-              timestamp: new Date().toISOString(),
-              direction: 'from-extension',
-              message: { method, params, sessionId },
-            })
+            // Drop high-frequency noise events before logging or forwarding.
+            // Old extensions may still send these; the relay filters them here.
+            if (DROPPED_CDP_EVENTS.has(method)) {
+              return
+            }
+
+            if (!NOISY_LOG_EVENTS.has(method)) {
+              logCdpJson({
+                timestamp: new Date().toISOString(),
+                direction: 'from-extension',
+                message: { method, params, sessionId },
+              })
+            }
 
             logCdpMessage({
               direction: 'from-extension',

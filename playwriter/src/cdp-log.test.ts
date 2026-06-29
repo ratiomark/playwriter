@@ -47,10 +47,6 @@ describe('CDP log rotation', () => {
     // It keeps last 10 (entries 11-20), then entries 21-24 are appended.
     expect(ids).toMatchInlineSnapshot(`
       [
-        11,
-        12,
-        13,
-        14,
         15,
         16,
         17,

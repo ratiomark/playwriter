@@ -72,6 +72,13 @@ export function createCdpLogger({
   // Keep half the entries after rotation so we don't rotate on every write
   const keepAfterRotation = Math.floor(resolvedMaxEntries / 2)
 
+  // Batch buffer: accumulate lines and flush periodically to reduce disk I/O.
+  // Without batching, high-frequency CDP events cause thousands of appendFile
+  // calls per second. See: https://github.com/remorses/playwriter/issues/96
+  const FLUSH_INTERVAL_MS = 500
+  let buffer: string[] = []
+  let flushTimer: ReturnType<typeof setInterval> | undefined
+
   // Atomic rotation: write to temp file then rename to avoid corruption on crash
   const rotate = async (): Promise<void> => {
     try {
@@ -90,21 +97,43 @@ export function createCdpLogger({
     }
   }
 
+  const flushBuffer = async (): Promise<void> => {
+    if (buffer.length === 0) {
+      return
+    }
+    const lines = buffer
+    buffer = []
+    await fs.promises.appendFile(resolvedLogFilePath, lines.join('\n') + '\n')
+    lineCount += lines.length
+    if (lineCount > resolvedMaxEntries) {
+      await rotate()
+    }
+  }
+
   const log = (entry: CdpLogEntry): void => {
     const replacer = createTruncatingReplacer({ maxStringLength: maxLength })
     const line = JSON.stringify(entry, replacer)
-    queue = queue.then(async () => {
-      await fs.promises.appendFile(resolvedLogFilePath, `${line}\n`)
-      lineCount++
-      if (lineCount > resolvedMaxEntries) {
-        await rotate()
-      }
-    })
+    buffer.push(line)
+    if (!flushTimer) {
+      flushTimer = setInterval(() => {
+        queue = queue.then(flushBuffer)
+      }, FLUSH_INTERVAL_MS)
+      flushTimer.unref()
+    }
+  }
+
+  const flush = async (): Promise<void> => {
+    if (flushTimer) {
+      clearInterval(flushTimer)
+      flushTimer = undefined
+    }
+    queue = queue.then(flushBuffer)
+    await queue
   }
 
   return {
     log,
-    flush: () => queue,
+    flush,
     logFilePath: resolvedLogFilePath,
   }
 }
