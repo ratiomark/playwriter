@@ -367,8 +367,8 @@ importers:
         specifier: ^0.7.1
         version: 0.7.1
       goke:
-        specifier: ^6.12.1
-        version: 6.12.3
+        specifier: ^6.13.0
+        version: 6.13.0
       hono:
         specifier: ^4.12.12
         version: 4.12.12
@@ -640,8 +640,8 @@ packages:
   '@asamuzakjp/nwsapi@2.3.9':
     resolution: {integrity: sha512-n8GuYSrI9bF7FFZ/SjhwevlHc8xaVlb/7HmHelnc/PZXBD2ZR49NnN9sMMuDdEGPeeRQ5d0hqlSlEpgCX3Wl0Q==}
 
-  '@azure-rest/core-client@2.6.1':
-    resolution: {integrity: sha512-KzI10qnkWTsVS2yRBUdc8NLUJ1rOm+292mYs7Pe9wqAj/jv4bRskVm1l8XkKeVTN0OCQtrU5RG0Yhjbz1Wmg7g==}
+  '@azure-rest/core-client@2.7.0':
+    resolution: {integrity: sha512-rL0lJqh1E8HLXNgjIw8cRyGAV/v+m6p1xRu/8OhsnmN8XHhwkyYJkAoGM+zrew96v7jZYPmVfy7pv7v4Iccfsg==}
     engines: {node: '>=20.0.0'}
 
   '@azure/abort-controller@2.1.2':
@@ -692,16 +692,16 @@ packages:
     resolution: {integrity: sha512-fCqPIfOcLE+CGqGPd66c8bZpwAji98tZ4JI9i/mlTNTlsIWslCfpg48s/ypyLxZTump5sypjrKn2/kY7q8oAbA==}
     engines: {node: '>=20.0.0'}
 
-  '@azure/msal-browser@5.14.0':
-    resolution: {integrity: sha512-Dfl7hPZe9/JJwRhFFXHq2z1oHYBuGubmff3kWXOsd1AGgyXlqjNYAWuN/1JL/ZrcZBs8TKMjGSil6Rcc7E8VPQ==}
+  '@azure/msal-browser@5.16.0':
+    resolution: {integrity: sha512-Wc75FGnQgYpsm5jsOqn1H8AXsh8vXruA6vwip1nhjrJxwby7juxKAIVLr7csepmHiwdZGr6EwI5BlSc3PizEtQ==}
     engines: {node: '>=0.8.0'}
 
-  '@azure/msal-common@16.9.0':
-    resolution: {integrity: sha512-1MWGjqgUCRAYgLmVFZKp7fs3Rg1TFvIMgywY8ze2olNVvLlJoRThuoziWSDJuwwyJI5L4rnLb9Tyt5D9GvSLPw==}
+  '@azure/msal-common@16.11.0':
+    resolution: {integrity: sha512-UikJOtMwkFpZNzTH6Dqk8UTUPbow15zH3e0UjGYZy69lYENW/S05gMLhbxI2eonz66uALhIljvhsSMEb6+O30g==}
     engines: {node: '>=0.8.0'}
 
-  '@azure/msal-node@5.2.5':
-    resolution: {integrity: sha512-RUuewWk9JvWJS5Yiy8/74Lm1rQAWlrU/qg/Bgtk1jIauVRtnb9XKwS5Xg0J+Whwjesq9EVrBIFgQEP8vHxgezA==}
+  '@azure/msal-node@5.3.1':
+    resolution: {integrity: sha512-sqqv3L1UOI4KDXonNtbxPYUgbSWVXqxvmmb6BUw9n4P/UXgG+cVur3dLWQN4Cz7qQ+UJROCCxMXlksm7gIq0Sw==}
     engines: {node: '>=20'}
 
   '@babel/code-frame@7.27.1':
@@ -1014,8 +1014,8 @@ packages:
     resolution: {integrity: sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw==}
     engines: {node: '>=12'}
 
-  '@csstools/color-helpers@6.0.2':
-    resolution: {integrity: sha512-LMGQLS9EuADloEFkcTBR3BwV/CGHV7zyDxVRtVDTwdI2Ca4it0CCVTT9wCkxSgokjE5Ho41hEPgb8OEUwoXr6Q==}
+  '@csstools/color-helpers@6.1.0':
+    resolution: {integrity: sha512-064IFJdjTfUqnjpCVpMOdbr8FLQBhinbZj6yRv2An2E41O/pLEXqfFRWqGq/SxlE5PEUYTlvWsG2r8MswAVvkg==}
     engines: {node: '>=20.19.0'}
 
   '@csstools/css-calc@3.2.1':
@@ -1025,8 +1025,8 @@ packages:
       '@csstools/css-parser-algorithms': ^4.0.0
       '@csstools/css-tokenizer': ^4.0.0
 
-  '@csstools/css-color-parser@4.1.8':
-    resolution: {integrity: sha512-3chWb7PRLijpJpPIKkDxdu6IBeO5MrFACND57On0j8OPpc0wZibcGc3xAHrSEbOx/KDRyMHoIxGn0w1PhXMYHw==}
+  '@csstools/css-color-parser@4.1.9':
+    resolution: {integrity: sha512-paQcIaOO53Rk5+YrBaBjm/SgrV4INImjo2BT1DtQRYr+XeTRbeAYlS+jxXp9drqvKmtFnWRJKIalDLhZZDu42A==}
     engines: {node: '>=20.19.0'}
     peerDependencies:
       '@csstools/css-parser-algorithms': ^4.0.0
@@ -1038,8 +1038,8 @@ packages:
     peerDependencies:
       '@csstools/css-tokenizer': ^4.0.0
 
-  '@csstools/css-syntax-patches-for-csstree@1.1.5':
-    resolution: {integrity: sha512-oNjBvzLq2GPZtJphCjLqXow/cHySHSgtxvKZb7OqSZ/xHgw6NWNhfad+6AB9cLeVm6eA9d/qMll3JdEHjy6M+A==}
+  '@csstools/css-syntax-patches-for-csstree@1.1.6':
+    resolution: {integrity: sha512-TcJCWFbXLPpJYq6z7bfOyjWYJDiDg2/I4gyUC9pqPNqHFRIey0EB0q0L5cSnQDfWJg8Jd6VadakxdIez/3zkqQ==}
     peerDependencies:
       css-tree: ^3.2.1
     peerDependenciesMeta:
@@ -1858,6 +1858,9 @@ packages:
 
   '@js-joda/core@5.7.0':
     resolution: {integrity: sha512-WBu4ULVVxySLLzK1Ppq+OdfP+adRS4ntmDQT915rzDJ++i95gc2jZkM5B6LWEAwN3lGXpfie3yPABozdD3K3Vg==}
+
+  '@js-joda/core@6.0.1':
+    resolution: {integrity: sha512-Iev3Cfa3MC+06JXXeFzSLew/7yeCXLMhjesyH/BD4EQYlUUDV49Ln3s8hd7p5XK5UesO/dO3K1LFJ7RT7v0Ddg==}
 
   '@js-temporal/polyfill@0.5.1':
     resolution: {integrity: sha512-hloP58zRVCRSpgDxmqCWJNlizAlUgJFqG2ypq79DCvyv9tHjRYMDOcPFjzfl/A1/YxDvRCZz8wvZvmapQnKwFQ==}
@@ -3324,8 +3327,8 @@ packages:
   '@types/react@19.2.7':
     resolution: {integrity: sha512-MWtvHrGZLFttgeEj28VXHxpmwYbor/ATPYbBfSFZEIRK0ecCFLl2Qo55z52Hss+UV9CRN7trSeq1zbgx7YDWWg==}
 
-  '@types/readable-stream@4.0.23':
-    resolution: {integrity: sha512-wwXrtQvbMHxCbBgjHaMGEmImFTQxxpfMOR/ZoQnXxB1woqkUbdLGFDgauo00Py9IudiaqSeiBiulSV9i6XIPig==}
+  '@types/readable-stream@4.0.24':
+    resolution: {integrity: sha512-NRvUNC/JFGPJvqdAfEve8oginbM6V08u5NzLWpG8MwA2kTPOLnqk+wpwuPT+mp3aUsxyuT6m2gnrPuHYCruzEg==}
 
   '@types/responselike@1.0.3':
     resolution: {integrity: sha512-H/+L+UkTV33uf49PH5pCAUBVPNj2nDBXTN+qS1dOwyyg24l3CcicicCA7ca+HMvJBZcFgl5r8e+RR6elsb4Lyw==}
@@ -5234,8 +5237,8 @@ packages:
     resolution: {integrity: sha512-jhIXaOzy1sb8IyocaruWSn1TjmnBVs8Ayhcy83rmxNJ8q2uWKCAj3CnJY+KpGSXCueAPc0i05kVvVKtP1t9S3g==}
     engines: {node: '>=10'}
 
-  goke@6.12.3:
-    resolution: {integrity: sha512-zB5CsmtGFY0a9VjUmGBhQZOf5C/TGQoAKV2gai7mrj1RIOhfEzAjFF60yRI2M6d6OSWtn03JcV2oBe0x9nIQFw==}
+  goke@6.13.0:
+    resolution: {integrity: sha512-dW9kHHku2sfyMJIH4RuF880zEztbRrka90sYt8WfFKHWK6d57VzxP3+cjFaEwnn+srj+kbGG8rg0ak6Z6fyUJg==}
     engines: {node: '>=18'}
 
   google-auth-library@10.5.0:
@@ -7308,17 +7311,17 @@ packages:
   tar-stream@3.1.7:
     resolution: {integrity: sha512-qJj60CXt7IU1Ffyc3NJMjh6EkuCFej46zUqJ4J7pqYlThyd9bO0XBTmcOIhSzZJVWfsLks0+nle/j538YAW9RQ==}
 
-  tarn@3.0.2:
-    resolution: {integrity: sha512-51LAVKUSZSVfI05vjPESNc5vwqqZpbXCsU+/+wxlOrUjk2SnFTt97v9ZgQrD4YmxYW1Px6w2KjaDitCfkvgxMQ==}
+  tarn@3.1.0:
+    resolution: {integrity: sha512-QDihlHbXxQ4SnuQcRd1TPNBHUYo/hafDRDP82COYSVfRcx/3qnfGDkn1WFjozVl+AYr8ZyDKSQ/kIgHH1ri1yg==}
     engines: {node: '>=8.0.0'}
 
   tedious@18.6.2:
     resolution: {integrity: sha512-g7jC56o3MzLkE3lHkaFe2ZdOVFBahq5bsB60/M4NYUbocw/MCrS89IOEQUFr+ba6pb8ZHczZ/VqCyYeYq0xBAg==}
     engines: {node: '>=18'}
 
-  tedious@19.2.1:
-    resolution: {integrity: sha512-pk1Q16Yl62iocuQB+RWbg6rFUFkIyzqOFQ6NfysCltRvQqKwfurgj8v/f2X+CKvDhSL4IJ0cCOfCHDg9PWEEYA==}
-    engines: {node: '>=18.17'}
+  tedious@20.0.0:
+    resolution: {integrity: sha512-bTR0aou0Ghucf0ytvZUJjnKHGKDV8tT57jPYtEkSpfTWFe++4uR1wxJLQ4mh5wlSvAYXzmgBxbI0vaE56qigXw==}
+    engines: {node: '>=22'}
 
   term-size@2.2.1:
     resolution: {integrity: sha512-wK0Ri4fOGjv/XPy8SBHZChl8CM7uMc5VML7SqiQ0zG7+J5Vr+RMQDoHa2CNT6KHUnTGIXH34UDMkPzAUyapBZg==}
@@ -7354,15 +7357,15 @@ packages:
   tldts-core@6.1.86:
     resolution: {integrity: sha512-Je6p7pkk+KMzMv2XXKmAE3McmolOQFdxkKw0R8EYNr7sELW46JqnNeTX8ybPiQgvg1ymCoF8LXs5fzFaZvJPTA==}
 
-  tldts-core@7.4.3:
-    resolution: {integrity: sha512-27ep5H9PzdBrNd5OFM/j3WCU8F3kPwM9D0BOaOf7uYfxMJfyr0K5Tjj69Gri+sZlh2WXd5buIm47NuPF29CDiw==}
+  tldts-core@7.4.5:
+    resolution: {integrity: sha512-pGrwzZDvPwKe+7NNUqAunb6rqTfynr0VOUhCMdqbu5xlvNiszsAJygRzwvpVycdzejlbpY+SWJOn+s75Og7FEA==}
 
   tldts@6.1.86:
     resolution: {integrity: sha512-WMi/OQ2axVTf/ykqCQgXiIct+mSQDFdH2fkwhPwgEwvJ1kSzZRiinb0zF2Xb8u4+OqPChmyI6MEu4EezNJz+FQ==}
     hasBin: true
 
-  tldts@7.4.3:
-    resolution: {integrity: sha512-A3BDQBeeukYPzB4QdQ1DtdlUmp4x2OCH8n5UVhEWbyANxNep8GavottKzd1xYKFJKjUgMyPT7EzOfnBO55s8Sg==}
+  tldts@7.4.5:
+    resolution: {integrity: sha512-RfEzKWcq5fHUOFq7J3rl3Oz6ylKGtcHqUznzj4EcXsxLSIjJcvpbXAQtWGeJQ0xKnimR5e0Cn+cn9TssfMzm+g==}
     hasBin: true
 
   to-regex-range@5.0.1:
@@ -8118,7 +8121,7 @@ snapshots:
   '@asamuzakjp/css-color@4.1.2':
     dependencies:
       '@csstools/css-calc': 3.2.1(@csstools/css-parser-algorithms@4.0.0(@csstools/css-tokenizer@4.0.0))(@csstools/css-tokenizer@4.0.0)
-      '@csstools/css-color-parser': 4.1.8(@csstools/css-parser-algorithms@4.0.0(@csstools/css-tokenizer@4.0.0))(@csstools/css-tokenizer@4.0.0)
+      '@csstools/css-color-parser': 4.1.9(@csstools/css-parser-algorithms@4.0.0(@csstools/css-tokenizer@4.0.0))(@csstools/css-tokenizer@4.0.0)
       '@csstools/css-parser-algorithms': 4.0.0(@csstools/css-tokenizer@4.0.0)
       '@csstools/css-tokenizer': 4.0.0
       lru-cache: 11.5.1
@@ -8136,7 +8139,7 @@ snapshots:
   '@asamuzakjp/nwsapi@2.3.9':
     optional: true
 
-  '@azure-rest/core-client@2.6.1':
+  '@azure-rest/core-client@2.7.0':
     dependencies:
       '@azure/abort-controller': 2.1.2
       '@azure/core-auth': 1.10.1
@@ -8226,8 +8229,8 @@ snapshots:
       '@azure/core-tracing': 1.3.1
       '@azure/core-util': 1.13.1
       '@azure/logger': 1.3.0
-      '@azure/msal-browser': 5.14.0
-      '@azure/msal-node': 5.2.5
+      '@azure/msal-browser': 5.16.0
+      '@azure/msal-node': 5.3.1
       open: 10.2.0
       tslib: 2.8.1
     transitivePeerDependencies:
@@ -8236,7 +8239,7 @@ snapshots:
 
   '@azure/keyvault-common@2.1.0':
     dependencies:
-      '@azure-rest/core-client': 2.6.1
+      '@azure-rest/core-client': 2.7.0
       '@azure/abort-controller': 2.1.2
       '@azure/core-auth': 1.10.1
       '@azure/core-rest-pipeline': 1.24.0
@@ -8250,7 +8253,7 @@ snapshots:
 
   '@azure/keyvault-keys@4.10.2':
     dependencies:
-      '@azure-rest/core-client': 2.6.1
+      '@azure-rest/core-client': 2.7.0
       '@azure/abort-controller': 2.1.2
       '@azure/core-auth': 1.10.1
       '@azure/core-lro': 2.7.2
@@ -8273,17 +8276,17 @@ snapshots:
       - supports-color
     optional: true
 
-  '@azure/msal-browser@5.14.0':
+  '@azure/msal-browser@5.16.0':
     dependencies:
-      '@azure/msal-common': 16.9.0
+      '@azure/msal-common': 16.11.0
     optional: true
 
-  '@azure/msal-common@16.9.0':
+  '@azure/msal-common@16.11.0':
     optional: true
 
-  '@azure/msal-node@5.2.5':
+  '@azure/msal-node@5.3.1':
     dependencies:
-      '@azure/msal-common': 16.9.0
+      '@azure/msal-common': 16.11.0
       jsonwebtoken: 9.0.3
     optional: true
 
@@ -8729,7 +8732,7 @@ snapshots:
     dependencies:
       '@jridgewell/trace-mapping': 0.3.9
 
-  '@csstools/color-helpers@6.0.2':
+  '@csstools/color-helpers@6.1.0':
     optional: true
 
   '@csstools/css-calc@3.2.1(@csstools/css-parser-algorithms@4.0.0(@csstools/css-tokenizer@4.0.0))(@csstools/css-tokenizer@4.0.0)':
@@ -8738,9 +8741,9 @@ snapshots:
       '@csstools/css-tokenizer': 4.0.0
     optional: true
 
-  '@csstools/css-color-parser@4.1.8(@csstools/css-parser-algorithms@4.0.0(@csstools/css-tokenizer@4.0.0))(@csstools/css-tokenizer@4.0.0)':
+  '@csstools/css-color-parser@4.1.9(@csstools/css-parser-algorithms@4.0.0(@csstools/css-tokenizer@4.0.0))(@csstools/css-tokenizer@4.0.0)':
     dependencies:
-      '@csstools/color-helpers': 6.0.2
+      '@csstools/color-helpers': 6.1.0
       '@csstools/css-calc': 3.2.1(@csstools/css-parser-algorithms@4.0.0(@csstools/css-tokenizer@4.0.0))(@csstools/css-tokenizer@4.0.0)
       '@csstools/css-parser-algorithms': 4.0.0(@csstools/css-tokenizer@4.0.0)
       '@csstools/css-tokenizer': 4.0.0
@@ -8751,7 +8754,7 @@ snapshots:
       '@csstools/css-tokenizer': 4.0.0
     optional: true
 
-  '@csstools/css-syntax-patches-for-csstree@1.1.5(css-tree@3.2.1)':
+  '@csstools/css-syntax-patches-for-csstree@1.1.6(css-tree@3.2.1)':
     optionalDependencies:
       css-tree: 3.2.1
     optional: true
@@ -9115,7 +9118,7 @@ snapshots:
     dependencies:
       '@clack/prompts': 1.5.1
       fflate: 0.8.3
-      goke: 6.12.3
+      goke: 6.13.0
       spiceflow: 1.26.0-rsc.5(@modelcontextprotocol/sdk@1.29.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(@types/react@19.2.7)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(vite@8.0.13(@types/node@25.2.0)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0))(zod@4.4.3)
       string-dedent: 3.0.2
       yaml: 2.9.0
@@ -9385,6 +9388,9 @@ snapshots:
       '@jridgewell/sourcemap-codec': 1.5.5
 
   '@js-joda/core@5.7.0':
+    optional: true
+
+  '@js-joda/core@6.0.1':
     optional: true
 
   '@js-temporal/polyfill@0.5.1':
@@ -10831,8 +10837,8 @@ snapshots:
   '@types/mssql@9.1.11':
     dependencies:
       '@types/node': 25.9.4
-      tarn: 3.0.2
-      tedious: 19.2.1
+      tarn: 3.1.0
+      tedious: 20.0.0
     transitivePeerDependencies:
       - supports-color
     optional: true
@@ -10876,7 +10882,7 @@ snapshots:
     dependencies:
       csstype: 3.2.3
 
-  '@types/readable-stream@4.0.23':
+  '@types/readable-stream@4.0.24':
     dependencies:
       '@types/node': 25.9.4
     optional: true
@@ -11447,7 +11453,7 @@ snapshots:
 
   bl@6.1.6:
     dependencies:
-      '@types/readable-stream': 4.0.23
+      '@types/readable-stream': 4.0.24
       buffer: 6.0.3
       inherits: 2.0.4
       readable-stream: 4.7.0
@@ -11770,7 +11776,7 @@ snapshots:
   cssstyle@5.3.7:
     dependencies:
       '@asamuzakjp/css-color': 4.1.2
-      '@csstools/css-syntax-patches-for-csstree': 1.1.5(css-tree@3.2.1)
+      '@csstools/css-syntax-patches-for-csstree': 1.1.6(css-tree@3.2.1)
       css-tree: 3.2.1
       lru-cache: 11.5.1
     optional: true
@@ -13022,7 +13028,7 @@ snapshots:
       merge2: 1.4.1
       slash: 3.0.0
 
-  goke@6.12.3: {}
+  goke@6.13.0: {}
 
   google-auth-library@10.5.0:
     dependencies:
@@ -14309,7 +14315,7 @@ snapshots:
       commander: 11.1.0
       debug: 4.4.3
       rfdc: 1.4.1
-      tarn: 3.0.2
+      tarn: 3.1.0
       tedious: 18.6.2
     transitivePeerDependencies:
       - supports-color
@@ -15659,7 +15665,7 @@ snapshots:
       - react-native-b4a
     optional: true
 
-  tarn@3.0.2:
+  tarn@3.1.0:
     optional: true
 
   tedious@18.6.2:
@@ -15678,12 +15684,12 @@ snapshots:
       - supports-color
     optional: true
 
-  tedious@19.2.1:
+  tedious@20.0.0:
     dependencies:
       '@azure/core-auth': 1.10.1
       '@azure/identity': 4.13.1
       '@azure/keyvault-keys': 4.10.2
-      '@js-joda/core': 5.7.0
+      '@js-joda/core': 6.0.1
       '@types/node': 25.9.4
       bl: 6.1.6
       iconv-lite: 0.7.2
@@ -15725,16 +15731,16 @@ snapshots:
 
   tldts-core@6.1.86: {}
 
-  tldts-core@7.4.3:
+  tldts-core@7.4.5:
     optional: true
 
   tldts@6.1.86:
     dependencies:
       tldts-core: 6.1.86
 
-  tldts@7.4.3:
+  tldts@7.4.5:
     dependencies:
-      tldts-core: 7.4.3
+      tldts-core: 7.4.5
     optional: true
 
   to-regex-range@5.0.1:
@@ -15751,7 +15757,7 @@ snapshots:
 
   tough-cookie@6.0.1:
     dependencies:
-      tldts: 7.4.3
+      tldts: 7.4.5
     optional: true
 
   tr46@0.0.3: {}

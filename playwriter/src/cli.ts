@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import util from 'node:util'
 import { fileURLToPath } from 'node:url'
-import { goke, openInBrowser } from 'goke'
+import { goke, openInBrowser, isAgent } from 'goke'
 import { z } from 'zod'
 import pc from 'picocolors'
 
@@ -1432,8 +1433,8 @@ cli
 cli
   .command('cloud login', 'Authenticate with playwriter.dev to use cloud browsers')
   .option('--base-url <url>', 'Website base URL (default: https://playwriter.dev)')
-  .action(async (options) => {
-    const baseUrl = options.baseUrl || process.env.PLAYWRITER_CLOUD_URL || 'https://playwriter.dev'
+  .action(async (options, ctx) => {
+    const baseUrl = options.baseUrl || ctx.process.env.PLAYWRITER_CLOUD_URL || 'https://playwriter.dev'
 
     // Use the better-auth client SDK so we don't hardcode endpoint URLs.
     // Hardcoded URLs broke before when better-auth changed paths between versions.
@@ -1444,49 +1445,114 @@ cli
       plugins: [deviceAuthorizationClient()],
     })
 
-    console.log('Requesting device authorization...')
+    if (ctx.daemon.isDaemon) {
+      // ── DAEMON: poll until user approves in browser ──
+      const deviceCode = ctx.process.env.PLAYWRITER_DEVICE_CODE!
+      const pollInterval = Number(ctx.process.env.PLAYWRITER_POLL_INTERVAL || 5) * 1000
+      const deadline = Date.now() + 10 * 60 * 1000
+
+      while (Date.now() < deadline) {
+        await new Promise((r) => { setTimeout(r, pollInterval) })
+        const { data: tokenData, error: pollError } = await client.device.token({
+          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+          device_code: deviceCode,
+          client_id: 'playwriter-cli',
+        })
+        if (tokenData?.access_token) {
+          saveCloudAuth({ token: tokenData.access_token, baseUrl })
+          return // daemon exits, PID file is cleaned up
+        }
+        if (pollError?.error === 'authorization_pending' || pollError?.error === 'slow_down') continue
+        if (pollError) return // unrecoverable error, exit
+      }
+      return
+    }
+
+    // ── FOREGROUND CLIENT ──
+    ctx.console.log('Requesting device authorization...')
     const { data: deviceData, error: requestError } = await client.device.code({
       client_id: 'playwriter-cli',
     })
     if (requestError || !deviceData) {
-      console.error(`Error: failed to request device code — ${requestError?.error_description || requestError?.error || 'unknown error'}`)
-      process.exit(1)
+      ctx.console.error(`Error: failed to request device code — ${requestError?.error_description || requestError?.error || 'unknown error'}`)
+      ctx.process.exit(1)
+      return
     }
 
     const verificationUrl = deviceData.verification_uri_complete || `${baseUrl}/device?user_code=${deviceData.user_code}`
-    console.log(`\nOpen this URL in your browser:\n  ${verificationUrl}\n`)
-    console.log(`Code: ${deviceData.user_code}\n`)
+    ctx.console.log(`\nOpen this URL in your browser:\n  ${verificationUrl}\n`)
+    ctx.console.log(`Code: ${deviceData.user_code}\n`)
 
     await openInBrowser(verificationUrl)
 
-    console.log('Waiting for approval...')
-    const pollInterval = (deviceData.interval || 5) * 1000
-    const deadline = Date.now() + (deviceData.expires_in || 300) * 1000
+    // Start daemon to poll in background, pass device_code via env
+    await ctx.daemon.start({
+      timeoutMs: 10 * 60 * 1000,
+      env: {
+        PLAYWRITER_DEVICE_CODE: deviceData.device_code,
+        PLAYWRITER_POLL_INTERVAL: String(deviceData.interval || 5),
+        PLAYWRITER_CLOUD_URL: baseUrl,
+      },
+    })
 
-    while (Date.now() < deadline) {
-      await new Promise((r) => { setTimeout(r, pollInterval) })
-      const { data: tokenData, error: pollError } = await client.device.token({
-        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-        device_code: deviceData.device_code,
-        client_id: 'playwriter-cli',
-      })
-      if (tokenData?.access_token) {
-        saveCloudAuth({ token: tokenData.access_token, baseUrl })
-        console.log(pc.green('\nLogged in successfully!'))
-        console.log('Cloud browsers will now appear in `playwriter session new`.')
-        return
-      }
-      if (pollError?.error === 'authorization_pending' || pollError?.error === 'slow_down') {
-        continue
-      }
-      if (pollError) {
-        console.error(`\nError: Device authorization failed — ${pollError.error_description || pollError.error}`)
-        process.exit(1)
-      }
+    if (isAgent) {
+      ctx.console.log('Login running in background.')
+      ctx.console.log('After approving in browser, verify with: playwriter cloud me')
+      return
     }
 
-    console.error('\nError: Device authorization timed out.')
-    process.exit(1)
+    // Interactive: poll the auth file until tokens appear
+    ctx.console.log('Waiting for approval...')
+    const deadline = Date.now() + (deviceData.expires_in || 300) * 1000
+    while (Date.now() < deadline) {
+      if (loadCloudAuth()) {
+        ctx.console.log(pc.green('\nLogged in successfully!'))
+        ctx.console.log('Cloud browsers will now appear in `playwriter session new`.')
+        return
+      }
+      await new Promise((r) => { setTimeout(r, 2000) })
+    }
+    ctx.console.error('\nError: Device authorization timed out.')
+    ctx.process.exit(1)
+  })
+
+cli
+  .command('cloud me', 'Check cloud auth status (exits 1 if not logged in)')
+  .action(async (_options, ctx) => {
+    const auth = loadCloudAuth()
+    if (auth) {
+      ctx.console.log('Authenticated')
+      ctx.console.log(`Cloud URL: ${auth.baseUrl}`)
+      return
+    }
+
+    // Check if login daemon is still running (user might not have approved yet)
+    const loginDaemon = ctx.daemon.forCommand('cloud login')
+    if (await loginDaemon.isRunning()) {
+      ctx.console.error('Login in progress. Approve in browser first.')
+      ctx.process.exit(1)
+    }
+
+    ctx.console.error('Not logged in. Run `playwriter cloud login` first.')
+    ctx.process.exit(1)
+  })
+
+cli
+  .command('cloud logout', 'Clear cloud auth')
+  .action(async (_options, ctx) => {
+    // Stop any running login daemon
+    const loginDaemon = ctx.daemon.forCommand('cloud login')
+    await loginDaemon.stop()
+
+    // Remove the auth file
+    try {
+      const authFile = path.join(os.homedir(), '.playwriter', 'auth.json')
+      fs.unlinkSync(authFile)
+    } catch {
+      // already gone
+    }
+
+    ctx.console.log('Logged out from cloud')
   })
 
 cli
