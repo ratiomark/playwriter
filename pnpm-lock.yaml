@@ -367,8 +367,8 @@ importers:
         specifier: ^0.7.1
         version: 0.7.1
       goke:
-        specifier: ^6.13.0
-        version: 6.13.0
+        specifier: ^6.14.0
+        version: 6.14.0
       hono:
         specifier: ^4.12.12
         version: 4.12.12
@@ -5237,8 +5237,8 @@ packages:
     resolution: {integrity: sha512-jhIXaOzy1sb8IyocaruWSn1TjmnBVs8Ayhcy83rmxNJ8q2uWKCAj3CnJY+KpGSXCueAPc0i05kVvVKtP1t9S3g==}
     engines: {node: '>=10'}
 
-  goke@6.13.0:
-    resolution: {integrity: sha512-dW9kHHku2sfyMJIH4RuF880zEztbRrka90sYt8WfFKHWK6d57VzxP3+cjFaEwnn+srj+kbGG8rg0ak6Z6fyUJg==}
+  goke@6.14.0:
+    resolution: {integrity: sha512-6EWee/DZmpGcrVwDlJjD+IfIPbj5rD9tp1sq/LTKo86/TjX+XIyh0pv3F399cESlhy1BRGvf4JM/6FT28xXZWQ==}
     engines: {node: '>=18'}
 
   google-auth-library@10.5.0:
@@ -9118,7 +9118,7 @@ snapshots:
     dependencies:
       '@clack/prompts': 1.5.1
       fflate: 0.8.3
-      goke: 6.13.0
+      goke: 6.14.0
       spiceflow: 1.26.0-rsc.5(@modelcontextprotocol/sdk@1.29.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(@types/react@19.2.7)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(vite@8.0.13(@types/node@25.2.0)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0))(zod@4.4.3)
       string-dedent: 3.0.2
       yaml: 2.9.0
@@ -13028,7 +13028,7 @@ snapshots:
       merge2: 1.4.1
       slash: 3.0.0
 
-  goke@6.13.0: {}
+  goke@6.14.0: {}
 
   google-auth-library@10.5.0:
     dependencies:

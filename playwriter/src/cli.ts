@@ -1447,9 +1447,11 @@ cli
 
     if (ctx.daemon.isDaemon) {
       // ── DAEMON: poll until user approves in browser ──
+      // Logs are visible to the parent when started with attach: true.
       const deviceCode = ctx.process.env.PLAYWRITER_DEVICE_CODE!
       const pollInterval = Number(ctx.process.env.PLAYWRITER_POLL_INTERVAL || 5) * 1000
-      const deadline = Date.now() + 10 * 60 * 1000
+      const expiresIn = Number(ctx.process.env.PLAYWRITER_DEVICE_EXPIRES_IN || 300)
+      const deadline = Date.now() + expiresIn * 1000
 
       while (Date.now() < deadline) {
         await new Promise((r) => { setTimeout(r, pollInterval) })
@@ -1463,8 +1465,14 @@ cli
           return // daemon exits, PID file is cleaned up
         }
         if (pollError?.error === 'authorization_pending' || pollError?.error === 'slow_down') continue
-        if (pollError) return // unrecoverable error, exit
+        if (pollError) {
+          ctx.console.error(`Device authorization failed: ${pollError.error_description || pollError.error}`)
+          ctx.process.exit(1)
+          return
+        }
       }
+      ctx.console.error('Device authorization timed out.')
+      ctx.process.exit(1)
       return
     }
 
@@ -1485,35 +1493,28 @@ cli
 
     await openInBrowser(verificationUrl)
 
-    // Start daemon to poll in background, pass device_code via env
-    await ctx.daemon.start({
-      timeoutMs: 10 * 60 * 1000,
-      env: {
-        PLAYWRITER_DEVICE_CODE: deviceData.device_code,
-        PLAYWRITER_POLL_INTERVAL: String(deviceData.interval || 5),
-        PLAYWRITER_CLOUD_URL: baseUrl,
-      },
-    })
+    const expiresIn = deviceData.expires_in || 300
+    const daemonEnv = {
+      PLAYWRITER_DEVICE_CODE: deviceData.device_code,
+      PLAYWRITER_POLL_INTERVAL: String(deviceData.interval || 5),
+      PLAYWRITER_DEVICE_EXPIRES_IN: String(expiresIn),
+      PLAYWRITER_CLOUD_URL: baseUrl,
+    }
+    const timeoutMs = expiresIn * 1000
 
     if (isAgent) {
+      // Agent: start daemon detached, return immediately
+      await ctx.daemon.start({ timeoutMs, env: daemonEnv })
       ctx.console.log('Login running in background.')
       ctx.console.log('After approving in browser, verify with: playwriter cloud me')
       return
     }
 
-    // Interactive: poll the auth file until tokens appear
+    // Interactive: attach to daemon, see real-time logs and errors
     ctx.console.log('Waiting for approval...')
-    const deadline = Date.now() + (deviceData.expires_in || 300) * 1000
-    while (Date.now() < deadline) {
-      if (loadCloudAuth()) {
-        ctx.console.log(pc.green('\nLogged in successfully!'))
-        ctx.console.log('Cloud browsers will now appear in `playwriter session new`.')
-        return
-      }
-      await new Promise((r) => { setTimeout(r, 2000) })
-    }
-    ctx.console.error('\nError: Device authorization timed out.')
-    ctx.process.exit(1)
+    await ctx.daemon.start({ attach: true, timeoutMs, env: daemonEnv })
+    ctx.console.log(pc.green('\nLogged in successfully!'))
+    ctx.console.log('Cloud browsers will now appear in `playwriter session new`.')
   })
 
 cli
