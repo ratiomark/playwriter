@@ -15,6 +15,8 @@ import type {
   StopRecordingParams,
   CancelRecordingParams,
   IsRecordingParams,
+  StartStreamParams,
+  StopStreamParams,
 } from './protocol.js'
 import pc from 'picocolors'
 import util from 'node:util'
@@ -31,6 +33,7 @@ import { EventEmitter } from 'node:events'
 import { VERSION, EXTENSION_IDS, shouldAutoEnablePlaywriter } from './utils.js'
 import { createCdpLogger, type CdpLogEntry, type CdpLogger } from './cdp-log.js'
 import { RecordingRelay } from './recording-relay.js'
+import { StreamRelay } from './stream-relay.js'
 import { appendSessionToWsUrl } from './chrome-discovery.js'
 import * as relayState from './relay-state.js'
 
@@ -521,6 +524,31 @@ export async function startPlayWriterCDPRelayServer({
       )
     }
     return recordingRelays.get(connId) || null
+  }
+
+  // Stream relays pipe capture chunks to ffmpeg for live RTMP streaming
+  // instead of accumulating them like RecordingRelay. Keyed per extension
+  // connection exactly like recordingRelays.
+  const streamRelays = new Map<string, StreamRelay>()
+
+  const getStreamRelay = (extensionId?: string | null): StreamRelay | null => {
+    const allowDefault = !extensionId && store.getState().extensions.size === 1
+    const conn = getExtensionConnection(extensionId, { allowFallback: allowDefault })
+    if (!conn) {
+      return null
+    }
+    const connId = conn.id
+    if (!streamRelays.has(connId)) {
+      streamRelays.set(
+        connId,
+        new StreamRelay(
+          (params) => sendToExtension({ extensionId: connId, ...params }),
+          () => store.getState().extensions.has(connId),
+          logger,
+        ),
+      )
+    }
+    return streamRelays.get(connId) || null
   }
 
   // Auto-create an initial blank tab when no targets exist. Set
@@ -1434,9 +1462,16 @@ export async function startPlayWriterCDPRelayServer({
             ws.close(1000, 'Extension not registered')
             return
           }
-          // Handle binary data (recording chunks)
+          // Handle binary data (capture chunks). Streams and recordings share
+          // the same WS messages; StreamRelay gets first pick and returns true
+          // when the chunk belongs to an active stream (tabId sets are disjoint
+          // because the extension refuses a second capture of the same tab).
           if (event.data instanceof ArrayBuffer || Buffer.isBuffer(event.data)) {
             const buffer = Buffer.isBuffer(event.data) ? event.data : Buffer.from(event.data)
+            const streamRelay = streamRelays.get(connectionId)
+            if (streamRelay?.handleBinaryData(buffer)) {
+              return
+            }
             const relay = getRecordingRelay(connectionId)
             if (relay) {
               relay.handleBinaryData(buffer)
@@ -1497,14 +1532,20 @@ export async function startPlayWriterCDPRelayServer({
             const prefix = pc.yellow(`[Extension] [${level.toUpperCase()}]`)
             logFunc?.(prefix, ...args)
           } else if (message.method === 'recordingData') {
-            const relay = getRecordingRelay(connectionId)
-            if (relay) {
-              relay.handleRecordingData(message as RecordingDataMessage)
+            const streamRelay = streamRelays.get(connectionId)
+            if (!streamRelay?.handleRecordingData(message as RecordingDataMessage)) {
+              const relay = getRecordingRelay(connectionId)
+              if (relay) {
+                relay.handleRecordingData(message as RecordingDataMessage)
+              }
             }
           } else if (message.method === 'recordingCancelled') {
-            const relay = getRecordingRelay(connectionId)
-            if (relay) {
-              relay.handleRecordingCancelled(message as RecordingCancelledMessage)
+            const streamRelay = streamRelays.get(connectionId)
+            if (!streamRelay?.handleRecordingCancelled(message as RecordingCancelledMessage)) {
+              const relay = getRecordingRelay(connectionId)
+              if (relay) {
+                relay.handleRecordingCancelled(message as RecordingCancelledMessage)
+              }
             }
           } else {
             const extensionEvent = message as ExtensionEventMessage
@@ -1781,6 +1822,13 @@ export async function startPlayWriterCDPRelayServer({
           }
           recordingRelays.delete(connectionId)
 
+          // Kill any active ffmpeg streams for this extension connection
+          const streamRelay = streamRelays.get(connectionId)
+          if (streamRelay) {
+            streamRelay.destroyAll('Extension disconnected')
+          }
+          streamRelays.delete(connectionId)
+
           // Reject all pending I/O requests (state cleanup happens in removeExtension below)
           const closingExt = store.getState().extensions.get(connectionId)
           if (closingExt) {
@@ -1927,6 +1975,7 @@ export async function startPlayWriterCDPRelayServer({
 
   app.use('/cli/*', privilegedRouteMiddleware)
   app.use('/recording/*', privilegedRouteMiddleware)
+  app.use('/stream/*', privilegedRouteMiddleware)
   app.use('/mcp-log', privilegedRouteMiddleware)
 
   app.post('/cli/execute', async (c) => {
@@ -2260,6 +2309,52 @@ export async function startPlayWriterCDPRelayServer({
     }
     const cancelParams: CancelRecordingParams = resolvedSessionId ? { sessionId: resolvedSessionId } : {}
     const result = await relay.cancelRecording(cancelParams)
+    return c.json(result)
+  })
+
+  // ============================================================================
+  // Streaming Endpoints - Live RTMP streaming of a tab via ffmpeg
+  // ============================================================================
+
+  app.post('/stream/start', async (c) => {
+    const body = (await c.req.json()) as StartStreamParams & { sessionId?: string | number }
+    const sessionId = normalizeSessionId(body.sessionId)
+    const { sessionId: _sessionId, ...streamOptions } = body
+    const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
+    const relay = getStreamRelay(extensionId)
+    if (!relay) {
+      return c.json({ success: false, error: 'Extension not connected' }, 500)
+    }
+    const streamParams: StartStreamParams = resolvedSessionId
+      ? { ...streamOptions, sessionId: resolvedSessionId }
+      : streamOptions
+    const result = await relay.startStream(streamParams)
+    const status = result.success ? 200 : result.error?.includes('required') ? 400 : 500
+    return c.json(result, status)
+  })
+
+  app.post('/stream/stop', async (c) => {
+    const body = (await c.req.json()) as { sessionId?: string | number }
+    const sessionId = normalizeSessionId(body.sessionId)
+    const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
+    const relay = getStreamRelay(extensionId)
+    if (!relay) {
+      return c.json({ success: false, error: 'Extension not connected' }, 500)
+    }
+    const stopParams: StopStreamParams = resolvedSessionId ? { sessionId: resolvedSessionId } : {}
+    const result = await relay.stopStream(stopParams)
+    const status = result.success ? 200 : result.error?.includes('No active stream') ? 404 : 500
+    return c.json(result, status)
+  })
+
+  app.get('/stream/status', async (c) => {
+    const sessionId = normalizeSessionId(c.req.query('sessionId'))
+    const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
+    const relay = getStreamRelay(extensionId)
+    if (!relay) {
+      return c.json({ streaming: false })
+    }
+    const result = relay.streamStatus(resolvedSessionId ? { sessionId: resolvedSessionId } : {})
     return c.json(result)
   })
 

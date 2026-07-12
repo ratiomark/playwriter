@@ -193,6 +193,92 @@ export type CancelRecordingResult = {
   error?: string
 }
 
+// ============================================================================
+// Streaming types (HTTP-only, used by /stream/* endpoints).
+// Streaming reuses the recording WS messages (startRecording/stopRecording/
+// recordingData) so no WS protocol changes are needed and old extensions keep
+// working. The relay pipes chunks to ffmpeg instead of accumulating them.
+// ============================================================================
+
+export type StartStreamParams = {
+  /** CDP tab session ID (pw-tab-*) to identify which tab to stream. */
+  sessionId?: string
+  /** RTMP destination URLs (or any ffmpeg-writable flv target, e.g. a file path for testing). */
+  rtmpUrls: string[]
+  /** Output resolution as WxH (default 1920x1080, X Live recommended). */
+  resolution?: string
+  /** Output frame rate (default 30). */
+  fps?: number
+  /** Video bitrate in kbps (default 9000, X Live recommended). */
+  videoBitrateKbps?: number
+  /** Audio bitrate in kbps (default 128). */
+  audioBitrateKbps?: number
+  /** Keyframe interval in seconds (default 3, X Live recommended and its max;
+   *  Twitch recommends 2). */
+  keyframeSeconds?: number
+  /** Capture tab audio (default true). When false, a silent audio track is injected
+   *  because platforms like X Live reject streams without audio. */
+  audio?: boolean
+  /** x264 preset (default veryfast). Only applies to libx264. */
+  preset?: string
+  /** Video codec for ffmpeg -c:v (default: auto-detect hardware encoder, falls back to libx264). */
+  codec?: string
+}
+
+export type StartStreamResult =
+  | {
+      success: true
+      tabId: number
+      startedAt: number
+      /** Destinations with stream keys redacted */
+      destinations: string[]
+    }
+  | {
+      success: false
+      error: string
+    }
+
+export type StopStreamParams = {
+  sessionId?: string
+}
+
+export type StopStreamResult =
+  | {
+      success: true
+      tabId: number
+      /** Stream duration in ms */
+      duration: number
+      /** Total bytes received from the extension and piped to ffmpeg */
+      bytesReceived: number
+    }
+  | {
+      success: false
+      error: string
+    }
+
+export type StreamStats = {
+  chunksReceived: number
+  bytesReceived: number
+  /** Encoder output fps parsed from ffmpeg progress lines */
+  ffmpegFps?: number
+  /** Encoder output bitrate in kbps parsed from ffmpeg progress lines */
+  ffmpegBitrateKbps?: number
+  /** Dropped frames parsed from ffmpeg progress lines */
+  droppedFrames?: number
+  lastFfmpegLine?: string
+}
+
+export type StreamStatusResult = {
+  streaming: boolean
+  tabId?: number
+  startedAt?: number
+  /** Destinations with stream keys redacted */
+  destinations?: string[]
+  stats?: StreamStats
+  /** Error from the last stream that died unexpectedly (ffmpeg crash, RTMP failure) */
+  error?: string
+}
+
 // Ghost Browser API command message (for Ghost Browser integration)
 export type GhostBrowserCommandMessage = {
   id: number

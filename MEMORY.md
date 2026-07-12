@@ -205,3 +205,10 @@ to `get-stream@9+` unless the vendored unzip code is rewritten or replaced.
 ## Network.clearBrowserCookies nukes entire profile (Jul 2026)
 
 `Network.clearBrowserCookies` clears ALL cookies for every domain in the Chrome profile, not just the current page. It wiped Gmail, GitHub, and all authenticated sessions. The relay now blocks this command (and `Network.clearBrowserCache`). Use `Network.getCookies` + `Network.deleteCookies` to clear cookies per-domain instead.
+
+## Pre-existing local test failures (Jul 2026)
+
+`cli-help.test.ts > unknown command` fails on main: goke no longer prints
+`playwriter --help` to stderr. `extension-connection.test.ts > reconnect after
+disconnecting everything` also fails on clean HEAD (verified via worktree).
+Neither is a regression signal for unrelated changes.

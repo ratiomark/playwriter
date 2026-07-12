@@ -35,7 +35,7 @@ import { createGhostBrowserChrome, type GhostBrowserCommandResult } from './ghos
 export type { SnapshotFormat }
 import { getCleanHTML, type GetCleanHTMLOptions } from './clean-html.js'
 import { getPageMarkdown, type GetPageMarkdownOptions } from './page-markdown.js'
-import { createRecordingApi } from './screen-recording.js'
+import { createRecordingApi, createStreamApi } from './screen-recording.js'
 import { createDemoVideo } from './ffmpeg.js'
 import { type GhostCursorClientOptions } from './ghost-cursor.js'
 import { GhostCursorController } from './ghost-cursor-controller.js'
@@ -1517,6 +1517,13 @@ export class PlaywrightExecutor {
         },
       })
 
+      // Live RTMP streaming: pipes tabCapture chunks to ffmpeg in the relay
+      // process. Streams keep running after execute() returns and CLI exits.
+      const streamApi = createStreamApi({
+        defaultPage: page,
+        relayPort,
+      })
+
       // Ghost Browser API - creates chrome object that mirrors Ghost Browser's APIs
       // See extension/src/ghost-browser-api.d.ts for full API documentation
       const chromeGhostBrowser = createGhostBrowserChrome(async (namespace, method, args) => {
@@ -1566,6 +1573,11 @@ export class PlaywrightExecutor {
           stop: recordingApi.stop,
           isRecording: recordingApi.isRecording,
           cancel: recordingApi.cancel,
+        },
+        stream: {
+          start: streamApi.start,
+          stop: streamApi.stop,
+          status: streamApi.status,
         },
         // Backward-compatible aliases
         startRecording: recordingApi.start,

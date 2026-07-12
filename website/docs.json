@@ -44,6 +44,7 @@
               "docs/debugger",
               "docs/network",
               "docs/recording",
+              "docs/streaming",
               "docs/headless",
               "docs/profiling",
               "docs/security"

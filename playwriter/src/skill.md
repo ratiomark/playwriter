@@ -247,6 +247,10 @@ playwriter -s 1 -f script.js
 
 The file is read from disk and executed in the same sandbox as `-e`. All context variables (`state`, `page`, `context`, etc.) are available. `-e` and `-f` cannot be used together.
 
+### Live streaming to RTMP (X Live, Twitch, YouTube)
+
+Niche use case: `playwriter stream start|stop|status` streams a tab live to RTMP endpoints via ffmpeg, surviving navigation and running 24/7 after the CLI exits. Docs: https://playwriter.dev/docs/streaming
+
 ### Debugging playwriter issues
 
 If some internal critical error happens you can read the relay server logs to understand the issue. The log file is located in the user home directory:

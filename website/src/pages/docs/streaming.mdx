@@ -1,0 +1,97 @@
+---
+title: Live Stream a Browser Tab to RTMP
+sidebarTitle: Streaming
+description: Stream a browser tab live to X Live, Twitch, or YouTube via RTMP. Uses chrome.tabCapture plus ffmpeg re-encoding, survives page navigation, and runs 24/7.
+icon: lucide:radio
+prompt: |
+  Document the `playwriter stream` command and executor `stream` API.
+  Sources: playwriter/src/stream-relay.ts, playwriter/src/screen-recording.ts,
+  playwriter/src/cli.ts (stream commands), playwriter/src/skill.md.
+---
+
+Stream a tab **live to RTMP endpoints** like X Live, Twitch, or YouTube. Playwriter captures the tab with the same `chrome.tabCapture` pipeline used for [recording](/docs/recording), so the **stream survives page navigation**. The relay pipes each capture chunk to an `ffmpeg` process that re-encodes in real time and pushes to your destinations.
+
+ffmpeg runs **inside the relay process**, so the stream keeps running after the CLI exits. Perfect for 24/7 auto-generated content: render a web page, stream it forever.
+
+## Requirements
+
+- `ffmpeg` installed and on `PATH`
+- Extension capture permission: use `playwriter browser start` for automated flows, or click the Playwriter extension icon on the tab once
+- Not available in headless or direct CDP mode (relies on the extension's `chrome.tabCapture`)
+
+## Start streaming
+
+The stream captures the session's **current page** — navigate first, then start:
+
+```bash
+playwriter -s 1 -e "await page.goto('https://my-generated-content.example')"
+playwriter stream start -s 1 --rtmp rtmp://va.pscp.tv:80/x/<stream-key>
+```
+
+Simultaneous multi-streaming — repeat `--rtmp` (uses ffmpeg's tee muxer, one encode for all destinations; a dead endpoint doesn't kill the others):
+
+```bash
+playwriter stream start -s 1 \
+  --rtmp rtmp://va.pscp.tv:80/x/<x-stream-key> \
+  --rtmp rtmp://live.twitch.tv/app/<twitch-stream-key>
+```
+
+## Monitor and stop
+
+```bash
+# Uptime, encoder fps, output bitrate, dropped frames
+playwriter stream status -s 1
+
+# Graceful stop: flushes the encoder and waits for ffmpeg to exit
+playwriter stream stop -s 1
+```
+
+## Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--rtmp <url>` | required | RTMP destination with stream key, repeatable |
+| `--resolution <WxH>` | `1920x1080` | Output resolution, ffmpeg scales the capture |
+| `--fps <n>` | `30` | Output frame rate |
+| `--video-bitrate <kbps>` | `9000` | X Live recommended; Twitch max is 6000 |
+| `--keyframe-interval <s>` | `3` | X Live recommended (and max); Twitch recommends 2 |
+| `--audio-bitrate <kbps>` | `128` | AAC 44100Hz stereo |
+| `--no-audio` | off | Skip tab audio, injects a silent track (X Live requires an audio track) |
+| `--preset <name>` | `veryfast` | x264 preset, only applies to libx264 |
+| `--codec <name>` | auto | Auto-detects hardware encoders (videotoolbox, nvenc, qsv), falls back to libx264 |
+
+Defaults match **X Live's recommended encoder settings** (1080p, 9000 kbps H.264, 30 fps, 3s keyframes, AAC 128k 44100Hz stereo). For Twitch use `--video-bitrate 6000 --keyframe-interval 2`.
+
+## Executor API
+
+The same functionality is available inside `execute` code:
+
+```js
+await stream.start({
+  rtmpUrls: ['rtmp://va.pscp.tv:80/x/STREAM_KEY'],
+  resolution: '1920x1080',
+  fps: 30,
+  videoBitrateKbps: 9000,
+})
+
+await stream.status()
+// => { streaming, startedAt, destinations, stats: { ffmpegFps, ffmpegBitrateKbps, droppedFrames, ... } }
+
+await stream.stop()
+// => { duration, bytesReceived }
+```
+
+Stream keys are secrets: status output and logs only ever show **redacted destinations** (`rtmp://host/…`).
+
+## Latency
+
+The extension emits capture chunks every second, and the encoder adds a little buffering: expect roughly **2 to 4 seconds** of glass-to-glass latency before the platform's own delay. Fine for live streams, not designed for real-time interaction.
+
+## Streaming vs recording
+
+| | `recording.*` | `stream.*` |
+|---|---|---|
+| Output | MP4 file on disk | RTMP endpoints |
+| Duration | auto-stops after 15 min | unlimited, runs after CLI exits |
+| Encoding | in-browser MediaRecorder | ffmpeg re-encode (CBR, fixed GOP) |
+| Same tab at once | one capture per tab — a tab can be recorded or streamed, not both | |

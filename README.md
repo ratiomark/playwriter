@@ -124,6 +124,15 @@ playwriter -e "await state.editor.edit({ url: 'https://example.com/app.js', oldS
 playwriter -e "await screenshotWithAccessibilityLabels({ page })"
 ```
 
+**Live stream a tab to X Live / Twitch (RTMP, runs 24/7):**
+
+```bash
+playwriter -s 1 -e "await page.goto('https://example.com')"
+playwriter stream start -s 1 --rtmp rtmp://va.pscp.tv:80/x/<stream-key>
+playwriter stream status -s 1
+playwriter stream stop -s 1
+```
+
 ## MCP Setup
 
 Using the CLI with the skill (step 4 above) is the recommended approach. For direct MCP server configuration, see [MCP.md](./MCP.md).

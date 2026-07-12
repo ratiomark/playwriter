@@ -1241,6 +1241,122 @@ cli
     }
   })
 
+// ============================================================================
+// Live RTMP streaming commands. These are sugar over the executor `stream`
+// global (same execute path as -e), which resolves the session's current tab
+// and calls the relay's /stream/* endpoints. ffmpeg runs inside the relay
+// process, so the stream keeps running after the CLI exits.
+// ============================================================================
+
+cli
+  .command('stream start', 'Stream the session tab live to RTMP destinations (X Live, Twitch, ...) via ffmpeg. Streams the current page - navigate first with -e "await page.goto(...)"')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .option('-s, --session <id>', 'Session ID (get one with `playwriter session new`)')
+  .option('--rtmp <url>', z.union([z.string(), z.array(z.string())]).describe('RTMP destination URL with stream key (repeatable for simultaneous multi-streaming)'))
+  .option('--resolution <WxH>', z.string().default('1920x1080').describe('Output resolution (default is X Live recommended)'))
+  .option('--fps <n>', z.number().default(30).describe('Output frame rate'))
+  .option('--video-bitrate <kbps>', z.number().default(9000).describe('Video bitrate in kbps (default is X Live recommended; Twitch max 6000)'))
+  .option('--audio-bitrate <kbps>', z.number().default(128).describe('Audio bitrate in kbps'))
+  .option('--keyframe-interval <seconds>', z.number().default(3).describe('Keyframe interval in seconds (3 = X Live recommended, 2 = Twitch)'))
+  .option('--no-audio', 'Do not capture tab audio (a silent track is injected, required by X Live)')
+  .option('--preset <name>', z.string().default('veryfast').describe('x264 preset (only applies to libx264)'))
+  .option('--codec <name>', 'Video codec for ffmpeg (default: auto-detect hardware encoder, falls back to libx264)')
+  .action(async (options) => {
+    const rtmpUrls: string[] = (() => {
+      if (!options.rtmp) {
+        return []
+      }
+      return Array.isArray(options.rtmp) ? options.rtmp : [options.rtmp]
+    })()
+    if (rtmpUrls.length === 0) {
+      console.error('Error: at least one --rtmp destination is required.')
+      console.error('Example: playwriter stream start -s 1 --rtmp rtmp://va.pscp.tv:80/x/<stream-key>')
+      process.exit(1)
+    }
+    if (!/^\d+x\d+$/.test(options.resolution)) {
+      console.error(`Error: invalid --resolution "${options.resolution}", expected WxH like 1920x1080`)
+      process.exit(1)
+    }
+
+    const streamParams = {
+      rtmpUrls,
+      resolution: options.resolution,
+      fps: options.fps,
+      videoBitrateKbps: options.videoBitrate,
+      audioBitrateKbps: options.audioBitrate,
+      keyframeSeconds: options.keyframeInterval,
+      audio: !options.noAudio,
+      preset: options.preset,
+      codec: options.codec,
+    }
+
+    // Run through the executor so the session's current tab is resolved and
+    // ffmpeg is spawned inside the relay process (survives CLI exit).
+    const code = [
+      `const result = await stream.start(${JSON.stringify(streamParams)})`,
+      `console.log('Streaming tab ' + result.tabId + ' to: ' + result.destinations.join(', '))`,
+      `console.log('The stream runs until you call: playwriter stream stop -s <session>')`,
+    ].join('\n')
+
+    await executeCode({
+      code,
+      timeout: 60000,
+      sessionId: options.session,
+      host: options.host,
+      token: options.token,
+    })
+  })
+
+cli
+  .command('stream stop', 'Stop the active stream for a session')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .option('-s, --session <id>', 'Session ID')
+  .action(async (options) => {
+    const code = [
+      `const result = await stream.stop()`,
+      `console.log('Stream stopped after ' + Math.round(result.duration / 1000) + 's (' + result.bytesReceived + ' bytes captured)')`,
+    ].join('\n')
+
+    await executeCode({
+      code,
+      timeout: 60000,
+      sessionId: options.session,
+      host: options.host,
+      token: options.token,
+    })
+  })
+
+cli
+  .command('stream status', 'Show stream health: uptime, encoder fps, bitrate, dropped frames')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .option('-s, --session <id>', 'Session ID')
+  .action(async (options) => {
+    const code = [
+      `const status = await stream.status()`,
+      `if (!status.streaming) {`,
+      `  console.log('Not streaming' + (status.error ? '. Last stream error: ' + status.error : ''))`,
+      `} else {`,
+      `  const uptime = Math.round((Date.now() - status.startedAt) / 1000)`,
+      `  console.log('Streaming tab ' + status.tabId + ' to: ' + status.destinations.join(', '))`,
+      `  console.log('Uptime: ' + uptime + 's, received: ' + status.stats.bytesReceived + ' bytes (' + status.stats.chunksReceived + ' chunks)')`,
+      `  if (status.stats.ffmpegFps !== undefined) {`,
+      `    console.log('Encoder: ' + status.stats.ffmpegFps + ' fps, ' + (status.stats.ffmpegBitrateKbps || '?') + ' kbps, dropped: ' + (status.stats.droppedFrames ?? 0))`,
+      `  }`,
+      `}`,
+    ].join('\n')
+
+    await executeCode({
+      code,
+      timeout: 15000,
+      sessionId: options.session,
+      host: options.host,
+      token: options.token,
+    })
+  })
+
 cli
   .command(
     'serve',

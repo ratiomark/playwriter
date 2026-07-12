@@ -15,6 +15,10 @@ import type {
   StopRecordingResult,
   IsRecordingResult,
   CancelRecordingResult,
+  StartStreamParams,
+  StartStreamResult,
+  StopStreamResult,
+  StreamStatusResult,
 } from './protocol.js'
 import { GhostCursorController } from './ghost-cursor-controller.js'
 
@@ -388,6 +392,120 @@ export async function isRecording(options: {
   const result = (await response.json()) as IsRecordingResult
 
   return { isRecording: result.isRecording, startedAt: result.startedAt, tabId: result.tabId }
+}
+
+// ============================================================================
+// Live RTMP streaming (reuses the tabCapture pipeline; the relay pipes chunks
+// to ffmpeg instead of writing a file). ffmpeg runs inside the relay process,
+// so streams keep running after the CLI or executor call returns.
+// ============================================================================
+
+export interface StartStreamOptions extends Omit<StartStreamParams, 'sessionId'> {
+  /** Target page to stream (defaults to the executor's current page) */
+  page?: Page
+  /** CDP tab session ID (pw-tab-*) to identify which tab to stream */
+  sessionId?: string
+}
+
+/** Start streaming a tab to one or more RTMP destinations. */
+export async function startStream(
+  options: StartStreamOptions & { relayPort?: number },
+): Promise<StartStreamResult & { success: true }> {
+  const { page: _page, relayPort = 19988, ...params } = options
+
+  const response = await fetch(`http://127.0.0.1:${relayPort}/stream/start`, {
+    method: 'POST',
+    headers: recordingHeaders(),
+    body: JSON.stringify(params),
+  })
+
+  const result = (await response.json()) as StartStreamResult
+
+  if (!result.success) {
+    const errorMsg = result.error || 'Unknown error'
+    if (isActiveTabPermissionError(errorMsg)) {
+      const restartCmd = getChromeRestartCommand()
+      throw new Error(
+        `Failed to start stream: ${errorMsg}\n\n` +
+          `For automated streaming, start a managed Playwriter browser with the bundled extension loaded:\n\n` +
+          `  ${restartCmd}\n\n` +
+          `Or click the Playwriter extension icon on the tab once to grant permission.`,
+      )
+    }
+    throw new Error(`Failed to start stream: ${errorMsg}`)
+  }
+
+  return result
+}
+
+/** Stop an active stream. Closes ffmpeg gracefully and waits for it to exit. */
+export async function stopStream(options: {
+  page?: Page
+  sessionId?: string
+  relayPort?: number
+}): Promise<{ duration: number; bytesReceived: number }> {
+  const { sessionId, relayPort = 19988 } = options
+
+  const response = await fetch(`http://127.0.0.1:${relayPort}/stream/stop`, {
+    method: 'POST',
+    headers: recordingHeaders(),
+    body: JSON.stringify({ sessionId }),
+  })
+
+  const result = (await response.json()) as StopStreamResult
+
+  if (!result.success) {
+    throw new Error(`Failed to stop stream: ${result.error}`)
+  }
+
+  return { duration: result.duration, bytesReceived: result.bytesReceived }
+}
+
+/** Get status and encoder stats for the active stream (if any). */
+export async function streamStatus(options: {
+  page?: Page
+  sessionId?: string
+  relayPort?: number
+}): Promise<StreamStatusResult> {
+  const { sessionId, relayPort = 19988 } = options
+
+  const url = new URL(`http://127.0.0.1:${relayPort}/stream/status`)
+  if (sessionId) {
+    url.searchParams.set('sessionId', sessionId)
+  }
+  const response = await fetch(url.toString(), { headers: recordingHeaders() })
+  return (await response.json()) as StreamStatusResult
+}
+
+/**
+ * Create the `stream` API exposed in the executor sandbox. Resolves the target
+ * tab's pw-tab-* sessionId from the page like the recording API does. Unlike
+ * recording there is no viewport resize or max-duration timer: streams pick an
+ * explicit output resolution (ffmpeg scales) and run indefinitely.
+ */
+export function createStreamApi(options: { defaultPage: Page; relayPort: number }): {
+  start: (opts: StartStreamOptions) => Promise<StartStreamResult & { success: true }>
+  stop: (opts?: { page?: Page; sessionId?: string }) => Promise<{ duration: number; bytesReceived: number }>
+  status: (opts?: { page?: Page; sessionId?: string }) => Promise<StreamStatusResult>
+} {
+  const { defaultPage, relayPort } = options
+
+  const resolveSessionId = (opts?: { page?: Page; sessionId?: string }): string | undefined => {
+    const targetPage = opts?.page || defaultPage
+    return opts?.sessionId || targetPage.sessionId() || undefined
+  }
+
+  return {
+    start: async (opts) => {
+      return startStream({ ...opts, sessionId: resolveSessionId(opts), relayPort })
+    },
+    stop: async (opts = {}) => {
+      return stopStream({ ...opts, sessionId: resolveSessionId(opts), relayPort })
+    },
+    status: async (opts = {}) => {
+      return streamStatus({ ...opts, sessionId: resolveSessionId(opts), relayPort })
+    },
+  }
 }
 
 /**
