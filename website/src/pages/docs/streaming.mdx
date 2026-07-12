@@ -19,6 +19,13 @@ ffmpeg runs **inside the relay process**, so the stream keeps running after the 
 - Extension capture permission: use `playwriter browser start` for automated flows, or click the Playwriter extension icon on the tab once
 - Not available in headless or direct CDP mode (relies on the extension's `chrome.tabCapture`)
 
+## Limitations
+
+- **Manual permission click per tab.** Chrome's `activeTab` model requires a user gesture: you must click the Playwriter extension icon on the tab before it can be captured, and the grant is **per tab** — streaming a different tab needs another click on that tab. This is a Chrome platform restriction, not a Playwriter one. For fully automated flows, launch a managed browser with `playwriter browser start`, which auto-accepts tab capture without any click.
+- **One stream per tab.** A tab can have only one active capture: it can be streamed or recorded, not both, and not streamed twice.
+- **Multiple tabs at once is untested.** The architecture supports one stream per tab (each with its own ffmpeg process), but Chrome does not officially document support for many simultaneous `tabCapture` streams, and each stream costs a full real-time encode. Test with your setup before relying on it for production multi-streaming; prefer the tee muxer (repeat `--rtmp`) when you want the *same* tab on several platforms — that's one capture and one encode.
+- **A few seconds of latency** (capture chunking + encoder buffering) — fine for live streaming, not for real-time interaction.
+
 ## Start streaming
 
 The stream captures the session's **current page** — navigate first, then start:
