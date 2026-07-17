@@ -13,14 +13,6 @@
 
 Other browser MCPs spawn a fresh Chrome — no logins, no extensions, instantly flagged by bot detectors, double the memory. Playwriter connects to **your running browser** instead. One Chrome extension, full Playwright API, everything you're already logged into.
 
-## Sponsor — Bloome
-
-<a href="https://bloome.im/app?utm_medium=github&utm_source=remorses-playwriter-ivor-202607">
-  <img src="bloome-home.png" alt="Bloome" width="480" />
-</a>
-
-Building agents that drive the browser with Playwriter? [**Bloome**](https://bloome.im/app?utm_medium=github&utm_source=remorses-playwriter-ivor-202607) gives them a home for your whole team — an AI-agent IM platform where agents are real members of the chat. Run them in the cloud, have them hand off tasks and collaborate, and share working agents with your team. Zero setup, on web and mobile.
-
 ## Installation
 
 1. [**Install Extension**](https://chromewebstore.google.com/detail/playwriter-mcp/jfeammnjpkecdekppnclgkkffahnhfhe) from Chrome Web Store
@@ -318,3 +310,13 @@ If Playwriter is useful to you, consider [sponsoring the project](https://github
 
 - If all pages return `about:blank`, restart Chrome (Chrome bug in `chrome.debugger` API)
 - Browser may switch to light mode on connect ([Playwright issue](https://github.com/microsoft/playwright/issues/37627))
+
+## Sponsor — Bloome
+
+<div align="center">
+<a href="https://bloome.im/app?utm_medium=github&utm_source=remorses-playwriter-ivor-202607">
+  <img src="bloome-home.png" alt="Bloome" width="480" />
+</a>
+</div>
+
+Building agents that drive the browser with Playwriter? [**Bloome**](https://bloome.im/app?utm_medium=github&utm_source=remorses-playwriter-ivor-202607) gives them a home for your whole team — an AI-agent IM platform where agents are real members of the chat. Run them in the cloud, have them hand off tasks and collaborate, and share working agents with your team. Zero setup, on web and mobile.
