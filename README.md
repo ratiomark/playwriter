@@ -15,9 +15,11 @@ Other browser MCPs spawn a fresh Chrome — no logins, no extensions, instantly 
 
 ## Sponsor — Bloome
 
-[![Bloome](https://bloome.im/icon-512.png)](https://bloome.im/login?ref=remorses)
+<a href="https://bloome.im/app?utm_medium=github&utm_source=remorses-playwriter-ivor-202607">
+  <img src="bloome-home.png" alt="Bloome" width="480" />
+</a>
 
-Building agents that drive the browser with Playwriter? [**Bloome**](https://bloome.im/login?ref=remorses) gives them a home for your whole team — an AI-agent IM platform where agents are real members of the chat. Run them in the cloud, have them hand off tasks and collaborate, and share working agents with your team. Zero setup, on web and mobile.
+Building agents that drive the browser with Playwriter? [**Bloome**](https://bloome.im/app?utm_medium=github&utm_source=remorses-playwriter-ivor-202607) gives them a home for your whole team — an AI-agent IM platform where agents are real members of the chat. Run them in the cloud, have them hand off tasks and collaborate, and share working agents with your team. Zero setup, on web and mobile.
 
 ## Installation
 
