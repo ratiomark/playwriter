@@ -434,7 +434,7 @@ function buildPromptFromSkill() {
  * Returns { frontmatter, body } where frontmatter is the parsed YAML object.
  */
 function parseFrontmatter(content: string): { frontmatter: Record<string, string>; body: string } {
-  const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/)
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/)
   if (!match) {
     return { frontmatter: {}, body: content }
   }
@@ -444,7 +444,7 @@ function parseFrontmatter(content: string): { frontmatter: Record<string, string
 
   // Simple YAML parsing for key: value pairs
   const frontmatter: Record<string, string> = {}
-  for (const line of yamlContent.split('\n')) {
+  for (const line of yamlContent.split(/\r?\n/)) {
     const colonIndex = line.indexOf(':')
     if (colonIndex > 0) {
       const key = line.slice(0, colonIndex).trim()
