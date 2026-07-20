@@ -1,11 +1,12 @@
 import { fileURLToPath } from 'node:url'
 import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
-import { defineConfig } from 'vite'
+import { defineConfig, normalizePath } from 'vite'
 import { viteStaticCopy } from 'vite-plugin-static-copy'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
+const staticCopySource = (source: string): string => normalizePath(resolve(__dirname, source))
 
 // Bundle the playwriter package version into the extension so it can report
 // which playwriter version it was built against. CLI/MCP use this to warn
@@ -29,12 +30,12 @@ export default defineConfig({
     viteStaticCopy({
       targets: [
         {
-          src: resolve(__dirname, 'icons/*'),
+          src: staticCopySource('icons/*'),
           dest: 'icons',
         },
 
         {
-          src: resolve(__dirname, 'manifest.json'),
+          src: staticCopySource('manifest.json'),
           dest: '.',
           transform: (content) => {
             const manifest = JSON.parse(content)
