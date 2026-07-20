@@ -33,6 +33,15 @@ function ensureDir(dir: string) {
   }
 }
 
+function writeTextIfChanged(filePath: string, content: string) {
+  if (fs.existsSync(filePath)) {
+    const current = fs.readFileSync(filePath, 'utf-8')
+    if (current.replace(/\r\n/g, '\n') === content.replace(/\r\n/g, '\n'))
+      return
+  }
+  fs.writeFileSync(filePath, content, 'utf-8')
+}
+
 function readFile(relativePath: string): string {
   return fs.readFileSync(path.join(playwriterDir, relativePath), 'utf-8')
 }
@@ -45,7 +54,7 @@ function writeToDestinations(filename: string, content: string) {
   const websitePath = path.join(websitePublicDir, filename)
 
   fs.writeFileSync(distPath, content, 'utf-8')
-  fs.writeFileSync(websitePath, content, 'utf-8')
+  writeTextIfChanged(websitePath, content)
 
   console.log(`Generated ${filename}`)
 }
@@ -425,7 +434,7 @@ function buildPromptFromSkill() {
   // Copy full skill.md to website/public/ for hosting at playwriter.dev/SKILL.md
   const websitePublicRoot = path.join(playwriterDir, '..', 'website', 'public')
   ensureDir(websitePublicRoot)
-  fs.writeFileSync(path.join(websitePublicRoot, 'SKILL.md'), skillContent, 'utf-8')
+  writeTextIfChanged(path.join(websitePublicRoot, 'SKILL.md'), skillContent)
   console.log('Generated website/public/SKILL.md')
 }
 
@@ -481,7 +490,7 @@ function buildWellKnownSkills() {
   ensureDir(playwriterSkillDir)
 
   // Copy SKILL.md to well-known location
-  fs.writeFileSync(path.join(playwriterSkillDir, 'SKILL.md'), skillContent, 'utf-8')
+  writeTextIfChanged(path.join(playwriterSkillDir, 'SKILL.md'), skillContent)
   console.log('Generated website/public/.well-known/skills/playwriter/SKILL.md')
 
   // Generate index.json
@@ -495,7 +504,7 @@ function buildWellKnownSkills() {
     ],
   }
 
-  fs.writeFileSync(path.join(wellKnownDir, 'index.json'), JSON.stringify(indexJson, null, 2) + '\n', 'utf-8')
+  writeTextIfChanged(path.join(wellKnownDir, 'index.json'), JSON.stringify(indexJson, null, 2) + '\n')
   console.log('Generated website/public/.well-known/skills/index.json')
 }
 
