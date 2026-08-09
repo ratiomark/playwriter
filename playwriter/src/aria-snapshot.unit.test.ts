@@ -6,6 +6,7 @@ import {
   filterFullSnapshotTree,
   filterInteractiveSnapshotTree,
   finalizeSnapshotOutput,
+  removeIgnoredIndentOffsets,
   type SnapshotNode,
 } from './aria-snapshot.js'
 
@@ -18,6 +19,46 @@ const nameValue = (value: string): Protocol.Accessibility.AXValue => {
 }
 
 describe('aria-snapshot tree filters', () => {
+  it('removes only indentation from ignored wrappers', () => {
+    const nodes: SnapshotNode[] = [
+      {
+        role: 'form',
+        name: 'Account',
+        indentOffset: 3,
+        children: [
+          {
+            role: 'textbox',
+            name: 'Email',
+            indentOffset: 2,
+            children: [],
+          },
+        ],
+      },
+      {
+        role: 'button',
+        name: 'Save',
+        indentOffset: 5,
+        children: [],
+      },
+    ]
+
+    const normalized = removeIgnoredIndentOffsets(nodes)
+
+    expect(
+      buildSnapshotLines(normalized)
+        .map((line) => line.text)
+        .join('\n'),
+    ).toBe('- form "Account"\n  - textbox "Email"\n- button "Save"')
+    expect(normalized).toEqual([
+      {
+        role: 'form',
+        name: 'Account',
+        children: [{ role: 'textbox', name: 'Email', children: [] }],
+      },
+      { role: 'button', name: 'Save', children: [] },
+    ])
+  })
+
   it('builds a raw snapshot tree with scope pruning', () => {
     const rootId = '1' as Protocol.Accessibility.AXNodeId
     const mainId = '2' as Protocol.Accessibility.AXNodeId

@@ -1,4 +1,4 @@
-import { exec } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import http from 'node:http'
 import net from 'node:net'
@@ -10,7 +10,7 @@ import { startPlayWriterCDPRelayServer, type RelayServer } from './cdp-relay.js'
 import { createFileLogger } from './create-logger.js'
 import { killPortProcess } from './kill-port.js'
 
-const execAsync = promisify(exec)
+const execFileAsync = promisify(execFile)
 const extensionBuildQueues: Map<string, Promise<void>> = new Map()
 
 async function buildExtension({ port, distDir }: { port: number; distDir: string }): Promise<void> {
@@ -21,8 +21,20 @@ async function buildExtension({ port, distDir }: { port: number; distDir: string
     })
     .then(async () => {
       // Build into a per-port dist to avoid parallel test runs overwriting each other.
-      await execAsync(`TESTING=1 PLAYWRITER_PORT=${port} PLAYWRITER_EXTENSION_DIST=${distDir} pnpm build`, {
+      const executable = process.platform === 'win32'
+        ? process.env.ComSpec || 'cmd.exe'
+        : 'pnpm'
+      const args = process.platform === 'win32'
+        ? ['/d', '/s', '/c', 'pnpm build']
+        : ['build']
+      await execFileAsync(executable, args, {
         cwd: '../extension',
+        env: {
+          ...process.env,
+          TESTING: '1',
+          PLAYWRITER_PORT: String(port),
+          PLAYWRITER_EXTENSION_DIST: distDir,
+        },
       })
     })
 
@@ -101,9 +113,10 @@ export async function setupTestContext({
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix))
   const extensionPath = path.resolve('../extension', distDir)
   const allExtensionPaths = [extensionPath, ...additionalExtensions].join(',')
+  const browserPath = process.env.PLAYWRITER_BROWSER_PATH?.trim()
 
   const browserContext = await chromium.launchPersistentContext(userDataDir, {
-    channel: 'chromium',
+    ...(browserPath ? { executablePath: browserPath } : { channel: 'chromium' }),
     headless: !process.env.HEADFUL,
     colorScheme: 'dark',
     args: [`--disable-extensions-except=${allExtensionPaths}`, `--load-extension=${allExtensionPaths}`],

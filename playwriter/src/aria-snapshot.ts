@@ -456,6 +456,16 @@ function shiftIndent(nodes: SnapshotNode[], offset: number): SnapshotNode[] {
   })
 }
 
+export function removeIgnoredIndentOffsets(nodes: SnapshotNode[]): SnapshotNode[] {
+  return nodes.map((node) => {
+    const { indentOffset: _indentOffset, ...visibleNode } = node
+    return {
+      ...visibleNode,
+      children: removeIgnoredIndentOffsets(node.children),
+    }
+  })
+}
+
 export function buildRawSnapshotTree(options: {
   nodeId: Protocol.Accessibility.AXNodeId
   axById: Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>
@@ -958,6 +968,7 @@ export async function getAriaSnapshot({
   locator,
   refFilter,
   interactiveOnly = false,
+  normalizeIgnoredIndent = false,
   cdp,
 }: {
   page: Page
@@ -965,6 +976,8 @@ export async function getAriaSnapshot({
   locator?: Locator
   refFilter?: (info: { role: string; name: string }) => boolean
   interactiveOnly?: boolean
+  /** Remove indentation contributed only by filtered-out accessibility wrappers. */
+  normalizeIgnoredIndent?: boolean
   cdp?: ICDPSession
 }): Promise<AriaSnapshotResult> {
   const session = cdp || (await getCDPSessionForPage({ page }))
@@ -1192,10 +1205,11 @@ export async function getAriaSnapshot({
       snapshotNodes = filtered
     }
 
-    const snapshotLines = buildSnapshotLines(snapshotNodes)
+    const outputNodes = normalizeIgnoredIndent ? removeIgnoredIndentOffsets(snapshotNodes) : snapshotNodes
+    const snapshotLines = buildSnapshotLines(outputNodes)
 
     const shortRefMap = buildShortRefMap({ refs })
-    const finalized = finalizeSnapshotOutput(snapshotLines, snapshotNodes, shortRefMap)
+    const finalized = finalizeSnapshotOutput(snapshotLines, outputNodes, shortRefMap)
     const refsWithShortRef: Array<AriaRef & { selector?: string }> = refs.map((entry) => {
       return {
         ...entry,

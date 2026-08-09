@@ -1,0 +1,420 @@
+# GitHub Dense UI
+
+This comparison reuses the GitHub case from `aria-snapshot.test.ts`.
+Both outputs come from the same Playwriter executor, page, accessibility extraction, and renderer.
+
+## Upstream Playwriter CLI Output
+
+```text
+Console output:
+[log]       - role=link[name="Skip to content"]
+      - banner:
+          - role=link[name="Homepage"]
+          - navigation "Global":
+            - list:
+              - listitem:
+                - role=button[name="Platform"]
+              - listitem:
+                - role=button[name="Solutions"]
+              - listitem:
+                - role=button[name="Resources"]
+              - listitem:
+                - role=button[name="Open Source"]
+              - listitem:
+                - role=button[name="Enterprise"]
+              - listitem:
+                - role=link[name="Pricing"] >> nth=0
+              - role=button[name="Search or jump to, type / to search"]
+            - role=link[name="Sign in"]
+            - role=link[name="Sign up"]
+        - main:
+                - region "The future of building happens together"
+                  - form:
+                    - labeltext:
+                      - text: "Enter your email"
+                      - textbox "Enter your email" [id="hero_user_email"]
+                    - role=button[name="Sign up for GitHub"] >> nth=0
+                  - role=link[name="Try GitHub Copilot"] >> nth=0
+                - role=button[name="Pause"]
+                      - role=video >> nth=0
+                  - role=tab[name="Code"]
+                  - role=tab[name="Plan"]
+                  - role=tab[name="Collaborate"]
+                  - role=tab[name="Automate"]
+                  - role=tab[name="Secure"]
+                  - role=button[name="Pause animation"]
+                - role=button[name="Pause video"]
+                    - role=video >> nth=1
+                      - role=link[name="Explore GitHub Copilot"]
+                        - role=link[name="Read customer story"]
+                        - role=link[name="Read industry report"]
+                      - role=button[name="Automate your path to production"]
+                        - role=link[name="Explore GitHub Actions"]
+                      - role=button[name="Code instantly from anywhere"]
+                      - role=button[name="Keep momentum on the go"]
+                      - role=button[name="Shape your toolchain"]
+                    - role=link[name="Explore GitHub Advanced Security"]
+                        - role=link[name="Learn about GitHub Code Security"]
+                        - role=link[name="Learn about Dependabot"]
+                        - role=link[name="Learn about GitHub Secret Protection"]
+                          - link "Footnote 1" [id="footnote-1-ref-0"]
+                          - link "Footnote 1" [id="footnote-1-ref-1"]
+                      - role=link[name="Explore GitHub Projects"]
+                      - role=button[name="Keep track of your tasks"]
+                        - role=link[name="Explore GitHub Issues"]
+                      - role=button[name="Share ideas and ask questions"]
+                      - role=button[name="Review code changes together"]
+                      - role=button[name="Fund open source projects"]
+                    - role=tab[name="By industry"]
+                    - role=tab[name="By size"]
+                    - role=tab[name="By use case"]
+                  - role=link[name="Technology Figma streamlines development and strengthens security Read customer story"]
+                  - role=link[name="Automotive Mercedes-Benz standardizes source code and automates onboarding Read customer story"]
+                  - role=link[name="Financial services Mercado Libre cuts coding time by 50% Read customer story"]
+                    - role=link[name="Explore customer stories"]
+                    - role=link[name="View all solutions"]
+                        - form:
+                          - labeltext:
+                            - text: "Enter your email"
+                            - textbox "Enter your email" [id="bottom_cta_section_user_email"]
+                          - role=button[name="Sign up for GitHub"] >> nth=1
+                        - role=link[name="Try GitHub Copilot"] >> nth=1
+                    - list:
+                      - listitem:
+                        - role=link[name="Back to content GitHub internal customer data, 2025."]
+                - role=link[name="Back to top"]
+        - contentinfo:
+              - region "THE DEVELOPER NEWSLETTER":
+                - role=link[name="Go to GitHub homepage"]
+                - role=link[name="Subscribe"]
+                - navigation "PLATFORM":
+                  - list:
+                    - listitem:
+                      - role=link[name="Features"]
+                    - listitem:
+                      - role=link[name="Enterprise"]
+                    - listitem:
+                      - role=link[name="Copilot"]
+                    - listitem:
+                      - role=link[name="AI"]
+                    - listitem:
+                      - role=link[name="Security"]
+                    - listitem:
+                      - role=link[name="Pricing"] >> nth=1
+                    - listitem:
+                      - role=link[name="Team"]
+                    - listitem:
+                      - role=link[name="Resources"]
+                    - listitem:
+                      - role=link[name="Roadmap"]
+                    - listitem:
+                      - role=link[name="Compare GitHub"]
+                - navigation "ECOSYSTEM":
+                  - list:
+                    - listitem:
+                      - role=link[name="Developer API"]
+                    - listitem:
+                      - role=link[name="Partners"]
+                    - listitem:
+                      - role=link[name="Education"]
+                    - listitem:
+                      - role=link[name="GitHub CLI"]
+                    - listitem:
+                      - role=link[name="GitHub Desktop"]
+                    - listitem:
+                      - role=link[name="GitHub Mobile"]
+                    - listitem:
+                      - role=link[name="GitHub Marketplace"]
+                    - listitem:
+                      - role=link[name="MCP Registry"]
+                - navigation "SUPPORT":
+                  - list:
+                    - listitem:
+                      - role=link[name="Docs"]
+                    - listitem:
+                      - role=link[name="Community Forum"]
+                    - listitem:
+                      - role=link[name="Professional Services"]
+                    - listitem:
+                      - role=link[name="Premium Support"]
+                    - listitem:
+                      - role=link[name="Skills"]
+                    - listitem:
+                      - role=link[name="Status"]
+                    - listitem:
+                      - role=link[name="Contact GitHub"]
+                    - listitem:
+                      - role=link[name="What is Git?"]
+                    - listitem:
+                      - role=link[name="Sitemap"]
+                - navigation "COMPANY":
+                  - list:
+                    - listitem:
+                      - role=link[name="About"]
+                    - listitem:
+                      - role=link[name="Why GitHub"]
+                    - listitem:
+                      - role=link[name="Customer Stories"]
+                    - listitem:
+                      - role=link[name="Blog"]
+                    - listitem:
+                      - role=link[name="The ReadME Project"]
+                    - listitem:
+                      - role=link[name="Careers"]
+                    - listitem:
+                      - role=link[name="Newsroom"]
+                    - listitem:
+                      - role=link[name="Inclusion"]
+                    - listitem:
+                      - role=link[name="Social Impact"]
+                    - listitem:
+                      - role=link[name="Shop"]
+              - navigation "Legal and Resource Links":
+                - list:
+                  - listitem
+                  - listitem:
+                    - role=link[name="TERMS"]
+                  - listitem:
+                    - role=link[name="PRIVACY"]
+                  - listitem:
+                    - role=button[name="MANAGE COOKIES"]
+                  - listitem:
+                    - role=button[name="DO NOT SHARE MY PERSONAL INFORMATION"]
+                - navigation "GitHub's Social Media Links":
+                  - list:
+                    - listitem:
+                      - role=link[name="GitHub on LinkedIn"]
+                    - listitem:
+                      - role=link[name="GitHub on Instagram"]
+                    - listitem:
+                      - role=link[name="GitHub on YouTube"]
+                    - listitem:
+                      - role=link[name="GitHub on X"]
+                    - listitem:
+                      - role=link[name="GitHub on TikTok"]
+                    - listitem:
+                      - role=link[name="GitHub on Twitch"]
+                    - listitem:
+                      - role=link[name="GitHub’s organization on GitHub"]
+                - "English - Select language" [data-testid="ActionMenu-button"]
+  - role=button[name="Pin element — click any element to copy inspection code for a playwriter -e call"]
+  - role=button[name="Close Playwriter toolbar"]
+
+use refToLocator({ ref: 'e3' }) to get locators for ref strings.
+```
+
+## Relay Structured Result
+
+```json
+{
+  "agentText": "- role=link[name=\"Skip to content\"]\n- banner:\n  - role=link[name=\"Homepage\"]\n  - navigation \"Global\":\n    - list:\n      - listitem:\n        - role=button[name=\"Platform\"]\n      - listitem:\n        - role=button[name=\"Solutions\"]\n      - listitem:\n        - role=button[name=\"Resources\"]\n      - listitem:\n        - role=button[name=\"Open Source\"]\n      - listitem:\n        - role=button[name=\"Enterprise\"]\n      - listitem:\n        - role=link[name=\"Pricing\"] >> nth=0\n  - role=button[name=\"Search or jump to, type / to search\"]\n  - role=link[name=\"Sign in\"]\n  - role=link[name=\"Sign up\"]\n- main:\n  - region \"The future of building happens together\"\n  - form:\n    - labeltext:\n      - text: \"Enter your email\"\n    - textbox \"Enter your email\" [id=\"hero_user_email\"]\n    - role=button[name=\"Sign up for GitHub\"] >> nth=0\n  - role=link[name=\"Try GitHub Copilot\"] >> nth=0\n  - role=button[name=\"Pause\"]\n  - role=video >> nth=0\n  - role=tab[name=\"Code\"]\n  - role=tab[name=\"Plan\"]\n  - role=tab[name=\"Collaborate\"]\n  - role=tab[name=\"Automate\"]\n  - role=tab[name=\"Secure\"]\n  - role=button[name=\"Pause animation\"]\n  - role=button[name=\"Pause video\"]\n  - role=video >> nth=1\n  - role=link[name=\"Explore GitHub Copilot\"]\n  - role=link[name=\"Read customer story\"]\n  - role=link[name=\"Read industry report\"]\n  - role=button[name=\"Automate your path to production\"]\n  - role=link[name=\"Explore GitHub Actions\"]\n  - role=button[name=\"Code instantly from anywhere\"]\n  - role=button[name=\"Keep momentum on the go\"]\n  - role=button[name=\"Shape your toolchain\"]\n  - role=link[name=\"Explore GitHub Advanced Security\"]\n  - role=link[name=\"Learn about GitHub Code Security\"]\n  - role=link[name=\"Learn about Dependabot\"]\n  - role=link[name=\"Learn about GitHub Secret Protection\"]\n  - link \"Footnote 1\" [id=\"footnote-1-ref-0\"]\n  - link \"Footnote 1\" [id=\"footnote-1-ref-1\"]\n  - role=link[name=\"Explore GitHub Projects\"]\n  - role=button[name=\"Keep track of your tasks\"]\n  - role=link[name=\"Explore GitHub Issues\"]\n  - role=button[name=\"Share ideas and ask questions\"]\n  - role=button[name=\"Review code changes together\"]\n  - role=button[name=\"Fund open source projects\"]\n  - role=tab[name=\"By industry\"]\n  - role=tab[name=\"By size\"]\n  - role=tab[name=\"By use case\"]\n  - role=link[name=\"Technology Figma streamlines development and strengthens security Read customer story\"]\n  - role=link[name=\"Automotive Mercedes-Benz standardizes source code and automates onboarding Read customer story\"]\n  - role=link[name=\"Financial services Mercado Libre cuts coding time by 50% Read customer story\"]\n  - role=link[name=\"Explore customer stories\"]\n  - role=link[name=\"View all solutions\"]\n  - form:\n    - labeltext:\n      - text: \"Enter your email\"\n    - textbox \"Enter your email\" [id=\"bottom_cta_section_user_email\"]\n    - role=button[name=\"Sign up for GitHub\"] >> nth=1\n  - role=link[name=\"Try GitHub Copilot\"] >> nth=1\n  - list:\n    - listitem:\n      - role=link[name=\"Back to content GitHub internal customer data, 2025.\"]\n  - role=link[name=\"Back to top\"]\n- contentinfo:\n  - region \"THE DEVELOPER NEWSLETTER\":\n    - role=link[name=\"Go to GitHub homepage\"]\n    - role=link[name=\"Subscribe\"]\n  - navigation \"PLATFORM\":\n    - list:\n      - listitem:\n        - role=link[name=\"Features\"]\n      - listitem:\n        - role=link[name=\"Enterprise\"]\n      - listitem:\n        - role=link[name=\"Copilot\"]\n      - listitem:\n        - role=link[name=\"AI\"]\n      - listitem:\n        - role=link[name=\"Security\"]\n      - listitem:\n        - role=link[name=\"Pricing\"] >> nth=1\n      - listitem:\n        - role=link[name=\"Team\"]\n      - listitem:\n        - role=link[name=\"Resources\"]\n      - listitem:\n        - role=link[name=\"Roadmap\"]\n      - listitem:\n        - role=link[name=\"Compare GitHub\"]\n  - navigation \"ECOSYSTEM\":\n    - list:\n      - listitem:\n        - role=link[name=\"Developer API\"]\n      - listitem:\n        - role=link[name=\"Partners\"]\n      - listitem:\n        - role=link[name=\"Education\"]\n      - listitem:\n        - role=link[name=\"GitHub CLI\"]\n      - listitem:\n        - role=link[name=\"GitHub Desktop\"]\n      - listitem:\n        - role=link[name=\"GitHub Mobile\"]\n      - listitem:\n        - role=link[name=\"GitHub Marketplace\"]\n      - listitem:\n        - role=link[name=\"MCP Registry\"]\n  - navigation \"SUPPORT\":\n    - list:\n      - listitem:\n        - role=link[name=\"Docs\"]\n      - listitem:\n        - role=link[name=\"Community Forum\"]\n      - listitem:\n        - role=link[name=\"Professional Services\"]\n      - listitem:\n        - role=link[name=\"Premium Support\"]\n      - listitem:\n        - role=link[name=\"Skills\"]\n      - listitem:\n        - role=link[name=\"Status\"]\n      - listitem:\n        - role=link[name=\"Contact GitHub\"]\n      - listitem:\n        - role=link[name=\"What is Git?\"]\n      - listitem:\n        - role=link[name=\"Sitemap\"]\n  - navigation \"COMPANY\":\n    - list:\n      - listitem:\n        - role=link[name=\"About\"]\n      - listitem:\n        - role=link[name=\"Why GitHub\"]\n      - listitem:\n        - role=link[name=\"Customer Stories\"]\n      - listitem:\n        - role=link[name=\"Blog\"]\n      - listitem:\n        - role=link[name=\"The ReadME Project\"]\n      - listitem:\n        - role=link[name=\"Careers\"]\n      - listitem:\n        - role=link[name=\"Newsroom\"]\n      - listitem:\n        - role=link[name=\"Inclusion\"]\n      - listitem:\n        - role=link[name=\"Social Impact\"]\n      - listitem:\n        - role=link[name=\"Shop\"]\n  - navigation \"Legal and Resource Links\":\n    - list:\n      - listitem\n      - listitem:\n        - role=link[name=\"TERMS\"]\n      - listitem:\n        - role=link[name=\"PRIVACY\"]\n      - listitem:\n        - role=button[name=\"MANAGE COOKIES\"]\n      - listitem:\n        - role=button[name=\"DO NOT SHARE MY PERSONAL INFORMATION\"]\n  - navigation \"GitHub's Social Media Links\":\n    - list:\n      - listitem:\n        - role=link[name=\"GitHub on LinkedIn\"]\n      - listitem:\n        - role=link[name=\"GitHub on Instagram\"]\n      - listitem:\n        - role=link[name=\"GitHub on YouTube\"]\n      - listitem:\n        - role=link[name=\"GitHub on X\"]\n      - listitem:\n        - role=link[name=\"GitHub on TikTok\"]\n      - listitem:\n        - role=link[name=\"GitHub on Twitch\"]\n      - listitem:\n        - role=link[name=\"GitHub’s organization on GitHub\"]\n  - \"English - Select language\" [data-testid=\"ActionMenu-button\"]\n- role=button[name=\"Pin element — click any element to copy inspection code for a playwriter -e call\"]\n- role=button[name=\"Close Playwriter toolbar\"]\n\nuse refToLocator({ ref: 'e3' }) to get locators for ref strings.",
+  "consoleEvents": [
+    {
+      "method": "log",
+      "text": "- role=link[name=\"Skip to content\"]\n- banner:\n  - role=link[name=\"Homepage\"]\n  - navigation \"Global\":\n    - list:\n      - listitem:\n        - role=button[name=\"Platform\"]\n      - listitem:\n        - role=button[name=\"Solutions\"]\n      - listitem:\n        - role=button[name=\"Resources\"]\n      - listitem:\n        - role=button[name=\"Open Source\"]\n      - listitem:\n        - role=button[name=\"Enterprise\"]\n      - listitem:\n        - role=link[name=\"Pricing\"] >> nth=0\n  - role=button[name=\"Search or jump to, type / to search\"]\n  - role=link[name=\"Sign in\"]\n  - role=link[name=\"Sign up\"]\n- main:\n  - region \"The future of building happens together\"\n  - form:\n    - labeltext:\n      - text: \"Enter your email\"\n    - textbox \"Enter your email\" [id=\"hero_user_email\"]\n    - role=button[name=\"Sign up for GitHub\"] >> nth=0\n  - role=link[name=\"Try GitHub Copilot\"] >> nth=0\n  - role=button[name=\"Pause\"]\n  - role=video >> nth=0\n  - role=tab[name=\"Code\"]\n  - role=tab[name=\"Plan\"]\n  - role=tab[name=\"Collaborate\"]\n  - role=tab[name=\"Automate\"]\n  - role=tab[name=\"Secure\"]\n  - role=button[name=\"Pause animation\"]\n  - role=button[name=\"Pause video\"]\n  - role=video >> nth=1\n  - role=link[name=\"Explore GitHub Copilot\"]\n  - role=link[name=\"Read customer story\"]\n  - role=link[name=\"Read industry report\"]\n  - role=button[name=\"Automate your path to production\"]\n  - role=link[name=\"Explore GitHub Actions\"]\n  - role=button[name=\"Code instantly from anywhere\"]\n  - role=button[name=\"Keep momentum on the go\"]\n  - role=button[name=\"Shape your toolchain\"]\n  - role=link[name=\"Explore GitHub Advanced Security\"]\n  - role=link[name=\"Learn about GitHub Code Security\"]\n  - role=link[name=\"Learn about Dependabot\"]\n  - role=link[name=\"Learn about GitHub Secret Protection\"]\n  - link \"Footnote 1\" [id=\"footnote-1-ref-0\"]\n  - link \"Footnote 1\" [id=\"footnote-1-ref-1\"]\n  - role=link[name=\"Explore GitHub Projects\"]\n  - role=button[name=\"Keep track of your tasks\"]\n  - role=link[name=\"Explore GitHub Issues\"]\n  - role=button[name=\"Share ideas and ask questions\"]\n  - role=button[name=\"Review code changes together\"]\n  - role=button[name=\"Fund open source projects\"]\n  - role=tab[name=\"By industry\"]\n  - role=tab[name=\"By size\"]\n  - role=tab[name=\"By use case\"]\n  - role=link[name=\"Technology Figma streamlines development and strengthens security Read customer story\"]\n  - role=link[name=\"Automotive Mercedes-Benz standardizes source code and automates onboarding Read customer story\"]\n  - role=link[name=\"Financial services Mercado Libre cuts coding time by 50% Read customer story\"]\n  - role=link[name=\"Explore customer stories\"]\n  - role=link[name=\"View all solutions\"]\n  - form:\n    - labeltext:\n      - text: \"Enter your email\"\n    - textbox \"Enter your email\" [id=\"bottom_cta_section_user_email\"]\n    - role=button[name=\"Sign up for GitHub\"] >> nth=1\n  - role=link[name=\"Try GitHub Copilot\"] >> nth=1\n  - list:\n    - listitem:\n      - role=link[name=\"Back to content GitHub internal customer data, 2025.\"]\n  - role=link[name=\"Back to top\"]\n- contentinfo:\n  - region \"THE DEVELOPER NEWSLETTER\":\n    - role=link[name=\"Go to GitHub homepage\"]\n    - role=link[name=\"Subscribe\"]\n  - navigation \"PLATFORM\":\n    - list:\n      - listitem:\n        - role=link[name=\"Features\"]\n      - listitem:\n        - role=link[name=\"Enterprise\"]\n      - listitem:\n        - role=link[name=\"Copilot\"]\n      - listitem:\n        - role=link[name=\"AI\"]\n      - listitem:\n        - role=link[name=\"Security\"]\n      - listitem:\n        - role=link[name=\"Pricing\"] >> nth=1\n      - listitem:\n        - role=link[name=\"Team\"]\n      - listitem:\n        - role=link[name=\"Resources\"]\n      - listitem:\n        - role=link[name=\"Roadmap\"]\n      - listitem:\n        - role=link[name=\"Compare GitHub\"]\n  - navigation \"ECOSYSTEM\":\n    - list:\n      - listitem:\n        - role=link[name=\"Developer API\"]\n      - listitem:\n        - role=link[name=\"Partners\"]\n      - listitem:\n        - role=link[name=\"Education\"]\n      - listitem:\n        - role=link[name=\"GitHub CLI\"]\n      - listitem:\n        - role=link[name=\"GitHub Desktop\"]\n      - listitem:\n        - role=link[name=\"GitHub Mobile\"]\n      - listitem:\n        - role=link[name=\"GitHub Marketplace\"]\n      - listitem:\n        - role=link[name=\"MCP Registry\"]\n  - navigation \"SUPPORT\":\n    - list:\n      - listitem:\n        - role=link[name=\"Docs\"]\n      - listitem:\n        - role=link[name=\"Community Forum\"]\n      - listitem:\n        - role=link[name=\"Professional Services\"]\n      - listitem:\n        - role=link[name=\"Premium Support\"]\n      - listitem:\n        - role=link[name=\"Skills\"]\n      - listitem:\n        - role=link[name=\"Status\"]\n      - listitem:\n        - role=link[name=\"Contact GitHub\"]\n      - listitem:\n        - role=link[name=\"What is Git?\"]\n      - listitem:\n        - role=link[name=\"Sitemap\"]\n  - navigation \"COMPANY\":\n    - list:\n      - listitem:\n        - role=link[name=\"About\"]\n      - listitem:\n        - role=link[name=\"Why GitHub\"]\n      - listitem:\n        - role=link[name=\"Customer Stories\"]\n      - listitem:\n        - role=link[name=\"Blog\"]\n      - listitem:\n        - role=link[name=\"The ReadME Project\"]\n      - listitem:\n        - role=link[name=\"Careers\"]\n      - listitem:\n        - role=link[name=\"Newsroom\"]\n      - listitem:\n        - role=link[name=\"Inclusion\"]\n      - listitem:\n        - role=link[name=\"Social Impact\"]\n      - listitem:\n        - role=link[name=\"Shop\"]\n  - navigation \"Legal and Resource Links\":\n    - list:\n      - listitem\n      - listitem:\n        - role=link[name=\"TERMS\"]\n      - listitem:\n        - role=link[name=\"PRIVACY\"]\n      - listitem:\n        - role=button[name=\"MANAGE COOKIES\"]\n      - listitem:\n        - role=button[name=\"DO NOT SHARE MY PERSONAL INFORMATION\"]\n  - navigation \"GitHub's Social Media Links\":\n    - list:\n      - listitem:\n        - role=link[name=\"GitHub on LinkedIn\"]\n      - listitem:\n        - role=link[name=\"GitHub on Instagram\"]\n      - listitem:\n        - role=link[name=\"GitHub on YouTube\"]\n      - listitem:\n        - role=link[name=\"GitHub on X\"]\n      - listitem:\n        - role=link[name=\"GitHub on TikTok\"]\n      - listitem:\n        - role=link[name=\"GitHub on Twitch\"]\n      - listitem:\n        - role=link[name=\"GitHub’s organization on GitHub\"]\n  - \"English - Select language\" [data-testid=\"ActionMenu-button\"]\n- role=button[name=\"Pin element — click any element to copy inspection code for a playwriter -e call\"]\n- role=button[name=\"Close Playwriter toolbar\"]\n\nuse refToLocator({ ref: 'e3' }) to get locators for ref strings."
+    }
+  ],
+  "returnValue": {
+    "snapshot": "- role=link[name=\"Skip to content\"]\n- banner:\n  - role=link[name=\"Homepage\"]\n  - navigation \"Global\":\n    - list:\n      - listitem:\n        - role=button[name=\"Platform\"]\n      - listitem:\n        - role=button[name=\"Solutions\"]\n      - listitem:\n        - role=button[name=\"Resources\"]\n      - listitem:\n        - role=button[name=\"Open Source\"]\n      - listitem:\n        - role=button[name=\"Enterprise\"]\n      - listitem:\n        - role=link[name=\"Pricing\"] >> nth=0\n  - role=button[name=\"Search or jump to, type / to search\"]\n  - role=link[name=\"Sign in\"]\n  - role=link[name=\"Sign up\"]\n- main:\n  - region \"The future of building happens together\"\n  - form:\n    - labeltext:\n      - text: \"Enter your email\"\n    - textbox \"Enter your email\" [id=\"hero_user_email\"]\n    - role=button[name=\"Sign up for GitHub\"] >> nth=0\n  - role=link[name=\"Try GitHub Copilot\"] >> nth=0\n  - role=button[name=\"Pause\"]\n  - role=video >> nth=0\n  - role=tab[name=\"Code\"]\n  - role=tab[name=\"Plan\"]\n  - role=tab[name=\"Collaborate\"]\n  - role=tab[name=\"Automate\"]\n  - role=tab[name=\"Secure\"]\n  - role=button[name=\"Pause animation\"]\n  - role=button[name=\"Pause video\"]\n  - role=video >> nth=1\n  - role=link[name=\"Explore GitHub Copilot\"]\n  - role=link[name=\"Read customer story\"]\n  - role=link[name=\"Read industry report\"]\n  - role=button[name=\"Automate your path to production\"]\n  - role=link[name=\"Explore GitHub Actions\"]\n  - role=button[name=\"Code instantly from anywhere\"]\n  - role=button[name=\"Keep momentum on the go\"]\n  - role=button[name=\"Shape your toolchain\"]\n  - role=link[name=\"Explore GitHub Advanced Security\"]\n  - role=link[name=\"Learn about GitHub Code Security\"]\n  - role=link[name=\"Learn about Dependabot\"]\n  - role=link[name=\"Learn about GitHub Secret Protection\"]\n  - link \"Footnote 1\" [id=\"footnote-1-ref-0\"]\n  - link \"Footnote 1\" [id=\"footnote-1-ref-1\"]\n  - role=link[name=\"Explore GitHub Projects\"]\n  - role=button[name=\"Keep track of your tasks\"]\n  - role=link[name=\"Explore GitHub Issues\"]\n  - role=button[name=\"Share ideas and ask questions\"]\n  - role=button[name=\"Review code changes together\"]\n  - role=button[name=\"Fund open source projects\"]\n  - role=tab[name=\"By industry\"]\n  - role=tab[name=\"By size\"]\n  - role=tab[name=\"By use case\"]\n  - role=link[name=\"Technology Figma streamlines development and strengthens security Read customer story\"]\n  - role=link[name=\"Automotive Mercedes-Benz standardizes source code and automates onboarding Read customer story\"]\n  - role=link[name=\"Financial services Mercado Libre cuts coding time by 50% Read customer story\"]\n  - role=link[name=\"Explore customer stories\"]\n  - role=link[name=\"View all solutions\"]\n  - form:\n    - labeltext:\n      - text: \"Enter your email\"\n    - textbox \"Enter your email\" [id=\"bottom_cta_section_user_email\"]\n    - role=button[name=\"Sign up for GitHub\"] >> nth=1\n  - role=link[name=\"Try GitHub Copilot\"] >> nth=1\n  - list:\n    - listitem:\n      - role=link[name=\"Back to content GitHub internal customer data, 2025.\"]\n  - role=link[name=\"Back to top\"]\n- contentinfo:\n  - region \"THE DEVELOPER NEWSLETTER\":\n    - role=link[name=\"Go to GitHub homepage\"]\n    - role=link[name=\"Subscribe\"]\n  - navigation \"PLATFORM\":\n    - list:\n      - listitem:\n        - role=link[name=\"Features\"]\n      - listitem:\n        - role=link[name=\"Enterprise\"]\n      - listitem:\n        - role=link[name=\"Copilot\"]\n      - listitem:\n        - role=link[name=\"AI\"]\n      - listitem:\n        - role=link[name=\"Security\"]\n      - listitem:\n        - role=link[name=\"Pricing\"] >> nth=1\n      - listitem:\n        - role=link[name=\"Team\"]\n      - listitem:\n        - role=link[name=\"Resources\"]\n      - listitem:\n        - role=link[name=\"Roadmap\"]\n      - listitem:\n        - role=link[name=\"Compare GitHub\"]\n  - navigation \"ECOSYSTEM\":\n    - list:\n      - listitem:\n        - role=link[name=\"Developer API\"]\n      - listitem:\n        - role=link[name=\"Partners\"]\n      - listitem:\n        - role=link[name=\"Education\"]\n      - listitem:\n        - role=link[name=\"GitHub CLI\"]\n      - listitem:\n        - role=link[name=\"GitHub Desktop\"]\n      - listitem:\n        - role=link[name=\"GitHub Mobile\"]\n      - listitem:\n        - role=link[name=\"GitHub Marketplace\"]\n      - listitem:\n        - role=link[name=\"MCP Registry\"]\n  - navigation \"SUPPORT\":\n    - list:\n      - listitem:\n        - role=link[name=\"Docs\"]\n      - listitem:\n        - role=link[name=\"Community Forum\"]\n      - listitem:\n        - role=link[name=\"Professional Services\"]\n      - listitem:\n        - role=link[name=\"Premium Support\"]\n      - listitem:\n        - role=link[name=\"Skills\"]\n      - listitem:\n        - role=link[name=\"Status\"]\n      - listitem:\n        - role=link[name=\"Contact GitHub\"]\n      - listitem:\n        - role=link[name=\"What is Git?\"]\n      - listitem:\n        - role=link[name=\"Sitemap\"]\n  - navigation \"COMPANY\":\n    - list:\n      - listitem:\n        - role=link[name=\"About\"]\n      - listitem:\n        - role=link[name=\"Why GitHub\"]\n      - listitem:\n        - role=link[name=\"Customer Stories\"]\n      - listitem:\n        - role=link[name=\"Blog\"]\n      - listitem:\n        - role=link[name=\"The ReadME Project\"]\n      - listitem:\n        - role=link[name=\"Careers\"]\n      - listitem:\n        - role=link[name=\"Newsroom\"]\n      - listitem:\n        - role=link[name=\"Inclusion\"]\n      - listitem:\n        - role=link[name=\"Social Impact\"]\n      - listitem:\n        - role=link[name=\"Shop\"]\n  - navigation \"Legal and Resource Links\":\n    - list:\n      - listitem\n      - listitem:\n        - role=link[name=\"TERMS\"]\n      - listitem:\n        - role=link[name=\"PRIVACY\"]\n      - listitem:\n        - role=button[name=\"MANAGE COOKIES\"]\n      - listitem:\n        - role=button[name=\"DO NOT SHARE MY PERSONAL INFORMATION\"]\n  - navigation \"GitHub's Social Media Links\":\n    - list:\n      - listitem:\n        - role=link[name=\"GitHub on LinkedIn\"]\n      - listitem:\n        - role=link[name=\"GitHub on Instagram\"]\n      - listitem:\n        - role=link[name=\"GitHub on YouTube\"]\n      - listitem:\n        - role=link[name=\"GitHub on X\"]\n      - listitem:\n        - role=link[name=\"GitHub on TikTok\"]\n      - listitem:\n        - role=link[name=\"GitHub on Twitch\"]\n      - listitem:\n        - role=link[name=\"GitHub’s organization on GitHub\"]\n  - \"English - Select language\" [data-testid=\"ActionMenu-button\"]\n- role=button[name=\"Pin element — click any element to copy inspection code for a playwriter -e call\"]\n- role=button[name=\"Close Playwriter toolbar\"]\n\nuse refToLocator({ ref: 'e3' }) to get locators for ref strings."
+  }
+}
+```
+
+## Candidate ATM Agent Output
+
+```text
+- role=link[name="Skip to content"]
+- banner:
+  - role=link[name="Homepage"]
+  - navigation "Global":
+    - list:
+      - listitem:
+        - role=button[name="Platform"]
+      - listitem:
+        - role=button[name="Solutions"]
+      - listitem:
+        - role=button[name="Resources"]
+      - listitem:
+        - role=button[name="Open Source"]
+      - listitem:
+        - role=button[name="Enterprise"]
+      - listitem:
+        - role=link[name="Pricing"] >> nth=0
+  - role=button[name="Search or jump to, type / to search"]
+  - role=link[name="Sign in"]
+  - role=link[name="Sign up"]
+- main:
+  - region "The future of building happens together"
+  - form:
+    - labeltext:
+      - text: "Enter your email"
+    - textbox "Enter your email" [id="hero_user_email"]
+    - role=button[name="Sign up for GitHub"] >> nth=0
+  - role=link[name="Try GitHub Copilot"] >> nth=0
+  - role=button[name="Pause"]
+  - role=video >> nth=0
+  - role=tab[name="Code"]
+  - role=tab[name="Plan"]
+  - role=tab[name="Collaborate"]
+  - role=tab[name="Automate"]
+  - role=tab[name="Secure"]
+  - role=button[name="Pause animation"]
+  - role=button[name="Pause video"]
+  - role=video >> nth=1
+  - role=link[name="Explore GitHub Copilot"]
+  - role=link[name="Read customer story"]
+  - role=link[name="Read industry report"]
+  - role=button[name="Automate your path to production"]
+  - role=link[name="Explore GitHub Actions"]
+  - role=button[name="Code instantly from anywhere"]
+  - role=button[name="Keep momentum on the go"]
+  - role=button[name="Shape your toolchain"]
+  - role=link[name="Explore GitHub Advanced Security"]
+  - role=link[name="Learn about GitHub Code Security"]
+  - role=link[name="Learn about Dependabot"]
+  - role=link[name="Learn about GitHub Secret Protection"]
+  - link "Footnote 1" [id="footnote-1-ref-0"]
+  - link "Footnote 1" [id="footnote-1-ref-1"]
+  - role=link[name="Explore GitHub Projects"]
+  - role=button[name="Keep track of your tasks"]
+  - role=link[name="Explore GitHub Issues"]
+  - role=button[name="Share ideas and ask questions"]
+  - role=button[name="Review code changes together"]
+  - role=button[name="Fund open source projects"]
+  - role=tab[name="By industry"]
+  - role=tab[name="By size"]
+  - role=tab[name="By use case"]
+  - role=link[name="Technology Figma streamlines development and strengthens security Read customer story"]
+  - role=link[name="Automotive Mercedes-Benz standardizes source code and automates onboarding Read customer story"]
+  - role=link[name="Financial services Mercado Libre cuts coding time by 50% Read customer story"]
+  - role=link[name="Explore customer stories"]
+  - role=link[name="View all solutions"]
+  - form:
+    - labeltext:
+      - text: "Enter your email"
+    - textbox "Enter your email" [id="bottom_cta_section_user_email"]
+    - role=button[name="Sign up for GitHub"] >> nth=1
+  - role=link[name="Try GitHub Copilot"] >> nth=1
+  - list:
+    - listitem:
+      - role=link[name="Back to content GitHub internal customer data, 2025."]
+  - role=link[name="Back to top"]
+- contentinfo:
+  - region "THE DEVELOPER NEWSLETTER":
+    - role=link[name="Go to GitHub homepage"]
+    - role=link[name="Subscribe"]
+  - navigation "PLATFORM":
+    - list:
+      - listitem:
+        - role=link[name="Features"]
+      - listitem:
+        - role=link[name="Enterprise"]
+      - listitem:
+        - role=link[name="Copilot"]
+      - listitem:
+        - role=link[name="AI"]
+      - listitem:
+        - role=link[name="Security"]
+      - listitem:
+        - role=link[name="Pricing"] >> nth=1
+      - listitem:
+        - role=link[name="Team"]
+      - listitem:
+        - role=link[name="Resources"]
+      - listitem:
+        - role=link[name="Roadmap"]
+      - listitem:
+        - role=link[name="Compare GitHub"]
+  - navigation "ECOSYSTEM":
+    - list:
+      - listitem:
+        - role=link[name="Developer API"]
+      - listitem:
+        - role=link[name="Partners"]
+      - listitem:
+        - role=link[name="Education"]
+      - listitem:
+        - role=link[name="GitHub CLI"]
+      - listitem:
+        - role=link[name="GitHub Desktop"]
+      - listitem:
+        - role=link[name="GitHub Mobile"]
+      - listitem:
+        - role=link[name="GitHub Marketplace"]
+      - listitem:
+        - role=link[name="MCP Registry"]
+  - navigation "SUPPORT":
+    - list:
+      - listitem:
+        - role=link[name="Docs"]
+      - listitem:
+        - role=link[name="Community Forum"]
+      - listitem:
+        - role=link[name="Professional Services"]
+      - listitem:
+        - role=link[name="Premium Support"]
+      - listitem:
+        - role=link[name="Skills"]
+      - listitem:
+        - role=link[name="Status"]
+      - listitem:
+        - role=link[name="Contact GitHub"]
+      - listitem:
+        - role=link[name="What is Git?"]
+      - listitem:
+        - role=link[name="Sitemap"]
+  - navigation "COMPANY":
+    - list:
+      - listitem:
+        - role=link[name="About"]
+      - listitem:
+        - role=link[name="Why GitHub"]
+      - listitem:
+        - role=link[name="Customer Stories"]
+      - listitem:
+        - role=link[name="Blog"]
+      - listitem:
+        - role=link[name="The ReadME Project"]
+      - listitem:
+        - role=link[name="Careers"]
+      - listitem:
+        - role=link[name="Newsroom"]
+      - listitem:
+        - role=link[name="Inclusion"]
+      - listitem:
+        - role=link[name="Social Impact"]
+      - listitem:
+        - role=link[name="Shop"]
+  - navigation "Legal and Resource Links":
+    - list:
+      - listitem
+      - listitem:
+        - role=link[name="TERMS"]
+      - listitem:
+        - role=link[name="PRIVACY"]
+      - listitem:
+        - role=button[name="MANAGE COOKIES"]
+      - listitem:
+        - role=button[name="DO NOT SHARE MY PERSONAL INFORMATION"]
+  - navigation "GitHub's Social Media Links":
+    - list:
+      - listitem:
+        - role=link[name="GitHub on LinkedIn"]
+      - listitem:
+        - role=link[name="GitHub on Instagram"]
+      - listitem:
+        - role=link[name="GitHub on YouTube"]
+      - listitem:
+        - role=link[name="GitHub on X"]
+      - listitem:
+        - role=link[name="GitHub on TikTok"]
+      - listitem:
+        - role=link[name="GitHub on Twitch"]
+      - listitem:
+        - role=link[name="GitHub’s organization on GitHub"]
+  - "English - Select language" [data-testid="ActionMenu-button"]
+- role=button[name="Pin element — click any element to copy inspection code for a playwriter -e call"]
+- role=button[name="Close Playwriter toolbar"]
+
+use refToLocator({ ref: 'e3' }) to get locators for ref strings.
+```

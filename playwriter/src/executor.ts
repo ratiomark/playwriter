@@ -39,7 +39,14 @@ import { createRecordingApi, createStreamApi } from './screen-recording.js'
 import { createDemoVideo } from './ffmpeg.js'
 import { type GhostCursorClientOptions } from './ghost-cursor.js'
 import { GhostCursorController } from './ghost-cursor-controller.js'
-
+import {
+  EXECUTION_CONSOLE_METHODS,
+  presentExecutionConsoleEvents,
+  toJsonReturnValue,
+  type ExecutionConsoleEvent,
+  type ExecutionConsoleMethod,
+  type JsonValue,
+} from './execution-result.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -240,6 +247,9 @@ export interface ExecuteScreenshot {
 
 export interface ExecuteResult {
   text: string
+  agentText?: string
+  consoleEvents?: readonly ExecutionConsoleEvent[]
+  returnValue?: JsonValue
   images: Array<{ data: string; mimeType: string }>
   screenshots: ExecuteScreenshot[]
   isError: boolean
@@ -1087,30 +1097,49 @@ export class PlaywrightExecutor {
   }
 
   async execute(code: string, timeout = 10000): Promise<ExecuteResult> {
-    const consoleLogs: Array<{ method: string; args: any[] }> = []
+    const consoleLogs: Array<{ method: ExecutionConsoleMethod; args: any[] }> = []
     const warningScope = this.beginWarningScope()
 
-    const formatConsoleLogs = (logs: Array<{ method: string; args: any[] }>, prefix = 'Console output') => {
+    const formatConsoleArgs = (args: any[]) => {
+      return args
+        .map((arg) => {
+          if (typeof arg === 'string') return arg
+          return util.inspect(arg, {
+            depth: 4,
+            colors: false,
+            maxArrayLength: 100,
+            maxStringLength: 1000,
+            breakLength: 80,
+          })
+        })
+        .join(' ')
+    }
+
+    const formatConsoleLogs = (
+      logs: Array<{ method: ExecutionConsoleMethod; args: any[] }>,
+      prefix = 'Console output',
+    ) => {
       if (logs.length === 0) {
         return ''
       }
       let text = `${prefix}:\n`
       logs.forEach(({ method, args }) => {
-        const formattedArgs = args
-          .map((arg) => {
-            if (typeof arg === 'string') return arg
-            return util.inspect(arg, {
-              depth: 4,
-              colors: false,
-              maxArrayLength: 100,
-              maxStringLength: 1000,
-              breakLength: 80,
-            })
-          })
-          .join(' ')
-        text += `[${method}] ${formattedArgs}\n`
+        text += `[${method}] ${formatConsoleArgs(args)}\n`
       })
       return text + '\n'
+    }
+
+    const buildConsoleEvents = (): readonly ExecutionConsoleEvent[] => {
+      return consoleLogs.map(({ method, args }) => ({ method, text: formatConsoleArgs(args) }))
+    }
+
+    const truncateOutput = (text: string): string => {
+      const MAX_LENGTH = 10000
+      const output = text.trim()
+      return output.length > MAX_LENGTH
+        ? output.slice(0, MAX_LENGTH) +
+            `\n\n[Truncated to ${MAX_LENGTH} characters. Use search to find specific content]`
+        : output
     }
 
     try {
@@ -1140,19 +1169,19 @@ export class PlaywrightExecutor {
 
       const customConsole = {
         log: (...args: any[]) => {
-          consoleLogs.push({ method: 'log', args })
+          consoleLogs.push({ method: EXECUTION_CONSOLE_METHODS.log, args })
         },
         info: (...args: any[]) => {
-          consoleLogs.push({ method: 'info', args })
+          consoleLogs.push({ method: EXECUTION_CONSOLE_METHODS.info, args })
         },
         warn: (...args: any[]) => {
-          consoleLogs.push({ method: 'warn', args })
+          consoleLogs.push({ method: EXECUTION_CONSOLE_METHODS.warn, args })
         },
         error: (...args: any[]) => {
-          consoleLogs.push({ method: 'error', args })
+          consoleLogs.push({ method: EXECUTION_CONSOLE_METHODS.error, args })
         },
         debug: (...args: any[]) => {
-          consoleLogs.push({ method: 'debug', args })
+          consoleLogs.push({ method: EXECUTION_CONSOLE_METHODS.debug, args })
         },
       }
 
@@ -1168,6 +1197,8 @@ export class PlaywrightExecutor {
         format?: SnapshotFormat
         /** Only include interactive elements (default: true) */
         interactiveOnly?: boolean
+        /** Remove indentation contributed only by filtered-out accessibility wrappers (default: true). */
+        normalizeIgnoredIndent?: boolean
       }) => {
         const {
           page: targetPage,
@@ -1176,6 +1207,7 @@ export class PlaywrightExecutor {
           search,
           showDiffSinceLastCall = !search,
           interactiveOnly = false,
+          normalizeIgnoredIndent = true,
         } = options
         const resolvedPage = targetPage || page
         if (!resolvedPage) {
@@ -1192,6 +1224,7 @@ export class PlaywrightExecutor {
           frame,
           locator,
           interactiveOnly,
+          normalizeIgnoredIndent,
         })
         const snapshotStr = rawSnapshot.toWellFormed?.() ?? rawSnapshot
 
@@ -1207,7 +1240,8 @@ export class PlaywrightExecutor {
         const shouldCacheSnapshot = !frame
         // Cache keyed by locator selector so full-page and locator-scoped snapshots
         // don't pollute each other's diff baselines
-        const snapshotKey = locator ? `locator:${locator.selector()}` : 'page'
+        const snapshotScope = locator ? `locator:${locator.selector()}` : 'page'
+        const snapshotKey = `${snapshotScope}:ignored-indent:${normalizeIgnoredIndent ? 'normalized' : 'preserved'}`
         let pageSnapshots = this.lastSnapshots.get(resolvedPage)
         if (!pageSnapshots) {
           pageSnapshots = new Map()
@@ -1646,6 +1680,9 @@ export class PlaywrightExecutor {
 
       let responseText = formatConsoleLogs(consoleLogs)
 
+      let returnValue: JsonValue | undefined
+      let formattedReturnValue: string | null = null
+
       // Only show return value if user explicitly used return
       if (hasExplicitReturn) {
         const resolvedResult = isPromise(result) ? await result : result
@@ -1655,6 +1692,7 @@ export class PlaywrightExecutor {
         // return specific fields (`return response.url()`) to see values.
         // See issue #82.
         if (resolvedResult !== undefined && !isPlaywrightChannelOwner(resolvedResult)) {
+          returnValue = toJsonReturnValue(resolvedResult)
           const formatted =
             typeof resolvedResult === 'string'
               ? resolvedResult
@@ -1666,24 +1704,32 @@ export class PlaywrightExecutor {
                   breakLength: 80,
                 })
           if (formatted.trim()) {
+            formattedReturnValue = formatted
             responseText += `[return value] ${formatted}\n`
           }
         }
       }
 
-      responseText += this.flushWarningsForScope(warningScope)
+      const warningText = this.flushWarningsForScope(warningScope)
+      responseText += warningText
 
       if (!responseText.trim()) {
         responseText = 'Code executed successfully (no output)'
       }
 
-      const MAX_LENGTH = 10000
-      let finalText = responseText.trim()
-      if (finalText.length > MAX_LENGTH) {
-        finalText =
-          finalText.slice(0, MAX_LENGTH) +
-          `\n\n[Truncated to ${MAX_LENGTH} characters. Use search to find specific content]`
-      }
+      const finalText = truncateOutput(responseText)
+      const executionConsoleEvents = buildConsoleEvents()
+      const agentText = truncateOutput(
+        [
+          presentExecutionConsoleEvents(executionConsoleEvents),
+          formattedReturnValue && executionConsoleEvents.length === 0
+            ? `[return value] ${formattedReturnValue}`
+            : '',
+          warningText.trim(),
+        ]
+          .filter(Boolean)
+          .join('\n\n') || 'Code executed successfully (no output)',
+      )
 
       const images = [
         ...screenshotCollector.map((s) => ({ data: s.base64, mimeType: s.mimeType })),
@@ -1697,7 +1743,15 @@ export class PlaywrightExecutor {
         labelCount: s.labelCount,
       }))
 
-      return { text: finalText, images, screenshots, isError: false }
+      return {
+        text: finalText,
+        agentText,
+        consoleEvents: executionConsoleEvents,
+        ...(returnValue !== undefined ? { returnValue } : {}),
+        images,
+        screenshots,
+        isError: false,
+      }
     } catch (error: any) {
       const errorStack = error.stack || error.message
       const isTimeoutError =
@@ -1721,8 +1775,16 @@ export class PlaywrightExecutor {
 
       // timeout stacks are internal noise (Promise.race / setTimeout); only show the message
       const errorText = isTimeoutError ? error.message : errorStack
+      const errorOutput = `Error executing code: ${errorText}${resetHint}`
+      const executionConsoleEvents = buildConsoleEvents()
       return {
-        text: `${logsText}${warningText}\nError executing code: ${errorText}${resetHint}`,
+        text: `${logsText}${warningText}\n${errorOutput}`,
+        agentText: truncateOutput(
+          [presentExecutionConsoleEvents(executionConsoleEvents), warningText.trim(), errorOutput]
+            .filter(Boolean)
+            .join('\n\n'),
+        ),
+        consoleEvents: executionConsoleEvents,
         images: [],
         screenshots: [],
         isError: true,
