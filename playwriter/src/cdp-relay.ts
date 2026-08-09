@@ -1978,11 +1978,13 @@ export async function startPlayWriterCDPRelayServer({
   app.use('/stream/*', privilegedRouteMiddleware)
   app.use('/mcp-log', privilegedRouteMiddleware)
 
+  const DEFAULT_EXEC_TIMEOUT = Number(process.env.PLAYWRITER_EXEC_TIMEOUT) || 10000
+
   app.post('/cli/execute', async (c) => {
     try {
       const body = (await c.req.json()) as { sessionId: string | number; code: string; timeout?: number }
       const sessionId = normalizeSessionId(body.sessionId)
-      const { code, timeout = 10000 } = body
+      const { code, timeout = DEFAULT_EXEC_TIMEOUT } = body
 
       if (!sessionId || !code) {
         return c.json({ error: 'sessionId and code are required' }, 400)

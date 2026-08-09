@@ -188,6 +188,18 @@ playwriter -s <sessionId> -e "<code>"
 
 The `-s` flag specifies a session ID (required). Get one with `playwriter session new`. Use the same session to persist state across commands.
 
+**Execution timeout:** default is 10000ms. Override per call with `--timeout <ms>`, or set a new default via env:
+
+```bash
+# One-off longer timeout 
+playwriter -s 1 --timeout 120000 -e '...'
+
+# Default for all -e/-f in this shell
+export PLAYWRITER_EXEC_TIMEOUT=30000
+playwriter -s 1 -e '...'
+```
+
+PLAYWRITER_EXEC_TIMEOUT is the default fallback. --timeout overrides it, and MCP clients can set the env var or pass a per-call timeout.
 **Examples:**
 
 ```bash
@@ -352,6 +364,7 @@ Writing to any other path (e.g. `~/Downloads`, `~/Desktop`) throws `EPERM: opera
 - **Multiple calls**: use multiple execute calls for complex logic - helps understand intermediate state and isolate which action failed
 - **Never close**: never call `browser.close()` or `context.close()`. Only close pages you created or if user asks
 - **No bringToFront**: never call unless user asks - it's disruptive and unnecessary, you can interact with background pages
+- **Click before keyboard input in extension mode.** Call `click()` on the target field immediately before `fill()` or `keyboard` methods. CDP sends keyboard input to the browser's OS-focused surface, so DOM focus and `bringToFront()` can still leave text in Chrome's omnibox.
 - **Check state after actions**: always verify page state after clicking/submitting (see next section)
 - **Clean up listeners**: call `state.page.removeAllListeners()` at end of message to prevent leaks
 - **Always print page logs after every action**: call `getLatestLogs({ page: state.page, sinceLastCall: true })` after every goto, click, or submit to catch console errors and warnings. Do not manually collect `page.on('console')` events; manual listeners miss logs emitted before the listener is attached. The first `sinceLastCall` call returns all buffered logs including startup and hydration errors.

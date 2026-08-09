@@ -233,6 +233,8 @@ server.resource(
   },
 )
 
+const DEFAULT_EXEC_TIMEOUT = Number(process.env.PLAYWRITER_EXEC_TIMEOUT) || 10000
+
 server.tool(
   'execute',
   promptContent,
@@ -242,7 +244,10 @@ server.tool(
       .describe(
         'js playwright code, has {page, state, context} in scope. Should be one line, using ; to execute multiple statements. you MUST call execute multiple times instead of writing complex scripts in a single tool call.',
       ),
-    timeout: z.number().default(10000).describe('Timeout in milliseconds for code execution (default: 10000ms)'),
+    timeout: z
+      .number()
+      .default(DEFAULT_EXEC_TIMEOUT)
+      .describe('Timeout in milliseconds for code execution (default: 10000ms, or PLAYWRITER_EXEC_TIMEOUT)'),
   },
   async ({ code, timeout }) => {
     try {
