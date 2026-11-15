@@ -49,9 +49,12 @@ import { challengeWarning, detectChallenge, MAX_CHALLENGE_WAIT_MS, PROBE_TIMEOUT
 import type { CloudAuth } from './cloud-client.js'
 import {
   EXECUTION_CONSOLE_METHODS,
+  EXECUTION_ERROR_KINDS,
   presentExecutionConsoleEvents,
+  toExecutionError,
   toJsonReturnValue,
   type ExecutionConsoleEvent,
+  type ExecutionError,
   type ExecutionConsoleMethod,
   type JsonValue,
 } from './execution-result.js'
@@ -362,6 +365,8 @@ export interface ExecuteResult {
   agentText?: string
   consoleEvents?: readonly ExecutionConsoleEvent[]
   returnValue?: JsonValue
+  /** Present when isError is true and the code ran; server errors outside execution have none. */
+  error?: ExecutionError
   images: Array<{ data: string; mimeType: string }>
   screenshots: ExecuteScreenshot[]
   isError: boolean
@@ -2333,16 +2338,28 @@ export class PlaywrightExecutor {
       const errorText = isTimeoutError ? error.message : errorStack
       const errorOutput = `Error executing code: ${errorText}${resetHint}`
       const consoleEvents = buildConsoleEvents()
+      const priorOutput = [presentExecutionConsoleEvents(consoleEvents), outputText.trim()].filter(Boolean).join('\n\n')
       return {
         text: boundExecuteOutput({
           before: outputText + logsText,
           after: `\n${errorOutput}`,
         }),
         agentText: boundExecuteOutput({
-          before: [presentExecutionConsoleEvents(consoleEvents), outputText.trim()].filter(Boolean).join('\n\n'),
+          before: priorOutput,
           after: `\n\n${errorOutput}`,
         }).trim(),
         consoleEvents,
+        error: toExecutionError({
+          error,
+          kind: isExecutionTimeout
+            ? EXECUTION_ERROR_KINDS.executionTimeout
+            : error instanceof ExecuteCancelledError
+              ? EXECUTION_ERROR_KINDS.cancelled
+              : EXECUTION_ERROR_KINDS.thrown,
+          // Same rule as errorText: timeout stacks are internal noise.
+          includeStack: !isTimeoutError,
+          priorOutput,
+        }),
         images: [],
         screenshots: [],
         isError: true,
