@@ -1,7 +1,7 @@
 ---
 title: Playwriter vs BrowserMCP
 sidebarTitle: vs BrowserMCP
-description: One execute tool with full Playwright vs dozens of fixed tools.
+description: Playwriter gives one execute tool with the full Playwright API. BrowserMCP exposes a dozen fixed tools with a lower ceiling.
 icon: lucide:puzzle
 ---
 
@@ -14,20 +14,20 @@ Playwright from its training data, so there's nothing new to learn.
 
 ## Comparison
 
-|  | BrowserMCP | Playwriter |
+|  | Playwriter | BrowserMCP |
 |---|---|---|
-| Tools | 12+ dedicated tools | 1 execute tool |
-| API | Limited actions | Full Playwright |
-| Context usage | High (tool schemas) | Low |
-| LLM knowledge | Must learn custom tools | Already knows Playwright |
-| CDP access | No | Yes |
-| Debugger | No | Yes |
-| Network interception | No | Full |
+| Tools | **1 execute tool** | 12+ dedicated tools |
+| API | **Full Playwright** | Limited actions |
+| Context usage | **Low** | High (tool schemas) |
+| LLM knowledge | **Already knows Playwright** | Must learn custom tools |
+| CDP access | **Yes** | No |
+| Debugger | **Yes** | No |
+| Network interception | **Full** | No |
 
 ## Context usage
 
-Every MCP tool adds its schema to the system prompt. With 12+ tools, that's thousands of
-tokens the agent pays on every request just to know what's available. Playwriter's single
+Every MCP tool adds its schema to the client's context. With 12+ tools, that's thousands of
+tokens the agent carries just to know what's available. Playwriter's single
 `execute` tool uses minimal schema space. The agent writes Playwright code, which it
 already knows from training.
 
@@ -41,6 +41,6 @@ for advanced workflows like debugging, performance profiling, and live code edit
 # BrowserMCP: limited to what the tools expose
 # Playwriter: anything Playwright can do
 
-playwriter -s 1 -e "page.evaluate(() => performance.getEntriesByType('navigation'))"
-playwriter -s 1 -e "state.cdp = getCDPSession({ page }); state.cdp.send('Network.enable')"
+playwriter -s 1 -e "state.page.evaluate(() => performance.getEntriesByType('navigation'))"
+playwriter -s 1 -e "state.cdp = getCDPSession({ page: state.page }); state.cdp.send('Network.enable')"
 ```

@@ -1,0 +1,433 @@
+---
+$schema: https://holocron.so/frontmatter.json
+title: 'Record workflows as agent skills'
+sidebarTitle: Skill Recorder
+description: Record a browser workflow once by hand. Your agent turns it into a reusable skill with verified locators and an importable utils script.
+icon: lucide:circle-dot
+---
+
+# Skill Recorder
+
+Some workflows are **easier to show than to explain**: submitting a SaaS to 20 directory
+websites, filling a legacy enterprise form, navigating an internal dashboard with unusual
+UI. Instead of describing every click to your agent, **perform the workflow once** in your
+real browser while Playwriter records everything. Your agent then reads the recording and
+writes a **skill**: a SKILL.md of markdown instructions with example playwriter commands, plus a utils script for cheap replay.
+
+<Steps>
+  <Step title='Start recording'>
+    Click **Record Skill** in the Playwriter toolbar, or tell your agent
+    "start recording". The agent runs `playwriter recorder start`. From this
+    moment every click, fill, navigation, and mutating xhr/fetch is captured
+    to a JSON event file. A jpeg is saved for each visual change; clicks
+    flash a ripple in those frames. Recording attaches to the current
+    Playwriter tabs and auto-stops after 20 minutes or 500 MB of frames and
+    events.
+  </Step>
+  <Step title='Perform the workflow in your browser'>
+    Use the app like you normally would, in your real Chrome with your real logins.
+    Pauses and dead ends are fine; they get filtered out later.
+  </Step>
+  <Step title='Say "done"'>
+    The agent reads https://playwriter.dev/SKILL.md (or runs `playwriter skill`),
+    then `playwriter recorder stop` and inspects the events, verifying each
+    locator against the live page.
+  </Step>
+  <Step title='The agent writes the skill'>
+    It produces a `SKILL.md` with numbered playwriter commands plus a helper
+    script (`submit.js`, `sdk.js`), then validates the whole flow by replaying
+    that script end-to-end.
+  </Step>
+</Steps>
+
+## Why record instead of describe
+
+- **You know the app, the agent doesn't.** Recording captures the exact sequence,
+  including the parts you'd forget to mention ("click the second row, the first is a header").
+- **Real locators, not guesses.** Every action is recorded with the same locator code
+  Playwright's own codegen produces: `await page.getByRole('button', { name: 'Submit' }).click()`.
+- **The agent sees what you clicked.** Each action is Playwright locator code plus
+  mutating xhr/fetch, so the generated skill knows the **expected outcome** of every step.
+- **Your logins come free.** Recording happens in your real Chrome with your real
+  sessions. No credential handling, no bot walls from a fresh automation browser.
+
+## Quick start
+
+Tell your agent to start recording:
+
+```bash
+playwriter recorder start
+# Recording 1 started on session 1.
+# Events file: ~/.playwriter/recordings/1.json
+# ... prints the full skill-authoring instructions for the agent ...
+```
+
+Perform the workflow in your browser like you normally would. Take your time; pauses and
+mistakes are fine, dead ends get filtered out later. Then tell the agent you're done:
+
+```bash
+playwriter recorder stop
+# Recording 1 stopped. 47 events captured.
+# Events file: ~/.playwriter/recordings/1.json
+```
+
+The agent inspects the events. The default view is a **thin timeline**: heavy payloads
+(response bodies) show up as sizes, so reading the whole recording costs
+few tokens:
+
+```bash
+playwriter recorder events | jq -r '[.id, .t, .type, (.code // .url // empty)] | @tsv'
+```
+
+```
+1   0     recording-started   https://directory.example.com
+2   2.1   action              await page.getByRole('link', { name: 'Submit a product' }).click()
+3   2.4   navigation          https://directory.example.com/submit
+4   3.8   action              await page.getByRole('textbox', { name: 'Product name' }).fill('Acme')
+5   5.2   action              await page.getByRole('textbox', { name: 'Website URL' }).fill('https://acme.com')
+6   7.0   action              await page.getByRole('button', { name: 'Submit' }).click()
+7   7.3   network             POST 200 https://directory.example.com/api/products
+```
+
+Then it drills into the events that matter, by id:
+
+```bash
+playwriter recorder events 7   # full request postData + responseBody of event 7
+```
+
+## How it works
+
+The **goal** is not a Playwright test file. You show a workflow once in your real
+Chrome. The agent turns that recording into a **skill**: markdown steps plus
+example `playwriter` commands an agent can replay later with your logins.
+
+Recording is a **relay daemon** job. The CLI or toolbar only toggles it. Closing
+the terminal does not stop it.
+
+```diagram
+You (Chrome)                                   Agent (CLI)
+     │                                              │
+     │  toolbar Record Skill                        │  playwriter recorder start
+     ▼                                              ▼
+POST /recorder/start                         POST /recorder/start
+(no sessionId)                               (-s optional)
+     │                                              │
+     └─────────────────────┬────────────────────────┘
+                           ▼
+                    Relay picks a session
+                    (free extension session,
+                     or creates one)
+                           │
+                           ▼
+                 Playwright API recorder
+                 ~/.playwriter/recordings/<id>/
+                           │
+     Stop                  │           playwriter recorder stop
+     (its recording id)    │                    │
+                           ▼                    ▼
+                    1 recording  ►  stop it
+                    2+ recordings ►  error with page URLs
+                                     then: recorder stop <id>
+```
+
+### Why session pick barely matters
+
+A playwriter **session** is an isolated sandbox (`state`). Browser **tabs** are
+shared across extension sessions. The recorder attaches to one session's
+Playwright context so it can listen for clicks. Any extension session sees the
+same tabs.
+
+The agent does not need that session id to consume the recording. It uses
+`playwriter recorder stop` and `playwriter recorder events`. If two recordings
+are active, **stop** lists each one with its current or last page URL so the
+agent can pick or ask you.
+
+The only session the toolbar must avoid is a **headless or cloud** session,
+which has no user tabs. The relay skips those and creates an extension session
+instead.
+
+### Toolbar vs CLI
+
+| Start from | What happens |
+| --- | --- |
+| Toolbar **Record Skill** | `POST /recorder/start` with no session id. Never fails just because many sessions exist. |
+| `playwriter recorder start` | Reuses the only session, or creates one. Pass `-s <id>` when several sessions exist. |
+| `playwriter recorder start -s 1` | Attaches to session 1. Fails with 409 if that session is already recording. |
+
+Toolbar **Stop recording…** sends the recording id it started, so it is never
+ambiguous. `playwriter recorder stop` without an id stops the only active
+recording, or errors with URLs if there are several.
+
+## Commands
+
+```bash
+playwriter recorder start            # reuse the only session, or create one
+playwriter recorder start -s 1       # attach to an existing session
+playwriter recorder status           # active recordings + current page urls
+playwriter recorder stop             # stop the only active recording
+playwriter recorder stop 3           # stop recording 3
+playwriter recorder events           # thin timeline of the latest recording
+playwriter recorder events -r 3      # events of recording 3
+playwriter recorder events 4 7       # full details of events 4 and 7
+playwriter recorder events --type action
+playwriter recorder events --full    # whole timeline, no size projection
+```
+
+`recorder events` prints one JSON object per line (jq-friendly). Default output
+is a **thin timeline**: heavy payloads become sizes. Pass event ids to read
+full request and response bodies.
+
+```bash
+playwriter recorder events | jq -r 'select(.type == "action") | .code'
+playwriter recorder events | jq -r 'select(.type == "network") | [.id, .method, .status, .url] | @tsv'
+```
+
+## Multiple recordings
+
+Two recordings can be active at once (toolbar + CLI, or two agents). Stop
+without an id then **throws** and prints enough to choose:
+
+```
+Multiple active recordings. Pass a recording id.
+
+  3  session 1  https://app.example.com/settings
+  5  session 2  https://github.com/remorses/playwriter
+```
+
+```bash
+playwriter recorder status
+playwriter recorder stop 3
+playwriter recorder events -r 3
+```
+
+Ask the user which URL matches the workflow if it is not obvious.
+
+## What gets recorded
+
+Every event is one JSON line with a timestamp (`t`, seconds since start):
+
+| Event type                    | What it captures                                                                                                                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `action`                      | Click, fill, press, select, setInputFiles — with generated Playwright locator code                                                                                        |
+| `network`                     | POST/PUT/PATCH/DELETE xhr/fetch only: method, url, status, post data, and **response bodies** for JSON/text. **WebSockets are not recorded.**                             |
+| `download`                    | File downloads: source url and suggested filename                                                                                                                         |
+| `navigation`                  | Full navigations                                                                                                                                                          |
+| `page-opened` / `page-closed` | Popups and new tabs, with page aliases                                                                                                                                    |
+| `console` / `page-error`      | Console errors/warnings and uncaught page errors                                                                                                                          |
+| `signal`                      | Navigation signals tied to an action                                                                                                                                      |
+
+## What the agent produces
+
+The `recorder start` output tells the agent to read
+[https://playwriter.dev/SKILL.md](https://playwriter.dev/SKILL.md) first, inspect
+the events, verify locators against the live page, then write a **`SKILL.md`**
+plus a helper script named for the flow (`submit.js`, `sdk.js`): markdown
+instructions for the flow you performed, with example **playwriter**
+commands, and an importable script for cheap replay.
+
+````markdown
+# Submit to directory
+
+Preconditions: already signed in. Playwriter drives the browser.
+
+1. Open the submit page
+
+```bash
+playwriter -s 1 -e 'state.page = await context.newPage(); await state.page.goto("https://directory.example.com/submit")'
+```
+
+2. Fill name and URL (parameters)
+
+```bash
+playwriter -s 1 -e 'const name = "Acme"; await state.page.getByRole("textbox", { name: "Product name" }).fill(name)'
+playwriter -s 1 -e 'const url = "https://acme.com"; await state.page.getByRole("textbox", { name: "Website URL" }).fill(url)'
+```
+
+3. Click Submit. Expect POST `/api/products` and confirmation text.
+
+```bash
+playwriter -s 1 -e 'await state.page.getByRole("button", { name: "Submit" }).click()'
+```
+````
+
+Replay the helper script (preferred, fewer tokens):
+
+```bash
+playwriter -s 1 -e 'const { submitProduct } = await import("./.agents/skills/submit-to-directory/submit.js"); state.page ??= await context.newPage(); await submitProduct({ page: state.page, name: "Acme", url: "https://acme.com" })'
+```
+
+The agent validates the skill by running that replay end-to-end before calling it done.
+
+## Use cases
+
+### Reverse engineer a typed API client
+
+Use a site normally — create a job on Midjourney, run a search, export a report — while the
+recorder captures every fetch/XHR request **and its response body**. The recording reveals
+what no agent can guess: the real request sequence, payload shapes, and response schemas.
+The agent then writes a **class SDK** that calls those endpoints with in-page `fetch`
+(`page.evaluate`), so cookies, captchas, and Cloudflare stay in the real tab:
+
+```bash
+# the site's API surface, extracted from one recorded session
+playwriter recorder events | jq -r 'select(.type == "network" and .responseBodySize) | [.id, .method, .url, .responseBodySize] | @tsv'
+# then read the full request/response payloads of the interesting endpoints
+playwriter recorder events 14 15 22
+```
+
+The SDK is a class in `sdk.js`. Shared state (`page`) goes in the constructor.
+Methods take one object argument. `fetch` runs inside `page.evaluate`. Failed
+calls throw with method, path, status, and response text.
+
+For an SDK that other code imports (scripts, bots, cron jobs), ask for a
+**standalone `sdk.ts`**. It uses `playwriter` as a library through the
+[Node API](/docs/sessions#node-api) and returns typed data:
+
+```ts
+import { connectViaExtension } from 'playwriter'
+
+export async function listProducts(): Promise<{ id: string; name: string }[]> {
+  await using connection = await connectViaExtension({ tabGroup: 'directory' })
+  await using page = await connection.browser.contexts()[0].newPage() // closes its tab at scope end
+  await page.goto('https://directory.example.com', { waitUntil: 'domcontentloaded' })
+  return await page.evaluate(async () => {
+    const res = await fetch('/api/products', { credentials: 'include' })
+    return await res.json()
+  })
+}
+```
+
+### CRM data entry
+
+Record one full "create lead → fill 20 fields → assign owner → save" flow in Salesforce or
+HubSpot. CRMs are deep menus, iframes, and modal choreography that are painful to describe
+in words; the recording captures the exact locators (with iframe paths) and the
+network events that confirm each step landed. The skill becomes numbered
+playwriter commands with parameters `{ name, email, owner }`.
+
+### Bookings driven by incoming messages
+
+Record a booking on your hotel PMS or scheduling tool once: pick dates in the custom
+calendar widget, select room type, set the rate, confirm. Custom date pickers are the
+classic case where described automation fails and recorded locators succeed. Then connect
+the skill to a trigger: an agent reads incoming emails or WhatsApp messages, extracts guest
+name and dates, and runs the recorded playwriter steps with those parameters —
+verified against the "booking created" network request from the recording.
+
+### Invoice and document harvesting
+
+Once a month someone logs into 15 SaaS billing pages and downloads invoices for accounting.
+Record one round per vendor; the recorded `download` events tie each file to the click that
+produced it, so the agent writes a skill with a `month` parameter per vendor. The same pattern
+covers bank statements, shipping labels, and result PDFs from healthcare or government
+portals.
+
+### Internal admin panel operations
+
+Every company has a crusty internal tool: refund a user, extend a trial, toggle a feature
+flag, merge duplicate accounts. Record each operation once and commit a skills folder to
+the repo — the whole team's agents can now perform them, and the recording doubles as
+living documentation. Mutations are verified through the recorded network status codes.
+
+### Repeat submissions
+
+Submit your SaaS to directory sites, cross-post to multiple platforms, file recurring
+reports. Record one submission — including logo uploads, captured as `setInputFiles` actions —
+and replay it for every launch, adapting locators per site while reusing the flow shape.
+
+### Legacy and enterprise apps
+
+EHRs, payer portals, ERPs, government form wizards: no APIs, unusual UI patterns, strict
+field ordering, session timeouts. These flows are far easier to show than to explain. The
+recording captures hidden dependencies too — like a field that only appears after another
+is filled, visible in the event timeline and frames.
+
+### E2E tests from a manual QA pass
+
+A QA person clicks through a critical flow once; the agent turns the recording into
+playwriter commands an agent can replay. Better than codegen alone, because the
+recording also contains the **expected outcomes** — mutating network status codes
+become response checks.
+
+### Bug reproduction reports
+
+A user hits a bug: "start recording", reproduce it, "done". The event stream — actions,
+network failures, `console` errors, `page-error` events — is a complete repro report an
+agent can replay and debug against.
+
+### Fixing broken skills
+
+When a site redesign breaks a skill, re-record the flow. The agent diffs the new locators
+against the old SKILL.md and utils file and updates only the selectors that changed, keeping the
+working parts untouched.
+
+## Troubleshooting
+
+### Record Skill does nothing, or shows an error toast
+
+The toolbar button calls `http://127.0.0.1:19988/recorder/start` from the extension. Check:
+
+1. The page is a normal website (not `chrome://` or the Web Store)
+2. The relay is running (`playwriter session list` should respond)
+3. `playwriter logfile` for `Record start endpoint error`
+
+It no longer fails just because many playwriter sessions are open. It still
+fails if the extension is disconnected, or if every extension session is
+already recording and a new session cannot be created.
+
+### `playwriter recorder start` asks for `-s`
+
+The CLI still requires `-s` when several sessions exist, because you are
+choosing a sandbox to attach to. The toolbar does not. Pass `-s` or let the
+user click **Record Skill**.
+
+### Stop says "Multiple active recordings"
+
+That is expected when two recordings are running. The error lists ids and page
+URLs. Stop the one that matches the workflow:
+
+```bash
+playwriter recorder stop 3
+```
+
+### Recording has no clicks
+
+The recorder only sees tabs where Playwriter is enabled. Click the extension
+icon on the tab you are using. Headless and direct-CDP sessions do not record
+your real Chrome; use the extension.
+
+### Recording died after 20 minutes or 500 MB
+
+Auto-stop is a safety limit. The `recording-stopped` event has `reason:
+"max-duration"` or `reason: "max-size"`. Busy pages produce many frames, so
+keep long workflows short or split them. Start again. Events already written stay in
+`~/.playwriter/recordings/<id>.json`.
+
+### Locators from the recording do not work
+
+Do not trust recorded locators blindly. Snapshot the live page and verify each
+one. Role names in generated locators may be prefixes of the live accessible
+name; they still match. Drop select-all / modifier keypresses that happen just
+before a fill.
+
+### Start hangs or errors about a stuck frame
+
+A tab frame never got a document (empty target, some iframes). Start fails in
+15s instead of hanging. Close unused iframe-heavy tabs and retry.
+
+## Notes
+
+- Recording runs inside the **relay daemon**, so it keeps recording after the CLI exits
+  and survives until you stop it.
+- Events persist in `~/.playwriter/recordings/<id>.json` (readable only by your user).
+  Cookie values are never stored; storage values and request bodies are truncated.
+- Works with multiple tabs and popups: actions carry page aliases so the agent knows
+  which page each step targets.
+
+<Aside>
+<Tip>
+The best prompt is simple: **"start recording, I'll show you the workflow"**. The
+agent guesses skill name, location, and parameters from the events, writes the
+SKILL.md and a named helper script, then tells you what it assumed.
+</Tip>
+</Aside>

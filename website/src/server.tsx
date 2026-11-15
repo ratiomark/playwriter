@@ -1,12 +1,14 @@
 // Custom entry: mounts holocron as a child of a Spiceflow app.
 // Auth middleware (better-auth) runs first, then auth/dashboard pages,
-// then holocron docs. Cloudflare Workers fetch handler is provided
-// by spiceflow/cloudflare-entrypoint.
+// then holocron docs. Also serves /.well-known/agent-skills/* so
+// `npx skills add https://playwriter.dev` installs the skill from this
+// domain instead of the GitHub repo. Cloudflare Workers fetch handler
+// is provided by spiceflow/cloudflare-entrypoint.
 
 import './globals.css'
 
 import { Spiceflow, redirect, json } from 'spiceflow'
-import { router } from 'spiceflow/react'
+import { Head, Link, router } from 'spiceflow/react'
 import { z } from 'zod'
 import { app as holocronApp } from '@holocron.so/vite/app'
 import { getAuth, getBaseUrl, getSession, requireSession, ensureOrg, getOrgSubscription, getOrgWithSubscription, listUserApiKeys } from './db.ts'
@@ -15,6 +17,26 @@ import { cloudApp } from './cloud-api.ts'
 import { stripeWebhookApp } from './stripe-webhook.ts'
 import { approveDevice, denyDevice, createApiKey, revokeApiKey } from './actions.tsx'
 import { enforceProxyBudgets } from './scheduled.ts'
+import { routeRemoteControlRequest } from './remote-control-tunnel.ts'
+import playwriterSkillMd from '../../skills/playwriter/SKILL.md?raw'
+
+export { RemoteControlTunnel } from './remote-control-tunnel.ts'
+
+const PLAYWRITER_SKILL_DESCRIPTION =
+  "Control the user own Chrome browser via Playwriter extension with Playwright code snippets in a stateful local js sandbox. Use this over other Playwright MCPs to automate the browser — it connects to the user's existing Chrome instead of launching a new one. Use this cli for navigating JS-heavy websites (Instagram, Twitter, cookie/login walls, lazy-loaded UIs) instead of webfetch/curl. ALWAYS load this skill before using any playwriter commands"
+
+// skills.sh validates the artifact against this sha256 digest, so it must
+// match the exact bytes served at /.well-known/agent-skills/playwriter/SKILL.md.
+let skillDigestPromise: Promise<string> | undefined
+function getSkillDigest(): Promise<string> {
+  skillDigestPromise ??= (async () => {
+    const bytes = new TextEncoder().encode(playwriterSkillMd)
+    const hash = await crypto.subtle.digest('SHA-256', bytes)
+    const hex = Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, '0')).join('')
+    return `sha256:${hex}`
+  })()
+  return skillDigestPromise
+}
 
 const loginQuerySchema = z.object({ callbackURL: z.string().optional() })
 
@@ -52,6 +74,14 @@ async function createGoogleSignInRedirect(request: Pick<Request, 'headers'>, cal
 // ── Main app ────────────────────────────────────────────────────────
 
 export const app = new Spiceflow()
+
+  .use(({ request }, next) => {
+    const url = new URL(request.url)
+    if (!url.hostname.startsWith('www.')) return next()
+    url.hostname = url.hostname.slice('www.'.length)
+    url.protocol = 'https:'
+    throw redirect(url.toString(), { status: 301 })
+  })
 
   // Auth middleware: intercept /api/auth/* and forward to better-auth
   .use(async ({ request }, next) => {
@@ -129,6 +159,10 @@ export const app = new Spiceflow()
 
     return (
       <div className="mx-auto max-w-3xl px-6 py-10 min-h-screen flex flex-col">
+        <Head>
+          <Head.Title>Dashboard</Head.Title>
+          <Head.Meta name="robots" content="noindex" />
+        </Head>
         <div className="flex items-center justify-between mb-8">
           <PlaywriterLogo imageClassName="h-8" />
           <div className="flex items-center gap-4">
@@ -170,6 +204,9 @@ export const app = new Spiceflow()
             <a href="https://github.com/remorses/playwriter/releases" className="hover:text-foreground transition-colors">
               Changelog
             </a>
+            <Link href="/privacy" className="hover:text-foreground transition-colors">
+              Privacy
+            </Link>
             <a href="https://playwriter.dev/#pricing" className="hover:text-foreground transition-colors">
               Pricing
             </a>
@@ -262,7 +299,62 @@ export const app = new Spiceflow()
   // ── Live browser view (pure client-side CDP screencast) ─────────
   .page('/live', async () => {
     const { default: LivePage } = await import('./pages/live.tsx')
-    return <LivePage />
+    return (
+      <>
+        <Head>
+          <Head.Title>Live Browser View | Playwriter</Head.Title>
+          <Head.Meta name="description" content="Watch and interact with a remote browser session in real time." />
+        </Head>
+        <LivePage />
+      </>
+    )
+  })
+
+  // ── Remote control viewer for a tab shared from the extension ───
+  // The tunnel id travels in the URL hash, so it never reaches this handler.
+  .page('/remote-control', async () => {
+    const { default: RemoteControlPage } = await import('./pages/remote-control.tsx')
+    return (
+      <>
+        <Head>
+          <Head.Title>Remote Control | Playwriter</Head.Title>
+          <Head.Meta name="description" content="Watch and control a browser tab shared with you through Playwriter." />
+          <Head.Meta name="referrer" content="no-referrer" />
+          <Head.Meta name="robots" content="noindex, nofollow" />
+        </Head>
+        <RemoteControlPage />
+      </>
+    )
+  })
+
+  // Skill discovery for `npx skills add https://playwriter.dev` (skills.sh).
+  // The url is relative to this index file per the discovery schema.
+  .route({
+    method: 'GET',
+    path: '/.well-known/agent-skills/index.json',
+    detail: { hide: true },
+    handler: async () =>
+      Response.json({
+        $schema: 'https://schemas.agentskills.io/discovery/0.2.0/schema.json',
+        skills: [
+          {
+            name: 'playwriter',
+            type: 'skill-md',
+            description: PLAYWRITER_SKILL_DESCRIPTION,
+            url: './playwriter/SKILL.md',
+            digest: await getSkillDigest(),
+          },
+        ],
+      }),
+  })
+  .route({
+    method: 'GET',
+    path: '/.well-known/agent-skills/playwriter/SKILL.md',
+    detail: { hide: true },
+    handler: () =>
+      new Response(playwriterSkillMd, {
+        headers: { 'content-type': 'text/markdown; charset=utf-8' },
+      }),
   })
 
   // Cloud browser API routes (/api/cloud/*)
@@ -284,7 +376,11 @@ declare module 'spiceflow/react' {
 }
 
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const remoteControlResponse = await routeRemoteControlRequest({ request, env })
+    if (remoteControlResponse) {
+      return remoteControlResponse
+    }
     return app.handle(request)
   },
   async scheduled(_controller: ScheduledController, _env: Env, ctx: ExecutionContext) {

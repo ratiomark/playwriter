@@ -33,12 +33,12 @@ export class GhostCursorController {
     this.logger = options.logger
   }
 
+  /** Returns null when neither page nor a matching sessionId is given. No default page. */
   resolveRecordingTargetPage(options: {
     context: BrowserContext
-    defaultPage: Page
     target?: RecordingTargetOptions
-  }): Page {
-    const { context, defaultPage, target } = options
+  }): Page | null {
+    const { context, target } = options
 
     if (target?.page) {
       return target.page
@@ -54,7 +54,7 @@ export class GhostCursorController {
       }
     }
 
-    return defaultPage
+    return null
   }
 
   /** Wire onMouseAction. Idempotent. */

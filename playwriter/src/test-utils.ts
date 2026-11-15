@@ -8,6 +8,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import { startPlayWriterCDPRelayServer, type RelayServer } from './cdp-relay.js'
 import { createFileLogger } from './create-logger.js'
+import { createCdpLogger, type CdpLogger } from './cdp-log.js'
 import { killPortProcess } from './kill-port.js'
 
 const execFileAsync = promisify(execFile)
@@ -82,6 +83,10 @@ export interface TestContext {
   browserContext: BrowserContext
   userDataDir: string
   relayServer: RelayServer
+  /** Pass to a restarted relay so it keeps counting session ids */
+  sessionCounterFile: string
+  /** This relay's own cdp.jsonl. Parallel test relays must not share ~/.playwriter/cdp.jsonl */
+  cdpLogger: CdpLogger
 }
 
 export async function setupTestContext({
@@ -89,6 +94,8 @@ export async function setupTestContext({
   tempDirPrefix,
   toggleExtension = false,
   additionalExtensions = [],
+  executablePath = process.env.PLAYWRITER_TEST_BROWSER,
+  relayOptions,
 }: {
   port: number
   tempDirPrefix: string
@@ -96,6 +103,8 @@ export async function setupTestContext({
   toggleExtension?: boolean
   /** Additional extension paths to load alongside the main playwriter extension */
   additionalExtensions?: string[]
+  executablePath?: string
+  relayOptions?: Partial<Parameters<typeof startPlayWriterCDPRelayServer>[0]>
 }): Promise<TestContext> {
   await killPortProcess({ port }).catch(() => {})
 
@@ -106,20 +115,26 @@ export async function setupTestContext({
   await buildExtension({ port, distDir })
   console.log('Extension built')
 
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix))
+  // Keep the session counter out of ~/.playwriter and away from other test runs
+  const sessionCounterFile = path.join(userDataDir, 'playwriter-session-counter.json')
   const localLogPath = path.join(process.cwd(), 'relay-server.log')
   const logger = createFileLogger({ logFilePath: localLogPath })
-  const relayServer = await startPlayWriterCDPRelayServer({ port, logger })
+  const cdpLogger = createCdpLogger({ logFilePath: path.join(userDataDir, 'cdp.jsonl') })
+  const relayServer = await startPlayWriterCDPRelayServer({ cdpLogger, ...relayOptions, port, logger, sessionCounterFile })
 
-  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix))
   const extensionPath = path.resolve('../extension', distDir)
   const allExtensionPaths = [extensionPath, ...additionalExtensions].join(',')
-  const browserPath = process.env.PLAYWRITER_BROWSER_PATH?.trim()
 
   const browserContext = await chromium.launchPersistentContext(userDataDir, {
-    ...(browserPath ? { executablePath: browserPath } : { channel: 'chromium' }),
+    executablePath,
+    channel: 'chromium',
     headless: !process.env.HEADFUL,
     colorScheme: 'dark',
-    args: [`--disable-extensions-except=${allExtensionPaths}`, `--load-extension=${allExtensionPaths}`],
+    // Headless Playwright adds --mute-audio, which also silences native tab recording.
+    // --disable-audio-output keeps the speakers quiet instead.
+    ignoreDefaultArgs: ['--mute-audio'],
+    args: [`--disable-extensions-except=${allExtensionPaths}`, `--load-extension=${allExtensionPaths}`, '--disable-audio-output'],
   })
 
   const serviceWorker = await getExtensionServiceWorker(browserContext)
@@ -132,7 +147,7 @@ export async function setupTestContext({
     })
   }
 
-  return { browserContext, userDataDir, relayServer }
+  return { browserContext, userDataDir, relayServer, sessionCounterFile, cdpLogger }
 }
 
 export async function cleanupTestContext(
@@ -333,6 +348,20 @@ export async function withTimeout<T>({
 /** Tagged template for inline JS code strings used in MCP execute calls */
 export function js(strings: TemplateStringsArray, ...values: unknown[]): string {
   return strings.reduce((result, str, i) => result + str + (values[i] || ''), '')
+}
+
+/** Execute code that sets `testPage` to the page whose HTML has `marker`. A toggled tab reaches the executor's context async. */
+export function findTestPageJs(marker: string): string {
+  return js`
+    let testPage;
+    for (let attempt = 0; attempt < 100 && !testPage; attempt++) {
+      for (const p of context.pages()) {
+        if ((await p.content().catch(() => '')).includes(${JSON.stringify(marker)})) { testPage = p; break; }
+      }
+      if (!testPage) await new Promise((r) => setTimeout(r, 50));
+    }
+    if (!testPage) throw new Error('Test page not found');
+  `
 }
 
 export function tryJsonParse(str: string) {

@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { goke, openInBrowser, isAgent } from 'goke'
 import { z } from 'zod'
 import pc from 'picocolors'
+import { Agent, fetch as undiciFetch } from 'undici'
 
 // Prevent Buffers from dumping hex bytes in util.inspect output.
 Buffer.prototype[util.inspect.custom] = function () {
@@ -16,18 +17,25 @@ Buffer.prototype[util.inspect.custom] = function () {
 import { killPortProcess } from './kill-port.js'
 import { canEmitKittyGraphics, emitKittyImage } from './kitty-graphics.js'
 import { VERSION, LOG_FILE_PATH, LOG_CDP_FILE_PATH, parseRelayHost } from './utils.js'
+import { TAB_GROUP_ALL_COLORS, normalizeTabGroupColor } from './protocol.js'
 import {
   ensureRelayServer,
+  getRelayInfo,
+  stopRelayServer,
   RELAY_PORT,
   waitForConnectedExtensions,
+  getLocalExtensionStatuses,
   getExtensionOutdatedWarning,
   getExtensionStatus,
   type ExtensionStatus,
+  EXTENSION_NOT_CONNECTED_ERROR,
 } from './relay-client.js'
 import { discoverChromeInstances, resolveDirectInput, type DiscoveredInstance } from './chrome-discovery.js'
-import { getCloudClient, loadCloudAuth, saveCloudAuth, CloudClient, buildLiveUrl } from './cloud-client.js'
+import { getCloudClient, loadCloudAuth, saveCloudAuth, CloudClient, buildLiveUrl, type CloudAuth } from './cloud-client.js'
+import { printTelemetryNoticeOnce } from './telemetry.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const executeDispatcher = new Agent({ headersTimeout: 0, bodyTimeout: 0 })
 
 const cli = goke('playwriter')
 
@@ -83,7 +91,6 @@ cli
         console.log(`  Extension: ${extensionPath}`)
         console.log(`  Profile: ${userDataDir}`)
         console.log(`  Mode: ${headless ? 'headless' : 'headed'}`)
-        console.log('  Permissions: recording/tabCapture flags enabled')
 
         if (connectedExtensions.length > 0) {
           console.log('Playwriter extension connected to the relay server.')
@@ -120,7 +127,7 @@ cli
   .option('-s, --session <name>', 'Session ID (required for -e, get one with `playwriter session new`)')
   .option('-e, --eval <code>', 'Execute JavaScript code and exit, read https://playwriter.dev/SKILL.md for usage')
   .option('-f, --file <path>', 'Execute JavaScript from a file and exit')
-  .option('--patchright', 'Use @playwriter/patchright-core for stealth mode (bypasses bot detection)')
+  .option('--patchright', 'MCP: connect with Patchright (@playwriter/patchright-core) instead of Playwright, with human-like input. CLI sessions use session new --patchright')
   .option('--timeout [ms]', z.number().default(DEFAULT_EXEC_TIMEOUT).describe('Execution timeout in milliseconds'))
   .action(async (options) => {
     if (options.patchright) {
@@ -176,6 +183,10 @@ async function getServerUrl(host?: string): Promise<string> {
 
 // Centralized header builder so every CLI subcommand sends the token consistently.
 // Falls back to PLAYWRITER_TOKEN env var when --token is not provided.
+function getRelayCloudAuth(): CloudAuth | undefined {
+  return loadCloudAuth() ?? undefined
+}
+
 function buildAuthHeaders({ token, json }: { token?: string; json?: boolean }): Record<string, string> {
   const headers: Record<string, string> = {}
   if (json) {
@@ -280,16 +291,28 @@ async function executeCode(options: {
   const executeUrl = `${serverUrl}/cli/execute`
 
   try {
-    const response = await fetch(executeUrl, {
+    const response = await undiciFetch(executeUrl, {
       method: 'POST',
       headers: buildAuthHeaders({ token, json: true }),
       body: JSON.stringify({ sessionId, code, timeout, cwd }),
+      dispatcher: executeDispatcher,
+      signal: AbortSignal.timeout(timeout + 30_000),
     })
 
     if (!response.ok) {
       const text = await response.text()
-      console.error(`Error: ${response.status} ${text}`)
-      process.exit(1)
+      // 503 while the relay drains for an upgrade carries a readable message in text.
+      const message = (() => {
+        try {
+          const json = JSON.parse(text) as { text?: string; error?: string }
+          return json.text || json.error || text
+        } catch {
+          return text
+        }
+      })()
+      console.error(`Error: ${response.status} ${message}`)
+      process.exitCode = 1
+      return
     }
 
     const result = (await response.json()) as {
@@ -345,8 +368,9 @@ async function executeCode(options: {
       console.error(pc.dim(`\nCloud session. Run \`playwriter session delete ${sessionId}\` when done.`))
     }
 
+    // Not process.exit(1): it drops stdout/stderr past 64 KiB when piped
     if (result.isError) {
-      process.exit(1)
+      process.exitCode = 1
     }
   } catch (error: any) {
     if (error.cause?.code === 'ECONNREFUSED') {
@@ -356,7 +380,7 @@ async function executeCode(options: {
     } else {
       console.error(`Error: ${error.message}`)
     }
-    process.exit(1)
+    process.exitCode = 1
   }
 }
 
@@ -382,28 +406,106 @@ cli
   .option('--host <host>', 'Remote relay server host')
   .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
   .option('--browser <key>', 'Browser key when multiple browsers are available. Special values: "headless" (launch headless Chrome, no extension), "cloud" (cloud browser with stealth/proxies)')
-  .option('--patchright', 'Use @playwriter/patchright-core for stealth mode (bypasses bot detection)')
   .option('--direct [endpoint]', 'Use direct CDP connection without the extension. Enable debugging first at chrome://inspect/#remote-debugging or launch Chrome with --remote-debugging-port=9222. Auto-discovers instances or accepts an explicit ws:// endpoint')
+  .option('--remote <id>', 'Connect to a browser another user shared via the extension `Remote control` button')
   .option('--proxy <region>', 'Enable residential proxy for cloud browser (e.g. us, de, jp). Disabled by default. Use for anti-detection or geo-targeting.')
   .option('--custom-proxy <url>', 'Custom proxy for cloud browser (host:port or user:pass@host:port)')
   .option('--timeout <minutes>', 'Cloud browser timeout in minutes (1-240, default 60)')
   .option('--disable-proxy-bandwidth-acceleration', 'Allow loading images, video, and fonts when proxy is enabled (they are blocked by default to save proxy bandwidth)')
+  .option('--tab-group <name>', 'Tab group title for this session (default "playwriter", or "remote" with --remote)')
+  .option('--tab-group-color <color>', 'Tab group color: grey, blue, red, yellow, green, pink, purple, cyan, orange (default derived from the group name)')
+  .option('--patchright', 'Connect with Patchright (@playwriter/patchright-core) instead of Playwright, with human-like mouse, scroll and typing on every page')
   .action(async (options) => {
-    if (options.patchright) {
-      process.env.PLAYWRITER_PATCHRIGHT = '1'
+    const tabGroup: string | undefined = (() => {
+      if (!options.tabGroup) {
+        return undefined
+      }
+      const normalized = String(options.tabGroup).trim()
+      if (!normalized) {
+        console.error('Error: --tab-group must be a non-empty name')
+        process.exit(1)
+      }
+      return normalized
+    })()
+    const tabGroupColor: string | undefined = (() => {
+      if (!options.tabGroupColor) {
+        return undefined
+      }
+      const normalized = normalizeTabGroupColor(options.tabGroupColor)
+      if (!normalized) {
+        console.error(`Error: --tab-group-color must be one of: ${TAB_GROUP_ALL_COLORS.join(', ')}`)
+        process.exit(1)
+      }
+      return normalized
+    })()
+    const patchright: boolean | undefined = options.patchright ? true : undefined
+    const warnExtensionOnlyFlags = (mode: string) => {
+      if (tabGroup || tabGroupColor || patchright) {
+        console.error(pc.yellow(`Warning: --tab-group/--tab-group-color/--patchright only apply to extension sessions, ignored for ${mode}.`))
+      }
     }
 
     const isLocal = !options.host && !process.env.PLAYWRITER_HOST
 
+    // --remote: bind the session to a browser another user shared via the
+    // extension Remote control button. Pass the id from the copied prompt. The
+    // local relay dials the tunnel, so later `playwriter -s N -e ...` calls need
+    // no extra flags.
+    if (options.remote) {
+      await ensureRelayForSessionCreation(isLocal)
+      const serverUrl = await getServerUrl(options.host)
+      try {
+        const response = await fetch(`${serverUrl}/cli/session/new`, {
+          method: 'POST',
+          headers: buildAuthHeaders({ token: options.token, json: true }),
+          body: JSON.stringify({
+            remoteControlUrl: options.remote,
+            cwd: process.cwd(),
+            tabGroup,
+            tabGroupColor,
+            patchright,
+          }),
+        })
+        if (!response.ok) {
+          const text = await response.text()
+          const parsed = (() => {
+            try {
+              return JSON.parse(text) as { error?: string }
+            } catch {
+              return null
+            }
+          })()
+          console.error(`Error: ${parsed?.error || `${response.status} ${text}`}`)
+          process.exit(1)
+        }
+        const result = (await response.json()) as {
+          id: string
+          browser?: string | null
+          warning?: string | null
+          tabGroup?: string | null
+        }
+        printSessionWarning(result)
+        warnIfTabGroupIgnored(tabGroup || tabGroupColor, result)
+        printSessionCreated(`Session ${result.id} created (remote browser). Use with: playwriter -s ${result.id} -e "..."`)
+        console.log(pc.dim('context.pages()[0] is the tab where the user started sharing. Remote control is not a security sandbox.'))
+        console.log(pc.dim('The user can revoke access anytime with Stop sharing on the Remote ON dropdown.'))
+      } catch (error: any) {
+        console.error(`Error: ${error.message}`)
+        process.exit(1)
+      }
+      return
+    }
+
     // --browser headless: launch headless Chrome via chromium.launch(), no extension
     if (options.browser === 'headless') {
+      warnExtensionOnlyFlags('headless sessions')
       try {
         await ensureRelayForSessionCreation(isLocal)
         const serverUrl = await getServerUrl(options.host)
         const response = await fetch(`${serverUrl}/cli/session/new`, {
           method: 'POST',
           headers: buildAuthHeaders({ token: options.token, json: true }),
-          body: JSON.stringify({ headless: true, cwd: process.cwd() }),
+          body: JSON.stringify({ headless: true, cwd: process.cwd(), cloudAuth: getRelayCloudAuth() }),
         })
         if (!response.ok) {
           const text = await response.text()
@@ -418,9 +520,9 @@ cli
           console.error(`Error: ${response.status} ${text}`)
           process.exit(1)
         }
-        const result = (await response.json()) as { id: string }
-        console.log(`Session ${result.id} created (headless). Use with: playwriter -s ${result.id} -e "..."`)
-        console.log(pc.dim('NOTE: Recording unavailable in headless mode.'))
+        const result = (await response.json()) as { id: string; warning?: string | null }
+        printSessionWarning(result)
+        printSessionCreated(`Session ${result.id} created (headless). Use with: playwriter -s ${result.id} -e "..."`)
       } catch (error: any) {
         if (error.message?.includes('Could not find a supported browser binary')) {
           console.error('No Chrome browser found. Install one first:')
@@ -443,6 +545,7 @@ cli
 
     // If --direct with explicit endpoint, resolve it (handles host:port → ws://) then skip discovery
     if (directEndpoint) {
+      warnExtensionOnlyFlags('direct CDP sessions')
       let cdpEndpoint: string
       try {
         cdpEndpoint = await resolveDirectInput(directEndpoint)
@@ -453,13 +556,14 @@ cli
       await ensureRelayForSessionCreation(isLocal)
       const serverUrl = await getServerUrl(options.host)
       const result = await createDirectSession({ serverUrl, cdpEndpoint, token: options.token })
-      console.log(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
-      console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
+      printSessionWarning(result)
+      printSessionCreated(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
       return
     }
 
     // If --direct with no endpoint, discover Chrome instances
     if (options.direct === '') {
+      warnExtensionOnlyFlags('direct CDP sessions')
       if (!isLocal) {
         console.error('Error: --direct auto-discovery only works locally.')
         console.error('For remote relay, pass an explicit endpoint reachable from the relay host:')
@@ -483,11 +587,11 @@ cli
         const instance = instances[0]
         const serverUrl = await getServerUrl(options.host)
         const result = await createDirectSession({ serverUrl, cdpEndpoint: instance.wsUrl, browser: instance.browser, profiles: instance.profiles, token: options.token })
+        printSessionWarning(result)
         const profileLabel = formatInstanceProfiles(instance)
-        console.log(
+        printSessionCreated(
           `Session ${result.id} created (direct CDP, ${instance.browser}${profileLabel}). Use with: playwriter -s ${result.id} -e "..."`,
         )
-        console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
         return
       }
 
@@ -508,8 +612,8 @@ cli
         }
         const serverUrl = await getServerUrl(options.host)
         const result = await createDirectSession({ serverUrl, cdpEndpoint: selected.wsUrl!, browser: selected.browser, profiles: selected.profiles, token: options.token })
-        console.log(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
-        console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
+        printSessionWarning(result)
+        printSessionCreated(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
         return
       }
 
@@ -538,7 +642,9 @@ cli
         })
       }
     } else {
-      extensions = await fetchExtensionsStatus({ host: options.host, token: options.token })
+      extensions = getLocalExtensionStatuses(
+        await fetchExtensionsStatus({ host: options.host, token: options.token }),
+      )
     }
 
     if (extensions.length === 0) {
@@ -574,7 +680,7 @@ cli
               blockProxyResources: computeBlockProxyResources(options),
               token: options.token,
             })
-          console.log(`Session ${result.id} created (cloud). Use with: playwriter -s ${result.id} -e "..."`)
+          printSessionCreated(`Session ${result.id} created (cloud). Use with: playwriter -s ${result.id} -e "..."`)
           if (result.liveUrl) {
             console.log(pc.dim(`Live view: ${result.liveUrl}`))
           }
@@ -590,7 +696,8 @@ cli
       if (options.browser) {
         await handleCloudBrowserNotFound(options.browser, { hasCloudOptions: false })
       }
-      console.error('No connected browsers detected. Click the Playwriter extension icon.')
+      console.error('ERROR code=extension_not_connected')
+      console.error(EXTENSION_NOT_CONNECTED_ERROR)
       console.error(pc.dim('Tip: Use --direct to connect via Chrome DevTools Protocol instead.'))
       console.error(pc.dim('Tip: Run `playwriter cloud login` to use cloud browsers.'))
       process.exit(1)
@@ -618,15 +725,22 @@ cli
         const response = await fetch(`${serverUrl}/cli/session/new`, {
           method: 'POST',
           headers: buildAuthHeaders({ token: options.token, json: true }),
-          body: JSON.stringify({ extensionId, cwd }),
+          body: JSON.stringify({ extensionId, cwd, cloudAuth: getRelayCloudAuth(), tabGroup, tabGroupColor, patchright }),
         })
         if (!response.ok) {
           const text = await response.text()
           console.error(`Error: ${response.status} ${text}`)
           process.exit(1)
         }
-        const result = (await response.json()) as { id: string; extensionId: string | null }
-        console.log(`Session ${result.id} created. Use with: playwriter -s ${result.id} -e "..."`)
+        const result = (await response.json()) as {
+          id: string
+          extensionId: string | null
+          warning?: string | null
+          tabGroup?: string | null
+        }
+        printSessionWarning(result)
+        warnIfTabGroupIgnored(tabGroup || tabGroupColor, result)
+        printSessionCreated(`Session ${result.id} created. Use with: playwriter -s ${result.id} -e "..."`)
         printCloudTip()
       } catch (error: any) {
         console.error(`Error: ${error.message}`)
@@ -675,6 +789,7 @@ cli
       try {
         const serverUrl = await getServerUrl(options.host)
         if (selected.type === 'cloud') {
+          warnExtensionOnlyFlags('cloud sessions')
           // Reuse existing running VM if selected, otherwise create new
           const result = selected.activeCloudSessionId
             ? await attachExistingCloudSession({
@@ -691,28 +806,38 @@ cli
               blockProxyResources: computeBlockProxyResources(options),
               token: options.token,
             })
-          console.log(`Session ${result.id} created (cloud). Use with: playwriter -s ${result.id} -e "..."`)
+          printSessionCreated(`Session ${result.id} created (cloud). Use with: playwriter -s ${result.id} -e "..."`)
           if (result.liveUrl) {
             console.log(pc.dim(`Live view: ${result.liveUrl}`))
           }
         } else if (selected.type === 'direct') {
+          warnExtensionOnlyFlags('direct CDP sessions')
           const result = await createDirectSession({ serverUrl, cdpEndpoint: selected.wsUrl!, browser: selected.browser, profiles: selected.profiles, token: options.token })
-          console.log(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
-          console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
+          printSessionWarning(result)
+          printSessionCreated(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
         } else {
           const cwd = process.cwd()
           const response = await fetch(`${serverUrl}/cli/session/new`, {
             method: 'POST',
             headers: buildAuthHeaders({ token: options.token, json: true }),
-            body: JSON.stringify({ extensionId: selected.extensionId, cwd }),
+            body: JSON.stringify({
+              extensionId: selected.extensionId,
+              cwd,
+              cloudAuth: getRelayCloudAuth(),
+              tabGroup,
+              tabGroupColor,
+              patchright,
+            }),
           })
           if (!response.ok) {
             const text = await response.text()
             console.error(`Error: ${response.status} ${text}`)
             process.exit(1)
           }
-          const result = (await response.json()) as { id: string }
-          console.log(`Session ${result.id} created. Use with: playwriter -s ${result.id} -e "..."`)
+          const result = (await response.json()) as { id: string; warning?: string | null; tabGroup?: string | null }
+          printSessionWarning(result)
+          warnIfTabGroupIgnored(tabGroup || tabGroupColor, result)
+          printSessionCreated(`Session ${result.id} created. Use with: playwriter -s ${result.id} -e "..."`)
           printCloudTip()
         }
       } catch (error: any) {
@@ -735,6 +860,15 @@ async function ensureRelayForSessionCreation(isLocal: boolean): Promise<void> {
   }
 }
 
+/** Old relays don't echo tabGroup from /cli/session/new — warn instead of silently ignoring the flag. */
+function warnIfTabGroupIgnored(requested: string | undefined, result: { tabGroup?: string | null }): void {
+  if (requested && result.tabGroup === undefined) {
+    console.error(
+      pc.yellow('Warning: the running relay does not support tab groups. Restart it (kill port 19988) after updating playwriter.'),
+    )
+  }
+}
+
 async function createDirectSession({
   serverUrl,
   cdpEndpoint,
@@ -747,18 +881,18 @@ async function createDirectSession({
   browser?: string
   profiles?: Array<{ name: string; email: string }>
   token?: string
-}): Promise<{ id: string }> {
+}): Promise<{ id: string; warning?: string | null }> {
   const cwd = process.cwd()
   const response = await fetch(`${serverUrl}/cli/session/new`, {
     method: 'POST',
     headers: buildAuthHeaders({ token, json: true }),
-    body: JSON.stringify({ cdpEndpoint, cwd, browser, profiles }),
+    body: JSON.stringify({ cdpEndpoint, cwd, browser, profiles, cloudAuth: getRelayCloudAuth() }),
   })
   if (!response.ok) {
     const text = await response.text()
     throw new Error(`${response.status} ${text}`)
   }
-  return (await response.json()) as { id: string }
+  return (await response.json()) as { id: string; warning?: string | null }
 }
 
 function instanceToBrowserOption(instance: DiscoveredInstance): BrowserOption {
@@ -868,6 +1002,18 @@ async function handleCloudBrowserNotFound(browserKey: string, { hasCloudOptions 
     }
   }
   process.exit(1)
+}
+
+/** Print a warning from the relay's session new response if present. */
+function printSessionWarning(result: { warning?: string | null }): void {
+  if (result.warning) {
+    console.error(pc.yellow(`Warning: ${result.warning}`))
+  }
+}
+
+function printSessionCreated(line: string): void {
+  console.log(line)
+  console.error('run playwriter skill to see how to use playwriter if not run already')
 }
 
 function printCloudTip(): void {
@@ -1103,6 +1249,7 @@ cli
       profile: { email: string; id: string } | null
       extensionId: string | null
       cwd: string | null
+      tabGroup?: string | null
     }> = []
 
     try {
@@ -1122,6 +1269,7 @@ cli
           profile: { email: string; id: string } | null
           extensionId: string | null
           cwd: string | null
+          tabGroup?: string | null
         }>
       }
       sessions = result.sessions
@@ -1139,6 +1287,7 @@ cli
     const browserWidth = Math.max(7, ...sessions.map((session) => (session.browser || 'Chrome').length))
     const profileWidth = Math.max(7, ...sessions.map((session) => (session.profile?.email || '').length || 1))
     const extensionWidth = Math.max(2, ...sessions.map((session) => (session.extensionId || '').length || 1))
+    const groupWidth = Math.max(5, ...sessions.map((session) => (session.tabGroup || '').length || 1))
     const cwdWidth = Math.max(3, ...sessions.map((session) => (session.cwd || '').length || 1))
     const stateWidth = Math.max(10, ...sessions.map((session) => session.stateKeys.join(', ').length || 1))
 
@@ -1151,11 +1300,15 @@ cli
         '  ' +
         'EXT'.padEnd(extensionWidth) +
         '  ' +
+        'GROUP'.padEnd(groupWidth) +
+        '  ' +
         'CWD'.padEnd(cwdWidth) +
         '  ' +
         'STATE KEYS',
     )
-    console.log('-'.repeat(idWidth + browserWidth + profileWidth + extensionWidth + cwdWidth + stateWidth + 10))
+    console.log(
+      '-'.repeat(idWidth + browserWidth + profileWidth + extensionWidth + groupWidth + cwdWidth + stateWidth + 12),
+    )
 
     for (const session of sessions) {
       const stateStr = session.stateKeys.length > 0 ? session.stateKeys.join(', ') : '-'
@@ -1169,6 +1322,8 @@ cli
           profileLabel.padEnd(profileWidth) +
           '  ' +
           (session.extensionId || '-').padEnd(extensionWidth) +
+          '  ' +
+          (session.tabGroup || '-').padEnd(groupWidth) +
           '  ' +
           cwdLabel.padEnd(cwdWidth) +
           '  ' +
@@ -1209,6 +1364,113 @@ cli
   })
 
 cli
+  .command('session update <sessionId>', 'Switch a session to Patchright and back, or change its tab group (rename moves its tabs, and/or color)')
+  .option('--patchright [enabled]', 'Reconnect with Patchright and human-like input; --patchright false switches back to Playwright. Tabs stay open, state is cleared')
+  .option('--tab-group <name>', 'New tab group title for the session')
+  .option('--tab-group-color <color>', 'New tab group color: grey, blue, red, yellow, green, pink, purple, cyan, orange')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .action(async (sessionId, options) => {
+    const tabGroup = options.tabGroup ? String(options.tabGroup).trim() : ''
+    const tabGroupColor: string = (() => {
+      if (!options.tabGroupColor) {
+        return ''
+      }
+      const normalized = normalizeTabGroupColor(options.tabGroupColor)
+      if (!normalized) {
+        console.error(`Error: --tab-group-color must be one of: ${TAB_GROUP_ALL_COLORS.join(', ')}`)
+        process.exit(1)
+      }
+      return normalized
+    })()
+    // A bare --patchright parses to '', --patchright false to 'false'
+    const patchright: boolean | undefined = (() => {
+      if (options.patchright === undefined) {
+        return undefined
+      }
+      const value = String(options.patchright).trim().toLowerCase()
+      if (value !== '' && value !== 'true' && value !== 'false') {
+        console.error('Error: --patchright takes true or false')
+        process.exit(1)
+      }
+      return value !== 'false'
+    })()
+    if (!tabGroup && !tabGroupColor && patchright === undefined) {
+      console.error('Error: pass --patchright [true|false], --tab-group <name> and/or --tab-group-color <color>')
+      process.exit(1)
+    }
+
+    if (!options.host && !process.env.PLAYWRITER_HOST) {
+      await ensureRelayServer({ logger: console })
+    }
+    const serverUrl = await getServerUrl(options.host)
+
+    try {
+      const response = await fetch(`${serverUrl}/cli/session/update`, {
+        method: 'POST',
+        headers: buildAuthHeaders({ token: options.token, json: true }),
+        body: JSON.stringify({
+          sessionId,
+          tabGroup: tabGroup || undefined,
+          tabGroupColor: tabGroupColor || undefined,
+          patchright,
+        }),
+      })
+
+      if (!response.ok) {
+        const text = await response.text()
+        const parsed = (() => {
+          try {
+            return JSON.parse(text) as { error?: string }
+          } catch {
+            return null
+          }
+        })()
+        if (response.status === 404 && !parsed?.error) {
+          // Old relays don't have /cli/session/update
+          console.error('Error: the running relay does not support session update. Restart it (kill port 19988) after updating playwriter.')
+          process.exit(1)
+        }
+        console.error(`Error: ${parsed?.error || `${response.status} ${text}`}`)
+        process.exit(1)
+      }
+
+      const result = (await response.json()) as {
+        success: boolean
+        patchright?: boolean
+        reconnected?: boolean
+        tabGroup?: string
+        tabGroupColor?: string
+        movedTabs?: number
+        warning?: string
+      }
+      if (result.warning) {
+        console.error(pc.yellow(`Warning: ${result.warning}`))
+      }
+      if (patchright !== undefined && result.patchright === undefined) {
+        console.error('Error: the running relay does not support --patchright in session update. Restart it (kill port 19988) after updating playwriter.')
+        process.exit(1)
+      }
+      if (result.patchright !== undefined) {
+        const driver = result.patchright ? 'Patchright' : 'Playwright'
+        const reconnect = result.reconnected
+          ? ' Reconnected: tabs stay open, state was cleared, get pages again from context.pages().'
+          : ''
+        console.log(`Session ${sessionId} now uses ${driver}.${reconnect}`)
+      }
+      if (result.tabGroup) {
+        const colorLabel = result.tabGroupColor ? `, color ${result.tabGroupColor}` : ''
+        console.log(
+          `Session ${sessionId} now uses tab group "${result.tabGroup}"${colorLabel} (${result.movedTabs ?? 0} tab(s) updated).`,
+        )
+      }
+    } catch (error: any) {
+      console.error(`Error: ${error.message}`)
+      process.exit(1)
+    }
+  })
+
+cli
   .command('session reset <sessionId>', 'Reset the browser connection for a session')
   .option('--host <host>', 'Remote relay server host')
   .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
@@ -1233,10 +1495,8 @@ cli
         process.exit(1)
       }
 
-      const result = (await response.json()) as { success: boolean; pageUrl: string; pagesCount: number }
-      console.log(
-        `Connection reset successfully. ${result.pagesCount} page(s) available. Current page URL: ${result.pageUrl}`,
-      )
+      const result = (await response.json()) as { success: boolean; pagesCount: number }
+      console.log(`Connection reset successfully. ${result.pagesCount} page(s) available.`)
     } catch (error: any) {
       console.error(`Error: ${error.message}`)
       process.exit(1)
@@ -1245,13 +1505,13 @@ cli
 
 // ============================================================================
 // Live RTMP streaming commands. These are sugar over the executor `stream`
-// global (same execute path as -e), which resolves the session's current tab
-// and calls the relay's /stream/* endpoints. ffmpeg runs inside the relay
-// process, so the stream keeps running after the CLI exits.
+// global (same execute path as -e), which streams the session's state.page.
+// The executor and ffmpeg run in the relay process, so the stream keeps running
+// after the CLI exits. It ends when the page closes or the session is reset.
 // ============================================================================
 
 cli
-  .command('stream start', 'Stream the session tab live to RTMP destinations (X Live, Twitch, ...) via ffmpeg. Streams the current page - navigate first with -e "await page.goto(...)"')
+  .command('stream start', 'Stream the session tab live to RTMP destinations (X Live, Twitch, ...) via ffmpeg. Streams state.page - set it first with -e "state.page = await context.newPage(); await state.page.goto(...)"')
   .option('--host <host>', 'Remote relay server host')
   .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
   .option('-s, --session <id>', 'Session ID (get one with `playwriter session new`)')
@@ -1261,7 +1521,7 @@ cli
   .option('--video-bitrate <kbps>', z.number().default(9000).describe('Video bitrate in kbps (default is X Live recommended; Twitch max 6000)'))
   .option('--audio-bitrate <kbps>', z.number().default(128).describe('Audio bitrate in kbps'))
   .option('--keyframe-interval <seconds>', z.number().default(3).describe('Keyframe interval in seconds (3 = X Live recommended, 2 = Twitch)'))
-  .option('--no-audio', 'Do not capture tab audio (a silent track is injected, required by X Live)')
+  .option('--no-audio', 'Do not capture page audio (a silent track is sent, required by X Live)')
   .option('--preset <name>', z.string().default('veryfast').describe('x264 preset (only applies to libx264)'))
   .option('--codec <name>', 'Video codec for ffmpeg (default: auto-detect hardware encoder, falls back to libx264)')
   .action(async (options) => {
@@ -1293,11 +1553,10 @@ cli
       codec: options.codec,
     }
 
-    // Run through the executor so the session's current tab is resolved and
-    // ffmpeg is spawned inside the relay process (survives CLI exit).
     const code = [
-      `const result = await stream.start(${JSON.stringify(streamParams)})`,
-      `console.log('Streaming tab ' + result.tabId + ' to: ' + result.destinations.join(', '))`,
+      `if (!state.page || state.page.isClosed()) throw new Error('Set state.page first, e.g. playwriter -s <session> -e "state.page = await context.newPage(); await state.page.goto(url)"')`,
+      `const result = await stream.start({ page: state.page, ...${JSON.stringify(streamParams)} })`,
+      `console.log('Streaming to: ' + result.destinations.join(', '))`,
       `console.log('The stream runs until you call: playwriter stream stop -s <session>')`,
     ].join('\n')
 
@@ -1317,8 +1576,9 @@ cli
   .option('-s, --session <id>', 'Session ID')
   .action(async (options) => {
     const code = [
-      `const result = await stream.stop()`,
-      `console.log('Stream stopped after ' + Math.round(result.duration / 1000) + 's (' + result.bytesReceived + ' bytes captured)')`,
+      `const target = state.page && !state.page.isClosed() ? { page: state.page } : undefined`,
+      `const result = await stream.stop(target)`,
+      `console.log('Stream stopped after ' + Math.round(result.duration / 1000) + 's (' + result.frames + ' frames)')`,
     ].join('\n')
 
     await executeCode({
@@ -1337,13 +1597,14 @@ cli
   .option('-s, --session <id>', 'Session ID')
   .action(async (options) => {
     const code = [
-      `const status = await stream.status()`,
+      `const target = state.page && !state.page.isClosed() ? { page: state.page } : undefined`,
+      `const status = await stream.status(target)`,
       `if (!status.streaming) {`,
       `  console.log('Not streaming' + (status.error ? '. Last stream error: ' + status.error : ''))`,
       `} else {`,
       `  const uptime = Math.round((Date.now() - status.startedAt) / 1000)`,
-      `  console.log('Streaming tab ' + status.tabId + ' to: ' + status.destinations.join(', '))`,
-      `  console.log('Uptime: ' + uptime + 's, received: ' + status.stats.bytesReceived + ' bytes (' + status.stats.chunksReceived + ' chunks)')`,
+      `  console.log('Streaming to: ' + status.destinations.join(', '))`,
+      `  console.log('Uptime: ' + uptime + 's, frames: ' + status.stats.videoFrames + ' sent, ' + status.stats.capturedFrames + ' captured, audio chunks: ' + status.stats.audioChunks)`,
       `  if (status.stats.ffmpegFps !== undefined) {`,
       `    console.log('Encoder: ' + status.stats.ffmpegFps + ' fps, ' + (status.stats.ffmpegBitrateKbps || '?') + ' kbps, dropped: ' + (status.stats.droppedFrames ?? 0))`,
       `  }`,
@@ -1359,12 +1620,324 @@ cli
     })
   })
 
+// ============================================================================
+// Action recording commands. Recording runs inside the relay daemon (survives
+// CLI exit) and writes user interactions as a JSON array to ~/.playwriter/recordings/.
+// The printed prompt (src/recorder-prompt.md) instructs the agent how to turn a
+// recording into a SKILL.md plus a utils script that automates the same flow.
+// ============================================================================
+
+cli
+  .command('recorder start', 'Record user actions in the browser as events for skill generation')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .option('-s, --session <id>', 'Session ID (defaults to the single active session, or creates a new one)')
+  .example('playwriter recorder start')
+  .example('playwriter recorder start -s 1')
+  .action(async (options) => {
+    if (!options.host && !process.env.PLAYWRITER_HOST) {
+      await ensureRelayServer({ logger: console })
+    }
+    const serverUrl = await getServerUrl(options.host)
+    const headers = buildAuthHeaders({ token: options.token, json: true })
+
+    try {
+      const sessionId: string = await (async () => {
+        const explicit = options.session ? String(options.session) : process.env.PLAYWRITER_SESSION
+        if (explicit) {
+          return explicit
+        }
+        const listResponse = await fetch(`${serverUrl}/cli/sessions`, {
+          headers: buildAuthHeaders({ token: options.token }),
+          signal: AbortSignal.timeout(5000),
+        })
+        const { sessions } = (await listResponse.json()) as { sessions: Array<{ id: string }> }
+        if (sessions.length === 1) {
+          return sessions[0].id
+        }
+        if (sessions.length > 1) {
+          console.error(`Multiple sessions active (${sessions.map((s) => s.id).join(', ')}). Pass -s <id>.`)
+          process.exit(1)
+        }
+        // No sessions: create a default extension-mode session
+        const newResponse = await fetch(`${serverUrl}/cli/session/new`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ cwd: process.cwd(), cloudAuth: getRelayCloudAuth() }),
+        })
+        const newResult = (await newResponse.json()) as { id?: string; error?: string }
+        if (!newResponse.ok || !newResult.id) {
+          console.error(`Error creating session: ${newResult.error || newResponse.status}`)
+          console.error(`Run 'playwriter session new' first, then retry with -s <id>.`)
+          process.exit(1)
+        }
+        return newResult.id
+      })()
+
+      const response = await fetch(`${serverUrl}/recorder/start`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ sessionId }),
+        signal: AbortSignal.timeout(30_000),
+      })
+      const result = (await response.json()) as { recordingId?: string; file?: string; error?: string }
+      if (!response.ok || !result.recordingId) {
+        console.error(`Error: ${result.error || response.status}`)
+        process.exit(1)
+      }
+
+      console.log(`Recording ${result.recordingId} started on session ${sessionId}.`)
+      console.log(`Events file: ${result.file}`)
+      console.log('')
+      const promptPath = path.join(__dirname, '..', 'src', 'recorder-prompt.md')
+      console.log(fs.readFileSync(promptPath, 'utf-8'))
+    } catch (error: any) {
+      console.error(`Error: ${error.message}`)
+      process.exit(1)
+    }
+  })
+
+cli
+  .command('recorder stop [recordingId]', 'Stop an active recording and print where the events are')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .example('playwriter recorder stop')
+  .action(async (recordingId, options) => {
+    const serverUrl = await getServerUrl(options.host)
+    try {
+      const response = await fetch(`${serverUrl}/recorder/stop`, {
+        method: 'POST',
+        headers: buildAuthHeaders({ token: options.token, json: true }),
+        body: JSON.stringify(recordingId ? { recordingId } : {}),
+      })
+      const result = (await response.json()) as {
+        recordingId?: string
+        eventCount?: number
+        filePath?: string
+        error?: string
+      }
+      if (!response.ok || !result.recordingId) {
+        console.error(`Error: ${result.error || response.status}`)
+        process.exit(1)
+      }
+      console.log(`Recording ${result.recordingId} stopped. ${result.eventCount} events captured.`)
+      console.log(`Events file: ${result.filePath}`)
+      console.log('')
+      console.log('Next steps (full instructions were printed by `recorder start`):')
+      console.log('  1. playwriter skill')
+      console.log('     or https://playwriter.dev/SKILL.md')
+      console.log(`  2. playwriter recorder events -r ${result.recordingId}`)
+      console.log('  3. Write SKILL.md + a named helper (submit.js, sdk.js) with playwriter -e examples from the events')
+      console.log('     or a standalone typed sdk.ts via connectViaExtension: https://playwriter.dev/docs/sessions#node-api')
+    } catch (error: any) {
+      console.error(`Error: ${error.message}`)
+      process.exit(1)
+    }
+  })
+
+cli
+  .command(
+    'recorder events [...eventIds]',
+    'Print recorded events as jsonl. Uses the latest recording unless `--recording` is passed. Default output is a thin timeline view. Pass event ids to print sanitized network details.',
+  )
+  .option('-r, --recording <id>', 'Recording ID (defaults to the latest recording)')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .option('--type <type>', 'Only print events of this type (e.g. action, network, toast, page-error)')
+  .option('--errors', 'Only print failed requests (status >= 400 or network failure), console errors, page errors and toasts')
+  .option('--exclude <regex>', 'Drop network events whose url matches this regex (e.g. "analytics|StylesService")')
+  .option('--full', 'Print full events for the whole timeline instead of the thin view')
+  .example('playwriter recorder events        # latest recording, thin timeline')
+  .example(`playwriter recorder events | jq -r '[.id, .t, .type, (.code // .url // .text // empty)] | @tsv'`)
+  .example('playwriter recorder events 4 7    # full details of events 4 and 7')
+  .example('playwriter recorder events -r 2 --type action   # actions of recording 2')
+  .example('playwriter recorder events --errors              # why steps failed')
+  .action(async (eventIds, options) => {
+    const recordingId = options.recording
+    // When defaulting to the latest recording while several recordings are
+    // active concurrently, "latest" is ambiguous: warn on stderr (stdout must
+    // stay clean jsonl). Best-effort: relay may not be reachable.
+    if (!recordingId) {
+      const active = await (async () => {
+        try {
+          const serverUrl = await getServerUrl(options.host)
+          const response = await fetch(`${serverUrl}/recorder/status`, {
+            headers: buildAuthHeaders({ token: options.token }),
+            signal: AbortSignal.timeout(2000),
+          })
+          const { recordings } = (await response.json()) as { recordings: Array<{ recordingId: string }> }
+          return recordings
+        } catch {
+          return []
+        }
+      })()
+      if (active.length > 1) {
+        console.error(
+          `Warning: ${active.length} recordings are active (ids ${active.map((r) => r.recordingId).join(', ')}). Showing the latest one; pass a recording id to choose.`,
+        )
+      }
+    }
+    const content: string = await (async () => {
+      // Local relay: read the jsonl straight from disk. Remote relay: the file
+      // lives on the relay's machine, fetch it over HTTP.
+      if (!options.host && !process.env.PLAYWRITER_HOST) {
+        const { recordingFilePath, latestRecordingId } = await import('./action-recorder.js')
+        // No id → latest recording, mirroring `recorder stop` defaulting
+        const resolvedId = recordingId ? String(recordingId) : latestRecordingId()
+        if (!resolvedId) {
+          console.error(`No recordings found. Start one with 'playwriter recorder start'.`)
+          process.exit(1)
+        }
+        const filePath = recordingFilePath(resolvedId)
+        if (!fs.existsSync(filePath)) {
+          console.error(`Recording ${resolvedId} not found at ${filePath}`)
+          process.exit(1)
+        }
+        return fs.readFileSync(filePath, 'utf-8')
+      }
+      const serverUrl = await getServerUrl(options.host)
+      const response = await fetch(`${serverUrl}/recorder/events/${recordingId ?? 'latest'}`, {
+        headers: buildAuthHeaders({ token: options.token }),
+        signal: AbortSignal.timeout(10000),
+      })
+      if (!response.ok) {
+        console.error(`Error: ${response.status} ${await response.text()}`)
+        process.exit(1)
+      }
+      return await response.text()
+    })()
+    const { projectThinEvent, parseRecording, isProblemEvent, collapseRepeatedNetwork } = await import('./action-recorder.js')
+    const invalidIds = (eventIds || []).filter((id) => !/^\d+$/.test(String(id)))
+    if (invalidIds.length > 0) {
+      console.error(`Invalid event ids: ${invalidIds.join(', ')}. Event ids are the numeric 'id' field from the timeline.`)
+      process.exit(1)
+    }
+    const exclude = (() => {
+      if (!options.exclude) {
+        return null
+      }
+      try {
+        return new RegExp(String(options.exclude), 'i')
+      } catch (error: any) {
+        console.error(`Invalid --exclude regex: ${error.message}`)
+        process.exit(1)
+      }
+    })()
+    const requestedIds = new Set((eventIds || []).map((id) => Number(id)))
+    const events = parseRecording(content)
+    if (requestedIds.size > 0) {
+      for (const event of events) {
+        if (event.id !== undefined && requestedIds.has(Number(event.id))) {
+          console.log(JSON.stringify(event))
+        }
+      }
+      return
+    }
+    const selected = events.filter((event) => {
+      if (options.type && event.type !== options.type) {
+        return false
+      }
+      if (options.errors && !isProblemEvent(event)) {
+        return false
+      }
+      return !(exclude && event.type === 'network' && exclude.test(String(event.url)))
+    })
+    if (options.full) {
+      for (const event of selected) {
+        console.log(JSON.stringify(event))
+      }
+      return
+    }
+    for (const event of collapseRepeatedNetwork(selected)) {
+      console.log(JSON.stringify(projectThinEvent(event)))
+    }
+  })
+
+cli
+  .command(
+    'recorder frame <eventId>',
+    'Print the path of the screencast frame closest to an event, to see the screen at that moment. Local relay only.',
+  )
+  .option('-r, --recording <id>', 'Recording ID (defaults to the latest recording)')
+  .option('--offset <ms>', z.number().default(0).describe('Milliseconds after the event. Use 1000 to see the result of a click'))
+  .example('playwriter recorder frame 42              # screen when event 42 happened')
+  .example('playwriter recorder frame 42 --offset 1500 # screen 1.5s later')
+  .action(async (eventId, options) => {
+    const { recordingFilePath, latestRecordingId, parseRecording, closestFrameFile } = await import('./action-recorder.js')
+    const resolvedId = options.recording ? String(options.recording) : latestRecordingId()
+    if (!resolvedId) {
+      console.error(`No recordings found. Start one with 'playwriter recorder start'.`)
+      process.exit(1)
+    }
+    const filePath = recordingFilePath(resolvedId)
+    if (!fs.existsSync(filePath)) {
+      console.error(`Recording ${resolvedId} not found at ${filePath}`)
+      process.exit(1)
+    }
+    const events = parseRecording(fs.readFileSync(filePath, 'utf-8'))
+    const event = events.find((item) => Number(item.id) === Number(eventId))
+    if (!event || typeof event.ms !== 'number') {
+      console.error(`Event ${eventId} not found in recording ${resolvedId}`)
+      process.exit(1)
+    }
+    const framesDir = events.find((item) => item.type === 'recording-started')?.framesDir
+    if (typeof framesDir !== 'string' || !fs.existsSync(framesDir)) {
+      console.error(`Recording ${resolvedId} has no frames folder`)
+      process.exit(1)
+    }
+    const frame = closestFrameFile({ frameFiles: fs.readdirSync(framesDir), ms: event.ms + Number(options.offset) })
+    if (!frame) {
+      console.error(`Recording ${resolvedId} has no frames`)
+      process.exit(1)
+    }
+    console.log(path.join(framesDir, frame))
+  })
+
+cli
+  .command('recorder status', 'List active recordings')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .action(async (options) => {
+    const serverUrl = await getServerUrl(options.host)
+    try {
+      const response = await fetch(`${serverUrl}/recorder/status`, {
+        headers: buildAuthHeaders({ token: options.token }),
+        signal: AbortSignal.timeout(5000),
+      })
+      const { recordings } = (await response.json()) as {
+        recordings: Array<{
+          recordingId: string
+          sessionId: string
+          startedAt: number
+          eventCount: number
+          filePath: string
+          pageUrls?: string[]
+          lastUrl?: string
+        }>
+      }
+      if (recordings.length === 0) {
+        console.log('No active recordings')
+        return
+      }
+      for (const recording of recordings) {
+        const uptime = Math.round((Date.now() - recording.startedAt) / 1000)
+        const urls = recording.pageUrls?.length ? recording.pageUrls.join(', ') : recording.lastUrl || '(no pages)'
+        console.log(`Recording ${recording.recordingId} (session ${recording.sessionId}): ${recording.eventCount} events, running ${uptime}s`)
+        console.log(`  ${urls}`)
+        console.log(`  ${recording.filePath}`)
+      }
+    } catch (error: any) {
+      console.error(`Error: ${error.message}`)
+      process.exit(1)
+    }
+  })
+
 cli
   .command(
     'serve',
-    `Start the relay server on this machine (must be the same host where Chrome is running). Remote clients (Docker, other machines) connect via PLAYWRITER_HOST. Use --host localhost for Docker (no token needed) — containers reach it via host.docker.internal. Use --host 0.0.0.0 for LAN/internet access (requires --token).`,
+    `Start the relay server on this machine (must be the same host where Chrome is running). Remote clients (Docker, other machines) connect via PLAYWRITER_HOST and PLAYWRITER_TOKEN. Use --host 0.0.0.0 for Docker, LAN, or internet access (requires --token).`,
   )
-  .option('--host [host]', z.string().default('0.0.0.0').describe('Host to bind to (use "localhost" for Docker, "0.0.0.0" for remote access)'))
+  .option('--host [host]', z.string().default('0.0.0.0').describe('Host to bind to (use "0.0.0.0" for Docker or remote access)'))
   .option('--token <token>', 'Authentication token, required when --host is 0.0.0.0 (or use PLAYWRITER_TOKEN env var)')
   .option('--replace', 'Kill existing server if running')
   .action(async (options) => {
@@ -1417,27 +1990,26 @@ cli
 
     // Lazy-load heavy dependencies only when serve command is used
     const { createFileLogger } = await import('./create-logger.js')
-    const { startPlayWriterCDPRelayServer } = await import('./cdp-relay.js')
+    const { startPlayWriterCDPRelayServer, defaultSessionCounterPath } = await import('./cdp-relay.js')
+    const { installProcessGuard } = await import('./process-guard.js')
 
     const logger = createFileLogger()
 
     process.title = 'playwriter-serve'
 
-    process.on('uncaughtException', async (err) => {
-      await logger.error('Uncaught Exception:', err)
-      process.exit(1)
-    })
-
-    process.on('unhandledRejection', async (reason) => {
-      await logger.error('Unhandled Rejection:', reason)
-      process.exit(1)
-    })
+    installProcessGuard({ logger })
 
     const server = await startPlayWriterCDPRelayServer({
       port: RELAY_PORT,
       host: options.host,
       token,
       logger,
+      sessionCounterFile: defaultSessionCounterPath(RELAY_PORT),
+      onDrained: () => {
+        console.log('\nA newer Playwriter CLI replaced this relay. Shutting down...')
+        server.close()
+        process.exit(0)
+      },
     })
 
     console.log('Playwriter CDP relay server started')
@@ -1781,8 +2353,30 @@ cli
     }
   })
 
+cli
+  .command('serve restart', 'Restart the local relay daemon. Refuses while agents run executes')
+  .hidden()
+  .option('--force', 'Restart even while executes run. They are aborted')
+  .action(async (options) => {
+    const relay = await getRelayInfo()
+    if (relay?.activeExecutes && !options.force) {
+      console.error(
+        `The relay is running ${relay.activeExecutes} execute(s) for agents. Run again when they finish, or pass --force to abort them.`,
+      )
+      process.exit(1)
+    }
+    try {
+      await stopRelayServer({ logger: console, drainTimeoutMs: options.force ? 0 : undefined })
+    } catch (error) {
+      console.error(`Error: ${error instanceof Error ? error.message : String(error)}`)
+      process.exit(1)
+    }
+    await ensureRelayServer({ logger: console })
+  })
+
 cli.command('logfile', 'Print the path to the relay server log file').action(() => {
   console.log(`relay: ${LOG_FILE_PATH}`)
+  console.log(`relay (previous run): ${LOG_FILE_PATH}.1`)
   console.log(`cdp: ${LOG_CDP_FILE_PATH}`)
 })
 
@@ -1795,5 +2389,9 @@ cli.command('skill', 'Print the full playwriter usage instructions').action(() =
 cli.help()
 cli.completions()
 cli.version(VERSION)
+cli.on('command:*', () => {
+  process.stderr.write('Run "playwriter --help" for usage information.\n')
+})
 
+printTelemetryNoticeOnce()
 await cli.parse()

@@ -1,5 +1,21 @@
 # Memory
 
+## getTargets().attached ≠ our own attachment (Jul 2026)
+
+`chrome.debugger.getTargets()` `attached` is true if ANY debugger client is on
+the target, including the downstream Playwright CDP client via `connectOverCDP`.
+After our own `chrome.debugger.detach({tabId})` it stays true (verified 600ms).
+So it cannot tell whether OUR extension's debugger is still attached. Do not use
+it to decide spurious-vs-genuine `target_closed` in `onDebuggerDetach` (issue #40).
+
+## target_closed transparent re-attach loses Playwright session state (Jul 2026)
+
+On a genuinely dropped debugger session, silently re-attaching with the same
+synthetic sessionId (no new `Target.attachedToTarget`) leaves Playwright's
+per-session `Runtime.enable` dead, so `page.evaluate` fails "Execution context
+was destroyed" forever. Transparent reuse only works if the session was never
+really dropped. #40's spurious detach needs a verified live repro, not this.
+
 ## Loopback ≠ trusted under tunnel agents (Apr 2026)
 
 Tunnel agents (traforo, ngrok, cloudflared) run as local processes that
@@ -211,4 +227,48 @@ to `get-stream@9+` unless the vendored unzip code is rewritten or replaced.
 `cli-help.test.ts > unknown command` fails on main: goke no longer prints
 `playwriter --help` to stderr. `extension-connection.test.ts > reconnect after
 disconnecting everything` also fails on clean HEAD (verified via worktree).
-Neither is a regression signal for unrelated changes.
+`relay-core.test.ts > shadcn-ui snapshot` used to always fail its interactive
+waitFor: the `text=shadcn/ui` locator is gone from the site, so the snapshot
+recorded the timeout error and `toContain('shadcn')` only passed on the error
+call log. Fixed by waiting on the hero `Get Started` link, then `waitForLoadState
+('networkidle')` so the Next.js SPA stops navigating before both snapshots, and
+widening that one exec call to 40s. Passes 3/3 in isolation; other external-site
+tests can still flake under full-suite load.
+`relay-core.test.ts > download events for
+Browser and Page domains` fails on clean HEAD too (verified via worktree, Apr
+2026): hasBrowserDownloadWillBegin/Progress come back false. `relay-session.test.ts
+> list scripts with Debugger class` flakes intermittently (passes on retry).
+Neither is a regression signal for unrelated changes. Careful: `pnpm test`
+passes `-u`, so these failing snapshot tests get rewritten with wrong values —
+always review the test-file git diff after a full run.
+
+## Toolbar plus menus (Oct 2026)
+
+The in-page toolbar was removed for menus, then restored next to them. Page CSS
+can restyle or cover it, so it lives in the ISOLATED world in a closed shadow
+root, checks clicks with `isTrustedToolbarClick`, and talks to the service
+worker only via `chrome.runtime.sendMessage` (a `window.postMessage` bridge once
+let any page start recording or remote control). The Record skill and Share
+browser… menu items and `share.html` were removed (Oct 2026): recording and
+sharing start only from the toolbar (Remote control consent is an in-page
+dialog). Menus (page right-click, icon right-click) keep Copy Locator, React
+source, and, while sharing, Copy remote agent prompt, Copy remote id and Stop
+sharing. The isolated content script only remembers the last right-clicked
+element and draws toasts; never expose it to the MAIN world.
+
+## Offscreen document must filter chrome.runtime messages (Apr 2026)
+
+`chrome.runtime.sendMessage` broadcasts to every extension context. An
+unfiltered offscreen listener that returns `true` answers service-worker
+actions first and breaks them. Offscreen clipboard writes also need
+`document.execCommand('copy')` on a textarea: offscreen documents can never be
+focused, so `navigator.clipboard.writeText` always rejects there.
+
+## Screencast keeps running on backgrounded debugged tabs (Apr 2026)
+
+Search results claim `Page.startScreencast` only works for visible tabs. Wrong
+when `chrome.debugger` is attached: after a real `chrome.tabs.update` switch the
+tab still reports `visibilityState === 'visible'` and frames keep arriving at the
+same rate (231 active vs 231 backgrounded). Pinned by
+`screencast-background-tab.test.ts`. `Page.bringToFront` does NOT switch the
+active Chrome tab, so any test using it measures nothing.

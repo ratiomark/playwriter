@@ -1,6 +1,6 @@
 # MCP Setup
 
-> **Note:** CLI is the recommended way to use Playwriter. See [README.md](./README.md) for CLI usage.
+> **Note:** CLI is the recommended way to use Playwriter. See [quick start](./website/src/pages/docs/quick-start.mdx) for CLI usage.
 
 Add to your MCP client settings:
 
@@ -32,28 +32,6 @@ The MCP exposes:
 - `execute` tool - run Playwright code snippets
 - `reset` tool - reconnect if connection issues occur
 
-## Environment Variables
-
-### `PLAYWRITER_AUTO_ENABLE`
-
-Auto-creates a tab when Playwright connects (no manual extension click needed). **Enabled by default** in both CLI and MCP. The auto-created tab starts at `about:blank`; navigate it to any URL.
-
-Set `PLAYWRITER_AUTO_ENABLE=false` to disable and require manually enabling the extension on a tab before connecting:
-
-```json
-{
-  "mcpServers": {
-    "playwriter": {
-      "command": "npx",
-      "args": ["-y", "playwriter@latest"],
-      "env": {
-        "PLAYWRITER_AUTO_ENABLE": "false"
-      }
-    }
-  }
-}
-```
-
 ## Direct CDP (no extension needed)
 
 Connect directly to Chrome's DevTools Protocol without the extension. Set `PLAYWRITER_DIRECT` in your MCP config:
@@ -77,8 +55,6 @@ Enable debugging in Chrome first: open `chrome://inspect/#remote-debugging` or l
 Chrome 136+ may show an approval dialog the first time a connection is made.
 
 You can also pass an explicit WebSocket endpoint: `PLAYWRITER_DIRECT=ws://127.0.0.1:9222/devtools/browser/abc`.
-
-**Limitation:** screen recording is unavailable in direct mode.
 
 ## Remote Agents (Devcontainers, VMs, SSH)
 

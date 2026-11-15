@@ -1,41 +1,34 @@
 ---
 title: Live Stream a Browser Tab to RTMP
 sidebarTitle: Streaming
-description: Stream a browser tab live to X Live, Twitch, or YouTube via RTMP. Uses chrome.tabCapture plus ffmpeg re-encoding, survives page navigation, and runs 24/7.
+description: Stream a browser tab live to X Live, Twitch, or YouTube via RTMP. Uses CDP screencast plus ffmpeg, needs no permission click, survives page navigation and works in direct CDP mode.
 icon: lucide:radio
 prompt: |
   Document the `playwriter stream` command and executor `stream` API.
-  Sources: playwriter/src/stream-relay.ts, playwriter/src/screen-recording.ts,
+  Sources: playwriter/src/screen-recording.ts, playwriter/src/audio-tap-client.ts,
   playwriter/src/cli.ts (stream commands), playwriter/src/skill.md.
 ---
 
-Stream a tab **live to RTMP endpoints** like X Live, Twitch, or YouTube. Playwriter captures the tab with the same `chrome.tabCapture` pipeline used for [recording](/docs/recording), so the **stream survives page navigation**. The relay pipes each capture chunk to an `ffmpeg` process that re-encodes in real time and pushes to your destinations.
+Stream a tab **live to RTMP endpoints** like X Live, Twitch, or YouTube. Playwriter captures the page with CDP `Page.startScreencast`, so the **stream survives page navigation**. Each JPEG frame is piped to an `ffmpeg` process that encodes in real time and pushes to your destinations.
 
-ffmpeg runs **inside the relay process**, so the stream keeps running after the CLI exits. Perfect for 24/7 auto-generated content: render a web page, stream it forever.
+No permission click is needed. It works in extension mode, direct CDP mode (`PLAYWRITER_DIRECT`), headless, and cloud browsers.
+
+The executor and ffmpeg run **inside the relay process**, so the stream keeps running after the CLI exits. Render a web page, stream it for hours.
 
 ## Requirements
 
 - `ffmpeg` installed and on `PATH`
-- Extension capture permission: use `playwriter browser start` for automated flows, or click the Playwriter extension icon on the tab once
-- Not available in headless or direct CDP mode (relies on the extension's `chrome.tabCapture`)
-
-## Limitations
-
-- **Manual permission click per tab.** Chrome's `activeTab` model requires a user gesture: you must click the Playwriter extension icon on the tab before it can be captured, and the grant is **per tab** — streaming a different tab needs another click on that tab. This is a Chrome platform restriction, not a Playwriter one. For fully automated flows, launch a managed browser with `playwriter browser start`, which auto-accepts tab capture without any click.
-- **One stream per tab.** A tab can have only one active capture: it can be streamed or recorded, not both, and not streamed twice.
-- **Multiple tabs at once is untested.** The architecture supports one stream per tab (each with its own ffmpeg process), but Chrome does not officially document support for many simultaneous `tabCapture` streams, and each stream costs a full real-time encode. Test with your setup before relying on it for production multi-streaming; prefer the tee muxer (repeat `--rtmp`) when you want the *same* tab on several platforms — that's one capture and one encode.
-- **A few seconds of latency** (capture chunking + encoder buffering) — fine for live streaming, not for real-time interaction.
 
 ## Start streaming
 
-The stream captures the session's **current page** — navigate first, then start:
+The stream captures the session's **`state.page`**. Set it and navigate first, then start:
 
 ```bash
-playwriter -s 1 -e "await page.goto('https://my-generated-content.example')"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://my-generated-content.example')"
 playwriter stream start -s 1 --rtmp rtmp://va.pscp.tv:80/x/<stream-key>
 ```
 
-Simultaneous multi-streaming — repeat `--rtmp` (uses ffmpeg's tee muxer, one encode for all destinations; a dead endpoint doesn't kill the others):
+Simultaneous **multi-streaming**: repeat `--rtmp`. It uses ffmpeg's tee muxer, so one encode serves all destinations, and a dead endpoint doesn't kill the others:
 
 ```bash
 playwriter stream start -s 1 \
@@ -46,11 +39,12 @@ playwriter stream start -s 1 \
 ## Monitor and stop
 
 ```bash
-# Uptime, encoder fps, output bitrate, dropped frames
+# Uptime, frames sent and captured, audio chunks, encoder fps, bitrate, dropped frames
 playwriter stream status -s 1
 
 # Graceful stop: flushes the encoder and waits for ffmpeg to exit
 playwriter stream stop -s 1
+# => Stream stopped after 3600s (108000 frames)
 ```
 
 ## Options
@@ -58,16 +52,26 @@ playwriter stream stop -s 1
 | Flag | Default | Description |
 |---|---|---|
 | `--rtmp <url>` | required | RTMP destination with stream key, repeatable |
-| `--resolution <WxH>` | `1920x1080` | Output resolution, ffmpeg scales the capture |
+| `--resolution <WxH>` | `1920x1080` | Output resolution |
 | `--fps <n>` | `30` | Output frame rate |
 | `--video-bitrate <kbps>` | `9000` | X Live recommended; Twitch max is 6000 |
 | `--keyframe-interval <s>` | `3` | X Live recommended (and max); Twitch recommends 2 |
 | `--audio-bitrate <kbps>` | `128` | AAC 44100Hz stereo |
-| `--no-audio` | off | Skip tab audio, injects a silent track (X Live requires an audio track) |
+| `--no-audio` | off | Skip page audio, sends a silent track (X Live requires an audio track) |
 | `--preset <name>` | `veryfast` | x264 preset, only applies to libx264 |
-| `--codec <name>` | auto | Auto-detects hardware encoders (videotoolbox, nvenc, qsv), falls back to libx264 |
+| `--codec <name>` | auto | Auto-detects hardware encoders (videotoolbox, nvenc, qsv, amf), falls back to libx264 |
 
 Defaults match **X Live's recommended encoder settings** (1080p, 9000 kbps H.264, 30 fps, 3s keyframes, AAC 128k 44100Hz stereo). For Twitch use `--video-bitrate 6000 --keyframe-interval 2`.
+
+## Audio
+
+Audio is **on by default** for streams. Playwriter injects a Web Audio tap in the page that captures `<audio>`, `<video>` and AudioContexts playing to the speakers, then muxes the PCM in ffmpeg.
+
+- No audio from cross-origin (out-of-process) iframes
+- An AudioContext graph wired before the stream starts is missed
+- The page can detect the patched audio APIs while streaming
+
+With `--no-audio` (or `audio: false`) a silent track is sent instead.
 
 ## Executor API
 
@@ -75,30 +79,37 @@ The same functionality is available inside `execute` code:
 
 ```js
 await stream.start({
+  page: state.page,
   rtmpUrls: ['rtmp://va.pscp.tv:80/x/STREAM_KEY'],
   resolution: '1920x1080',
   fps: 30,
   videoBitrateKbps: 9000,
 })
+// => { startedAt, destinations }
 
-await stream.status()
-// => { streaming, startedAt, destinations, stats: { ffmpegFps, ffmpegBitrateKbps, droppedFrames, ... } }
+await stream.status({ page: state.page })
+// => { streaming, startedAt, destinations, stats: { videoFrames, capturedFrames, audioChunks, ffmpegFps, ffmpegBitrateKbps, droppedFrames }, error? }
 
-await stream.stop()
-// => { duration, bytesReceived }
+await stream.stop({ page: state.page })
+// => { duration, frames }
 ```
 
-Stream keys are secrets: status output and logs only ever show **redacted destinations** (`rtmp://host/…`).
+`page` is optional for `stop` and `status` when only one stream is active. Stream keys are secrets: status output and logs only ever show **redacted destinations** (`rtmp://host/…`).
 
-## Latency
+## Limitations
 
-The extension emits capture chunks every second, and the encoder adds a little buffering: expect roughly **2 to 4 seconds** of glass-to-glass latency before the platform's own delay. Fine for live streams, not designed for real-time interaction.
+- **Ends with the page.** The stream is tied to the Playwright page. It stops when the page closes or the session is reset or deleted.
+- **One stream per page.** Use repeated `--rtmp` to send the same page to several platforms with one encode.
+- **One encode per stream.** Streaming several pages at once runs one real-time ffmpeg encode each, so CPU cost adds up.
 
 ## Streaming vs recording
 
 | | `recording.*` | `stream.*` |
 |---|---|---|
-| Output | MP4 file on disk | RTMP endpoints |
-| Duration | auto-stops after 15 min | unlimited, runs after CLI exits |
-| Encoding | in-browser MediaRecorder | ffmpeg re-encode (CBR, fixed GOP) |
-| Same tab at once | one capture per tab — a tab can be recorded or streamed, not both | |
+| Output | video file on disk | RTMP endpoints |
+| Capture | Chrome's native recorder | CDP screencast JPEG frames |
+| Duration | auto-stops after 60 min | runs until stopped, survives CLI exit |
+| Audio | off by default | on by default |
+| Encoding | Chrome AV1, H.264 by ffmpeg | ffmpeg, H.264 with fixed keyframe interval |
+
+A tab cannot record and stream at the same time: Chrome allows one screencast per tab.

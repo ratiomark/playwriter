@@ -16,7 +16,9 @@ Buffer.prototype[util.inspect.custom] = function () {
 import dedent from 'string-dedent'
 import { LOG_FILE_PATH, VERSION, parseRelayHost } from './utils.js'
 import { ensureRelayServer, RELAY_PORT } from './relay-client.js'
-import { PlaywrightExecutor, CodeExecutionTimeoutError } from './executor.js'
+import { PlaywrightExecutor, CodeExecutionTimeoutError, boundExecuteOutput } from './executor.js'
+import { installProcessGuard } from './process-guard.js'
+import { isPatchrightEnvEnabled } from './playwright-import.js'
 import { discoverChromeInstances, resolveDirectInput, appendSessionToWsUrl } from './chrome-discovery.js'
 import crypto from 'node:crypto'
 
@@ -26,6 +28,7 @@ const require = createRequire(import.meta.url)
 
 // Single executor instance for MCP (created lazily)
 let executor: PlaywrightExecutor | null = null
+let executorPromise: Promise<PlaywrightExecutor> | null = null
 
 interface RemoteConfig {
   host: string
@@ -78,7 +81,7 @@ async function sendLogToRelayServer(level: string, ...args: any[]) {
  */
 function mcpLog(...args: any[]) {
   console.error(...args)
-  sendLogToRelayServer('log', ...args)
+  void sendLogToRelayServer('log', ...args)
 }
 
 /** MCP-specific logger for executor */
@@ -86,7 +89,7 @@ const mcpLogger = {
   log: (...args: any[]) => mcpLog(...args),
   error: (...args: any[]) => {
     console.error(...args)
-    sendLogToRelayServer('error', ...args)
+    void sendLogToRelayServer('error', ...args)
   },
 }
 
@@ -133,39 +136,51 @@ async function getOrCreateExecutor(): Promise<PlaywrightExecutor> {
   if (executor) {
     return executor
   }
+  if (executorPromise) {
+    return executorPromise
+  }
 
-  // Direct CDP mode takes priority over relay/remote
-  const directConfig = await getDirectCdpConfig()
-  if (directConfig) {
-    executor = new PlaywrightExecutor({
-      cdpConfig: directConfig,
+  executorPromise = (async () => {
+    // Direct CDP mode takes priority over relay/remote
+    const directConfig = await getDirectCdpConfig()
+    if (directConfig) {
+      return new PlaywrightExecutor({
+        cdpConfig: directConfig,
+        logger: mcpLogger,
+        cwd: process.cwd(),
+        patchright: isPatchrightEnvEnabled(),
+      })
+    }
+
+    const remote = getRemoteConfig()
+    if (!remote) {
+      await ensureRelayServerForMcp()
+    }
+
+    // Pass config instead of pre-generated URL so executor can generate unique URLs for each connection
+    const cdpConfig = { ...(remote || { port: RELAY_PORT }), client: 'mcp' as const }
+    return new PlaywrightExecutor({
+      cdpConfig,
       logger: mcpLogger,
       cwd: process.cwd(),
+      patchright: isPatchrightEnvEnabled(),
     })
+  })()
+
+  try {
+    executor = await executorPromise
     return executor
+  } finally {
+    executorPromise = null
   }
-
-  const remote = getRemoteConfig()
-  if (!remote) {
-    await ensureRelayServerForMcp()
-  }
-
-  // Pass config instead of pre-generated URL so executor can generate unique URLs for each connection
-  const cdpConfig = remote || { port: RELAY_PORT }
-  executor = new PlaywrightExecutor({
-    cdpConfig,
-    logger: mcpLogger,
-    cwd: process.cwd(),
-  })
-
-  return executor
 }
 
-async function checkRemoteServer({ host, port }: { host: string; port: number }): Promise<void> {
+async function checkRemoteServer({ host, port, token }: RemoteConfig): Promise<void> {
   const { httpBaseUrl } = parseRelayHost(host, port)
   const versionUrl = `${httpBaseUrl}/version`
   try {
-    const response = await fetch(versionUrl, { signal: AbortSignal.timeout(3000) })
+    const headers = token ? { Authorization: `Bearer ${token}` } : undefined
+    const response = await fetch(versionUrl, { headers, signal: AbortSignal.timeout(3000) })
     if (!response.ok) {
       throw new Error(`Server responded with status ${response.status}`)
     }
@@ -242,7 +257,7 @@ server.tool(
     code: z
       .string()
       .describe(
-        'js playwright code, has {page, state, context} in scope. Should be one line, using ; to execute multiple statements. you MUST call execute multiple times instead of writing complex scripts in a single tool call.',
+        'js playwright code, has {state, context} in scope. There is no `page` global: use `state.page = await context.newPage()` or pick an existing tab from `context.pages()`. Should be one line, using ; to execute multiple statements. you MUST call execute multiple times instead of writing complex scripts in a single tool call.',
       ),
     timeout: z
       .number()
@@ -261,19 +276,16 @@ server.tool(
       }
 
       const exec = await getOrCreateExecutor()
-      const result = await exec.execute(code, timeout)
+      const result = await exec.execute(code, { timeout })
 
-      // Transform executor result to MCP format
-      // Append screenshot metadata to text for MCP (image is included inline as content)
-      const MAX_TEXT = 10000
-      let text = result.text
-      for (const s of result.screenshots) {
-        text += `\nScreenshot saved to: ${s.path} (image included below, ${s.labelCount} labels)\n`
-        text += `Accessibility snapshot:\n${s.snapshot}\n`
-      }
-      if (text.length > MAX_TEXT) {
-        text = text.slice(0, MAX_TEXT) + '\n\n[Truncated]'
-      }
+      // result.text is already bounded by the executor. Bound only the appended
+      // screenshot snapshots here (images are included inline as content).
+      const screenshotText = result.screenshots
+        .map((s) => {
+          return `\nScreenshot saved to: ${s.path} (image included below, ${s.labelCount} labels)\nAccessibility snapshot:\n${s.snapshot}\n`
+        })
+        .join('')
+      const text = result.text + boundExecuteOutput({ before: '', after: screenshotText })
 
       const content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> = [
         { type: 'text', text },
@@ -295,7 +307,7 @@ server.tool(
 
       console.error('Error in execute tool:', errorStack)
       if (!isTimeoutError) {
-        sendLogToRelayServer('error', 'Error in execute tool:', errorStack)
+        void sendLogToRelayServer('error', 'Error in execute tool:', errorStack)
       }
 
       const resetHint = isTimeoutError
@@ -315,11 +327,11 @@ server.tool(
 server.tool(
   'reset',
   dedent`
-    Recreates the CDP connection and resets the browser/page/context. Use this when the MCP stops responding, you get connection errors, if there are no pages in context, assertion failures, page closed, or other issues.
+    Recreates the CDP connection and resets the browser/context. Use this when the MCP stops responding, you get connection errors, assertion failures, or other issues.
 
-    After calling this tool, the page and context variables are automatically updated in the execution environment.
+    After calling this tool, the context variable is automatically updated in the execution environment.
 
-    This tools also removes any custom properties you may have added to the global scope AND clearing all keys from the \`state\` object. Only \`page\`, \`context\`, \`state\` (empty), \`console\`, and utility functions will remain.
+    This tools also removes any custom properties you may have added to the global scope AND clearing all keys from the \`state\` object. Only \`context\`, \`state\` (empty), \`console\`, and utility functions will remain. Assign \`state.page\` again after a reset.
 
     if playwright always returns all pages as about:blank urls and evaluate does not work you should ask the user to restart Chrome. This is a known Chrome bug.
   `,
@@ -336,13 +348,13 @@ server.tool(
       }
 
       const exec = await getOrCreateExecutor()
-      const { page, context } = await exec.reset()
+      const { context } = await exec.reset()
       const pagesCount = context.pages().length
       return {
         content: [
           {
             type: 'text',
-            text: `Connection reset successfully. ${pagesCount} page(s) available. Current page URL: ${page.url()}`,
+            text: `Connection reset successfully. ${pagesCount} page(s) available.`,
           },
         ],
       }
@@ -356,6 +368,8 @@ server.tool(
 )
 
 export async function startMcp(options: { host?: string; token?: string } = {}) {
+  installProcessGuard({ logger: mcpLogger })
+
   if (options.host) {
     process.env.PLAYWRITER_HOST = options.host
   }

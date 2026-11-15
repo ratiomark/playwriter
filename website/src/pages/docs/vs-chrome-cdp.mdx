@@ -1,7 +1,7 @@
 ---
 title: Playwriter vs Chrome Direct CDP
 sidebarTitle: vs Chrome Direct CDP
-description: Why Chrome's built-in CDP remote debugging is impractical for agents, and how Playwriter solves it.
+description: Why Chrome's built-in CDP remote debugging is impractical for agents, and how Playwriter avoids the debugger dialog.
 icon: lucide:shield-alert
 ---
 
@@ -28,6 +28,12 @@ on its own. The user must be present, watching, and ready to click every time th
 reconnects. If Chrome restarts, the dialog appears again. If the connection drops, the dialog
 appears again.
 
+There is a second, stricter limit. Since **Chrome 136**, `--remote-debugging-port` is
+**ignored on your default profile** as a security mitigation. You must launch with a
+throwaway `--user-data-dir`, which is a fresh profile with none of your logins or extensions.
+So Chrome's built-in CDP either can't touch your real profile at all, or triggers a dialog
+you have to approve by hand.
+
 ## How Playwriter avoids the dialog
 
 Playwriter uses a Chrome extension with `chrome.debugger` permissions instead of external CDP
@@ -39,15 +45,15 @@ No flags, no Chrome restart, no recurring permission prompts.
 
 ## Comparison
 
-|  | Chrome Direct CDP | Playwriter |
+|  | Playwriter | Chrome Direct CDP |
 |---|---|---|
-| Permission dialog | Every connection | Never |
-| Autonomous agents | Blocked by dialog | Works unattended |
-| Chrome restart needed | Yes (`--remote-debugging-port`) | No |
-| Login state | Depends on profile flags | Already logged in |
-| User intervention | Required every reconnect | One-time extension click |
-| Extensions available | Yes | Yes |
-| Full CDP access | Yes | Yes |
+| Permission dialog | **Never** | Every connection |
+| Autonomous agents | **Works unattended** | Blocked by dialog |
+| Chrome restart needed | **No** | Yes (`--remote-debugging-port`) |
+| Login state | **Already logged in** | Depends on profile flags |
+| User intervention | **One-time extension click** | Required every reconnect |
+| Extensions available | **Yes** | Yes |
+| Full CDP access | **Yes** | Yes |
 
 ## Chrome Direct CDP setup
 
@@ -66,11 +72,11 @@ the extension mode is better because it avoids the dialog entirely.
 ```bash
 # Extension mode (recommended): no dialog, no flags
 playwriter session new
-playwriter -s 1 -e "page.goto('https://example.com')"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
 
 # Direct mode: uses built-in CDP, dialog appears once
 playwriter session new --direct
-playwriter -s 1 -e "page.goto('https://example.com')"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
 ```
 
 ## Why this matters for agents

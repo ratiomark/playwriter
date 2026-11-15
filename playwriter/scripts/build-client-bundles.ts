@@ -52,6 +52,11 @@ const BUNDLES: BundleConfig[] = [
     type: 'source',
     entry: 'ghost-cursor-client.ts',
   },
+  {
+    name: 'audio-tap-client',
+    type: 'source',
+    entry: 'audio-tap-client.ts',
+  },
 
   // Wrapper bundles (npm packages → globalThis)
   {

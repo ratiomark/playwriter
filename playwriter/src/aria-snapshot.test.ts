@@ -4,6 +4,7 @@ import net from 'node:net'
 import { Page } from '@xmorse/playwright-core'
 import fs from 'node:fs'
 import path from 'node:path'
+import dedent from 'string-dedent'
 import { getAriaSnapshot } from './aria-snapshot.js'
 import { getCdpUrl } from './utils.js'
 import { getCDPSessionForPage } from './cdp-session.js'
@@ -244,6 +245,106 @@ describe('aria-snapshot', () => {
 
       const content = await bareEditors.first().innerText()
       expect(content).toContain('Typed via locator!')
+    } finally {
+      await htmlServer.close()
+    }
+  }, 30000)
+
+  it('returns the current accessibility tree after page and client-side navigation', async () => {
+    const htmlServer = await createHtmlServer({
+      htmlByPath: {
+        '/first': '<main><h1>First route</h1></main>',
+        '/second': '<main><h1>Second route</h1></main>',
+        '/rendered': dedent`
+          <main><h1>Previous route</h1></main>
+          <script>
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+              document.querySelector('h1').textContent = 'Rendered route'
+            }))
+          </script>
+        `,
+      },
+    })
+
+    try {
+      await page.goto(`${htmlServer.baseUrl}/first`, { waitUntil: 'domcontentloaded' })
+      const { snapshot: firstSnapshot } = await getAriaSnapshot({ page })
+      expect(firstSnapshot).toContain('First route')
+
+      await page.goto(`${htmlServer.baseUrl}/second`, { waitUntil: 'domcontentloaded' })
+      expect(await page.locator('main').innerText()).toBe('Second route')
+
+      const { snapshot: secondSnapshot } = await getAriaSnapshot({ page })
+      expect(secondSnapshot).toContain('Second route')
+      expect(secondSnapshot).not.toContain('First route')
+
+      await page.evaluate(() => {
+        document.defaultView!.history.pushState({}, '', '/third')
+        document.querySelector('main')!.innerHTML = '<h1>Third route</h1>'
+      })
+      expect(await page.locator('main').innerText()).toBe('Third route')
+
+      const { snapshot: thirdSnapshot } = await getAriaSnapshot({ page })
+      expect(thirdSnapshot).toContain('Third route')
+      expect(thirdSnapshot).not.toContain('Second route')
+
+      await page.goto(`${htmlServer.baseUrl}/rendered`, { waitUntil: 'domcontentloaded' })
+      const { snapshot: renderedSnapshot } = await getAriaSnapshot({ page })
+      expect(await page.locator('main').innerText()).toBe('Rendered route')
+      expect(renderedSnapshot).toContain('Rendered route')
+      expect(renderedSnapshot).not.toContain('Previous route')
+    } finally {
+      await htmlServer.close()
+    }
+  }, 30000)
+
+  it('generates a usable locator for CSS-transformed accessible text', async () => {
+    const htmlServer = await createHtmlServer({
+      htmlByPath: {
+        '/': dedent`
+          <!doctype html>
+          <button style="text-transform: capitalize">jersey 150</button>
+          <button>Save</button>
+          <button>save</button>
+        `,
+      },
+    })
+
+    try {
+      await page.goto(htmlServer.baseUrl, { waitUntil: 'domcontentloaded' })
+      const { snapshot } = await getAriaSnapshot({ page, interactiveOnly: true })
+      const locator = snapshot.match(/role=button\[name="[^"]+"i?\]/)?.[0]
+      if (!locator) {
+        throw new Error(`Snapshot did not contain a button locator: ${snapshot}`)
+      }
+
+      expect(await page.locator(locator).count()).toBe(1)
+      const caseVariantLocators = snapshot.match(/role=button\[name="save"i\](?: >> nth=\d+)?/gi) ?? []
+      expect(caseVariantLocators).toHaveLength(2)
+      expect(
+        await Promise.all(
+          caseVariantLocators.map((selector) => {
+            return page.locator(selector).count()
+          }),
+        ),
+      ).toEqual([1, 1])
+    } finally {
+      await htmlServer.close()
+    }
+  }, 30000)
+
+  // The toolbar is injected async after load, so snapshots used to flip between runs
+  it('never includes the Playwriter toolbar', async () => {
+    const htmlServer = await createHtmlServer({ htmlByPath: { '/': '<!doctype html><button>Save</button>' } })
+    try {
+      await page.goto(htmlServer.baseUrl, { waitUntil: 'domcontentloaded' })
+      await page.locator('[data-playwriter-toolbar]').first().waitFor({ state: 'attached' })
+      const [full, interactive] = await Promise.all([
+        getAriaSnapshot({ page }),
+        getAriaSnapshot({ page, interactiveOnly: true }),
+      ])
+      expect(full.snapshot).toMatchInlineSnapshot(`"  - role=button[name="Save"i]"`)
+      expect(interactive.snapshot).toMatchInlineSnapshot(`"  - role=button[name="Save"i]"`)
     } finally {
       await htmlServer.close()
     }

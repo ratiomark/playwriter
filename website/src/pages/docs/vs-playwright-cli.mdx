@@ -1,28 +1,30 @@
 ---
 title: Playwriter vs Playwright CLI
 sidebarTitle: vs Playwright CLI
-description: Full Playwright API in your real browser instead of a fresh instance.
+description: Full Playwright API in your real Chrome instead of the Playwright CLI launching a fresh browser instance.
 icon: lucide:terminal
 ---
 
-The Playwright CLI (`npx playwright`) launches a new browser for testing and automation.
-It's great for CI/CD pipelines and test suites, but for agent-driven browser control
-it has the same fresh-browser limitations as Playwright MCP.
+The classic Playwright CLI (`npx playwright screenshot`, `pdf`, `codegen`, `open`) launches a
+new browser and exposes a small utility command set. The newer `@playwright/cli` adds a
+`run-code` command and can attach to a browser, but by default both still drive a **separate
+browser profile**, not the Chrome you're using right now.
 
-Playwriter gives you the **full Playwright API** but runs it against your existing Chrome.
+Playwriter gives you the **full Playwright API** and, by design, runs it against your existing Chrome.
 
 ## Comparison
 
-|  | Playwright CLI | Playwriter |
+|  | Playwriter | Playwright CLI |
 |---|---|---|
-| Browser | Spawns new browser | Uses your Chrome |
-| Login state | Fresh (logged out) | Already logged in |
-| Extensions | None | Your existing ones |
-| Captchas | Always blocked | Bypass (disconnect extension) |
-| Collaboration | Separate window | Same browser as user |
-| Capabilities | Limited command set | Anything Playwright can do |
-| Raw CDP access | No | Yes |
-| Video recording | File-based tracing | Native tab capture (30-60fps) |
+| Browser | **Your running Chrome** (extension) | New browser by default |
+| Login state | **Your live sessions, zero setup** | Persistent profile, separate from your daily Chrome |
+| Extensions | **Your existing ones** | None by default |
+| Captchas | **Disconnect extension to solve manually** | Managed automation profile |
+| Collaboration | **Same tab as user** | Separate window |
+| Programmable JS | **`execute` with persistent `state`** | `run-code` (no cross-call state) |
+| Raw CDP access | **First-class** | Not exposed |
+| Video recording | **CDP screencast + ffmpeg (up to 60fps), page audio** | Trace / screencast based |
+| Cloud + remote tab share | **Built-in** | No |
 
 ## Same API, different browser
 
@@ -34,7 +36,7 @@ Instead of spawning a new browser, your code controls the browser you're already
 npx playwright screenshot https://example.com shot.png
 
 # Playwriter: your browser, your cookies, your extensions
-playwriter -s 1 -e "page.screenshot({ path: './shot.png', scale: 'css' })"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com'); await state.page.screenshot({ path: './shot.png', scale: 'css' })"
 ```
 
 ## Raw CDP access
@@ -44,17 +46,18 @@ agents set breakpoints, profile performance, intercept network requests, and liv
 page scripts. The Playwright CLI doesn't expose CDP at all.
 
 ```bash
-playwriter -s 1 -e "state.cdp = getCDPSession({ page })"
+playwriter -s 1 -e "state.cdp = getCDPSession({ page: state.page })"
 playwriter -s 1 -e "state.cdp.send('Performance.getMetrics').then(console.log)"
 ```
 
 ## Video recording
 
-Playwright CLI records via tracing (file-based, low FPS). Playwriter uses
-`chrome.tabCapture` for native 30-60fps recording that survives page navigation.
+Playwright CLI records via tracing (file-based, low FPS). Playwriter pipes CDP screencast frames
+to `ffmpeg` for up to 60fps recording with optional page audio. No permission click, and it
+survives page navigation.
 
 ```bash
-playwriter -s 1 -e "recording.start({ page, outputPath: './demo.mp4' })"
-playwriter -s 1 -e "page.click('a'); page.waitForLoadState('domcontentloaded')"
-playwriter -s 1 -e "recording.stop({ page })"
+playwriter -s 1 -e "state.video = await recording.start({ page: state.page, outputPath: './demo.mp4' })"
+playwriter -s 1 -e "state.page.click('a'); state.page.waitForLoadState('domcontentloaded')"
+playwriter -s 1 -e "await state.video.stop()"
 ```

@@ -12,16 +12,34 @@
 import { createStore, type StoreApi } from 'zustand/vanilla'
 import type { WSContext } from 'hono/ws'
 import type { Protocol } from './cdp-types.js'
+import { INVENTORY_READY_CAPABILITY, type TabGroupColor } from './protocol.js'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+/**
+ * Minimal socket interface for extension connections. Satisfied by both hono's
+ * WSContext (inbound /extension route) and the `ws` client WebSocket used when
+ * the relay dials out to a remote-control tunnel (see remote-control.ts).
+ */
+export type ExtensionSocket = {
+  send(data: string | ArrayBuffer | Uint8Array): void
+  close(code?: number, reason?: string): void
+  /** WebSocket protocol ping frame. Only remote-control dials have it. */
+  ping?(): void
+}
 
 export type ConnectedTarget = {
   sessionId: string
   targetId: string
   targetInfo: Protocol.Target.TargetInfo
   frameIds: Set<string>
+  /** Ownership key of the session that created the tab. Undefined: shared by every session. */
+  ownerKey?: string
+  /** Child worker session. Never announce it as a browser root target. */
+  parentSessionId?: string
+  workerScriptLoaded?: boolean
 }
 
 export type ExtensionInfo = {
@@ -47,16 +65,26 @@ export type ExtensionEntry = {
   stableKey: string
   connectedTargets: Map<string, ConnectedTarget>
   // Runtime I/O fields
-  ws: WSContext | null
+  ws: ExtensionSocket | null
   pendingRequests: Map<number, ExtensionPendingRequest>
   messageId: number
   pingInterval: ReturnType<typeof setInterval> | null
+  capabilities: ReadonlySet<string>
+  inventoryReady: boolean
 }
 
 export type PlaywrightClient = {
   id: string
   extensionId: string | null
   ws: WSContext
+  /** CLI session id this client belongs to (from the ?session= query param) */
+  sessionId?: string
+  /** Tab group title for tabs this client creates (from the ?tabGroup= query param) */
+  tabGroup?: string
+  /** Explicit tab group color (from the ?tabGroupColor= query param) */
+  tabGroupColor?: TabGroupColor
+  /** Connected with Patchright (?patchright=1): its input is humanized on every page */
+  patchright?: boolean
 }
 
 export type RelayState = {
@@ -94,6 +122,20 @@ export function findExtensionByStableKey(state: RelayState, stableKey: string): 
   return match
 }
 
+export function isRemoteExtensionKey(stableKey: string): boolean {
+  return stableKey.startsWith('remote:')
+}
+
+export function isRemoteExtension(extension: ExtensionEntry): boolean {
+  return isRemoteExtensionKey(extension.stableKey)
+}
+
+export function getLocalExtensions(state: RelayState): ExtensionEntry[] {
+  return Array.from(state.extensions.values()).filter((extension) => {
+    return !isRemoteExtension(extension)
+  })
+}
+
 export function buildStableExtensionKey(info: ExtensionInfo, connectionId: string): string {
   // chrome.identity ids and emails identify the signed-in Google account, not
   // the Chrome profile. Use the per-profile extension storage install id first
@@ -113,14 +155,30 @@ export function buildStableExtensionKey(info: ExtensionInfo, connectionId: strin
   return `connection:${connectionId}`
 }
 
-/** Find which extension owns a CDP tab sessionId (e.g. "pw-tab-1"). */
-export function findExtensionIdByCdpSession(state: RelayState, cdpSessionId: string): string | null {
-  for (const [connectionId, ext] of state.extensions.entries()) {
-    if (ext.connectedTargets.has(cdpSessionId)) {
-      return connectionId
-    }
+/**
+ * Chrome has one screencast per tab, shared by every CDP client on it. Merge
+ * the params of all clients so each gets at least what it asked for: jpeg if
+ * anyone wants jpeg, highest quality, largest max size, every frame anyone needs.
+ */
+export function mergeScreencastParams(
+  list: Protocol.Page.StartScreencastRequest[],
+): Protocol.Page.StartScreencastRequest {
+  const maxOrUnlimited = (values: Array<number | undefined>) => {
+    return values.some((value) => value === undefined) ? undefined : Math.max(...(values as number[]))
   }
-  return null
+  const qualities = list.flatMap((params) => {
+    return params.quality === undefined ? [] : [params.quality]
+  })
+  const merged: Protocol.Page.StartScreencastRequest = {
+    format: list.some((params) => params.format === 'jpeg') ? 'jpeg' : 'png',
+    quality: qualities.length > 0 ? Math.max(...qualities) : undefined,
+    maxWidth: maxOrUnlimited(list.map((params) => params.maxWidth)),
+    maxHeight: maxOrUnlimited(list.map((params) => params.maxHeight)),
+    everyNthFrame: Math.min(...list.map((params) => params.everyNthFrame || 1)),
+  }
+  return Object.fromEntries(
+    Object.entries(merged).filter(([, value]) => value !== undefined),
+  ) as Protocol.Page.StartScreencastRequest
 }
 
 // ---------------------------------------------------------------------------
@@ -145,11 +203,13 @@ export function addExtension(
     info,
     stableKey,
     ws,
+    capabilities = [],
   }: {
     id: string
     info: ExtensionInfo
     stableKey: string
-    ws: WSContext | null
+    ws: ExtensionSocket | null
+    capabilities?: string[]
   },
 ): RelayState {
   const newExtensions = new Map(state.extensions)
@@ -163,6 +223,8 @@ export function addExtension(
     pendingRequests: new Map(),
     messageId: 0,
     pingInterval: null,
+    capabilities: new Set(capabilities),
+    inventoryReady: !capabilities.includes(INVENTORY_READY_CAPABILITY),
   })
   return { ...state, extensions: newExtensions }
 }
@@ -192,10 +254,52 @@ export function removeExtension(state: RelayState, { extensionId }: { extensionI
 /** Add a playwright client (state + ws handle co-located). */
 export function addPlaywrightClient(
   state: RelayState,
-  { id, extensionId, ws }: { id: string; extensionId: string | null; ws: WSContext },
+  {
+    id,
+    extensionId,
+    ws,
+    sessionId,
+    tabGroup,
+    tabGroupColor,
+    patchright,
+  }: {
+    id: string
+    extensionId: string | null
+    ws: WSContext
+    sessionId?: string
+    tabGroup?: string
+    tabGroupColor?: TabGroupColor
+    patchright?: boolean
+  },
 ): RelayState {
   const newClients = new Map(state.playwrightClients)
-  newClients.set(id, { id, extensionId, ws })
+  newClients.set(id, { id, extensionId, ws, sessionId, tabGroup, tabGroupColor, patchright })
+  return { ...state, playwrightClients: newClients }
+}
+
+/** Update the tab group title/color on all clients belonging to a CLI session.
+ *  Absent fields keep their current value. */
+export function updateClientsTabGroup(
+  state: RelayState,
+  { sessionId, tabGroup, tabGroupColor }: { sessionId: string; tabGroup?: string; tabGroupColor?: TabGroupColor },
+): RelayState {
+  let updated = false
+  const newClients = new Map(state.playwrightClients)
+  for (const [clientId, client] of newClients) {
+    if (client.sessionId !== sessionId) {
+      continue
+    }
+    const nextTabGroup = tabGroup ?? client.tabGroup
+    const nextColor = tabGroupColor ?? client.tabGroupColor
+    if (client.tabGroup === nextTabGroup && client.tabGroupColor === nextColor) {
+      continue
+    }
+    newClients.set(clientId, { ...client, tabGroup: nextTabGroup, tabGroupColor: nextColor })
+    updated = true
+  }
+  if (!updated) {
+    return state
+  }
   return { ...state, playwrightClients: newClients }
 }
 
@@ -244,7 +348,7 @@ export function updateExtensionIO(
     pingInterval,
   }: {
     extensionId: string
-    ws?: WSContext | null
+    ws?: ExtensionSocket | null
     pingInterval?: ReturnType<typeof setInterval> | null
   },
 ): RelayState {
@@ -258,6 +362,42 @@ export function updateExtensionIO(
     ...(ws !== undefined ? { ws } : {}),
     ...(pingInterval !== undefined ? { pingInterval } : {}),
   })
+  return { ...state, extensions: newExtensions }
+}
+
+/** Merge new identity fields into an extension's info (used by tunnel `hello` messages). */
+export function updateExtensionInfo(
+  state: RelayState,
+  { extensionId, info }: { extensionId: string; info: ExtensionInfo },
+): RelayState {
+  const ext = state.extensions.get(extensionId)
+  if (!ext) {
+    return state
+  }
+  const newExtensions = new Map(state.extensions)
+  newExtensions.set(extensionId, {
+    ...ext,
+    info: {
+      browser: info.browser ?? ext.info.browser,
+      email: info.email ?? ext.info.email,
+      id: info.id ?? ext.info.id,
+      installId: info.installId ?? ext.info.installId,
+      version: info.version ?? ext.info.version,
+    },
+  })
+  return { ...state, extensions: newExtensions }
+}
+
+export function markExtensionInventoryReady(
+  state: RelayState,
+  { extensionId }: { extensionId: string },
+): RelayState {
+  const ext = state.extensions.get(extensionId)
+  if (!ext || ext.inventoryReady) {
+    return state
+  }
+  const newExtensions = new Map(state.extensions)
+  newExtensions.set(extensionId, { ...ext, inventoryReady: true })
   return { ...state, extensions: newExtensions }
 }
 
@@ -312,6 +452,8 @@ export function addTarget(
     targetId,
     targetInfo,
     existingFrameIds,
+    ownerKey,
+    parentSessionId,
   }: {
     extensionId: string
     sessionId: string
@@ -319,6 +461,8 @@ export function addTarget(
     targetInfo: Protocol.Target.TargetInfo
     /** Preserve existing frameIds if target already existed (update scenario). */
     existingFrameIds?: Set<string>
+    ownerKey?: string
+    parentSessionId?: string
   },
 ): RelayState {
   const ext = state.extensions.get(extensionId)
@@ -333,6 +477,8 @@ export function addTarget(
     targetId,
     targetInfo,
     frameIds: existingFrameIds ?? existingTarget?.frameIds ?? new Set(),
+    ownerKey,
+    parentSessionId,
   })
 
   const newExtensions = new Map(state.extensions)

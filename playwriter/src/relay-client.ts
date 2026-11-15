@@ -7,13 +7,30 @@ import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pc from 'picocolors'
-import { getListeningPidsForPort, killPortProcess } from './kill-port.js'
-import { VERSION, sleep, LOG_FILE_PATH } from './utils.js'
+import dedent from 'string-dedent'
+import { getListeningPidsForPort, killPid } from './kill-port.js'
+import { VERSION, getCdpUrl, sleep, LOG_FILE_PATH } from './utils.js'
+import { isRemoteExtensionKey } from './relay-state.js'
+import { getChromium, type Browser } from './playwright-import.js'
+import type { TabGroupColor } from './protocol.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 export const RELAY_PORT = Number(process.env.PLAYWRITER_PORT) || 19988
+
+export const PLAYWRITER_EXTENSION_URL =
+  'https://chromewebstore.google.com/detail/playwriter/jfeammnjpkecdekppnclgkkffahnhfhe'
+
+// One message for CLI, executor and library users (skills calling
+// connectViaExtension). Written for the agent to relay to the user.
+export const EXTENSION_NOT_CONNECTED_ERROR = dedent`
+  The Playwriter Chrome extension is not connected.
+  Tell the user to:
+  1. Install the Playwriter extension in Chrome: ${PLAYWRITER_EXTENSION_URL}
+  2. Keep Chrome open. If the extension icon is gray, click it on any tab.
+  3. Run the command again.
+`
 
 export type ExtensionStatus = {
   extensionId: string
@@ -24,19 +41,39 @@ export type ExtensionStatus = {
   playwriterVersion: string | null
 }
 
-export async function getRelayServerVersion(port: number = RELAY_PORT): Promise<string | null> {
+export function getLocalExtensionStatuses(extensions: ExtensionStatus[]): ExtensionStatus[] {
+  return extensions.filter((extension) => {
+    return !extension.stableKey || !isRemoteExtensionKey(extension.stableKey)
+  })
+}
+
+/** `/version` response. Older relays only send `version`. */
+export type RelayInfo = {
+  version: string
+  pid?: number
+  /** Random per relay start. Tells a relay apart from one that replaced it on the same port */
+  instanceId?: string
+  activeExecutes?: number
+}
+
+export async function getRelayInfo(port: number = RELAY_PORT): Promise<RelayInfo | null> {
   try {
+    // 10s: a busy relay (many agents attaching tabs) can miss a 2s /version probe.
     const response = await fetch(`http://127.0.0.1:${port}/version`, {
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(10_000),
     })
     if (!response.ok) {
       return null
     }
-    const data = (await response.json()) as { version: string }
-    return data.version
+    const data = (await response.json()) as RelayInfo
+    return typeof data?.version === 'string' ? data : null
   } catch {
     return null
   }
+}
+
+export async function getRelayServerVersion(port: number = RELAY_PORT): Promise<string | null> {
+  return (await getRelayInfo(port))?.version ?? null
 }
 
 /**
@@ -44,24 +81,28 @@ export async function getRelayServerVersion(port: number = RELAY_PORT): Promise<
  * Used during startup races where a relay may have bound the port
  * but isn't serving HTTP yet (issue #75).
  */
-export async function waitForRelayVersion({
+export async function waitForRelayInfo({
   port = RELAY_PORT,
-  timeoutMs = 2000,
+  timeoutMs = 10_000,
   intervalMs = 200,
 }: {
   port?: number
   timeoutMs?: number
   intervalMs?: number
-} = {}): Promise<string | null> {
+} = {}): Promise<RelayInfo | null> {
   const end = Date.now() + timeoutMs
   while (Date.now() < end) {
-    const version = await getRelayServerVersion(port)
-    if (version) {
-      return version
+    const info = await getRelayInfo(port)
+    if (info) {
+      return info
     }
     await sleep(intervalMs)
   }
   return null
+}
+
+export async function waitForRelayVersion(options: { port?: number; timeoutMs?: number; intervalMs?: number } = {}) {
+  return (await waitForRelayInfo(options))?.version ?? null
 }
 
 export async function getExtensionStatus(
@@ -145,7 +186,7 @@ export async function waitForConnectedExtensions(
   logger?.log(pc.dim('Waiting for extension to connect...'))
 
   while (Date.now() - startTime < timeoutMs) {
-    const extensions = await getExtensionsStatus(port)
+    const extensions = getLocalExtensionStatuses(await getExtensionsStatus(port))
     if (extensions.length > 0) {
       logger?.log(pc.green('Extension connected'))
       return extensions
@@ -157,23 +198,137 @@ export async function waitForConnectedExtensions(
   return []
 }
 
-async function killRelayServer(options: { port: number; waitForFreeMs?: number }): Promise<void> {
-  const { port, waitForFreeMs = 3000 } = options
-
-  try {
-    await killPortProcess({ port })
-  } catch {
-    return
+/** Resolves true once none of `pids` listens on `port` (exited or closed the server). */
+async function waitForPidsToReleasePort({
+  port,
+  pids,
+  timeoutMs,
+}: {
+  port: number
+  pids: number[]
+  timeoutMs: number
+}): Promise<boolean> {
+  const end = Date.now() + timeoutMs
+  while (true) {
+    const listening = await getListeningPidsForPort({ port }).catch((): number[] => [])
+    if (!pids.some((pid) => listening.includes(pid))) {
+      return true
+    }
+    if (Date.now() >= end) {
+      return false
+    }
+    await sleep(250)
   }
+}
 
-  const startTime = Date.now()
-  while (Date.now() - startTime < waitForFreeMs) {
-    const pids = await getListeningPidsForPort({ port }).catch(() => [])
-    if (pids.length === 0) {
+/** Kill the processes that hold the relay port and wait until they release it. */
+async function killRelayPids({ port, pids }: { port: number; pids: number[] }): Promise<void> {
+  const targets = pids.filter((pid) => pid !== process.pid)
+  await Promise.all(targets.map((pid) => killPid({ pid })))
+  const released = await waitForPidsToReleasePort({ port, pids: targets, timeoutMs: 3000 })
+  if (!released) {
+    throw new Error(`Process on relay port ${port} (pid ${targets.join(', ')}) did not exit after kill`)
+  }
+}
+
+/**
+ * Ask a relay to stop: it refuses new executes, waits up to drainTimeoutMs for running ones, then exits.
+ * Returns false when the relay does not support draining (404 on old relays) or did not exit in time.
+ */
+async function drainRelay({
+  port,
+  pid,
+  instanceId,
+  drainTimeoutMs,
+  logger,
+}: {
+  port: number
+  pid: number
+  instanceId: string
+  drainTimeoutMs: number
+  logger?: { log: (...args: any[]) => void }
+}): Promise<boolean> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (process.env.PLAYWRITER_TOKEN) {
+    headers.Authorization = `Bearer ${process.env.PLAYWRITER_TOKEN}`
+  }
+  const response = await fetch(`http://127.0.0.1:${port}/cli/drain`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ instanceId, timeoutMs: drainTimeoutMs }),
+    signal: AbortSignal.timeout(10_000),
+  }).catch(() => null)
+  if (!response) {
+    // Probed relay is gone (or hung): the caller checks the pid again.
+    return false
+  }
+  if (response.status === 409) {
+    // Another client already replaced the relay we probed.
+    return true
+  }
+  if (!response.ok) {
+    return false
+  }
+  const { activeExecutes = 0 } = (await response.json().catch(() => ({}))) as { activeExecutes?: number }
+  if (activeExecutes > 0 && drainTimeoutMs > 0) {
+    logger?.log(
+      pc.yellow(
+        `Waiting up to ${Math.round(drainTimeoutMs / 1000)}s for ${activeExecutes} running execute(s) to finish before restarting the relay...`,
+      ),
+    )
+  }
+  return waitForPidsToReleasePort({ port, pids: [pid], timeoutMs: drainTimeoutMs + 5000 })
+}
+
+const DEFAULT_DRAIN_TIMEOUT_MS = 30_000
+
+/**
+ * Stop the relay on `port`. A relay that supports it is drained first so running executes of
+ * other agents can finish. Only Playwriter relay processes are ever killed.
+ * `relay` is the /version probe; pass null when the port holder does not answer /version.
+ */
+async function stopRelay({
+  port,
+  relay,
+  drainTimeoutMs = DEFAULT_DRAIN_TIMEOUT_MS,
+  logger,
+}: {
+  port: number
+  relay: RelayInfo | null
+  drainTimeoutMs?: number
+  logger?: { log: (...args: any[]) => void }
+}): Promise<void> {
+  const { pid, instanceId } = relay ?? {}
+  if (pid && instanceId) {
+    if (await drainRelay({ port, pid, instanceId, drainTimeoutMs, logger })) {
       return
     }
-    await sleep(100)
+    await killRelayPids({ port, pids: [pid] })
+    return
   }
+  // Old relay without pid in /version, or a port holder that does not answer /version.
+  const pids = await getListeningPidsForPort({ port }).catch(() => [])
+  await killRelayPids({ port, pids })
+}
+
+/**
+ * Stop the local relay daemon, draining it first. Used by `playwriter serve restart`.
+ * drainTimeoutMs 0 stops it right away and aborts running executes.
+ */
+export async function stopRelayServer({
+  port = RELAY_PORT,
+  drainTimeoutMs,
+  logger,
+}: {
+  port?: number
+  drainTimeoutMs?: number
+  logger?: { log: (...args: any[]) => void }
+} = {}): Promise<void> {
+  const relay = await getRelayInfo(port)
+  if (!relay && (await getListeningPidsForPort({ port }).catch(() => [])).length === 0) {
+    return
+  }
+  await stopRelay({ port, relay, drainTimeoutMs, logger })
 }
 
 /**
@@ -215,7 +370,7 @@ export function getExtensionOutdatedWarning(extensionPlaywriterVersion: string |
 
 export interface EnsureRelayServerOptions {
   logger?: { log: (...args: any[]) => void }
-  /** If true, will kill and restart server on version mismatch. Default: true */
+  /** If true, will drain and restart an older relay. Default: true */
   restartOnVersionMismatch?: boolean
   /** Pass additional environment variables to the relay server process */
   env?: Record<string, string>
@@ -242,56 +397,29 @@ export async function ensureRelayServer(options: EnsureRelayServerOptions = {}):
 
 async function ensureRelayServerImpl(options: EnsureRelayServerOptions = {}): Promise<true | undefined> {
   const { logger, restartOnVersionMismatch = true, env: additionalEnv } = options
-  const serverVersion = await getRelayServerVersion(RELAY_PORT)
 
-  if (serverVersion === VERSION) {
-    return
+  let relay = await getRelayInfo(RELAY_PORT)
+  const listeningPids = relay ? [] : await getListeningPidsForPort({ port: RELAY_PORT }).catch(() => [])
+  if (!relay && listeningPids.length > 0) {
+    // A competing relay may have bound the port before /version became ready.
+    relay = await waitForRelayInfo({ port: RELAY_PORT })
   }
 
-  // Don't restart if server version is higher than our version.
-  // This prevents older clients from killing a newer server.
-  if (serverVersion !== null && compareVersions(serverVersion, VERSION) > 0) {
-    return
-  }
-
-  if (serverVersion !== null) {
-    if (restartOnVersionMismatch) {
-      logger?.log(
-        pc.yellow(`CDP relay server version mismatch (server: ${serverVersion}, client: ${VERSION}), restarting...`),
-      )
-      await killRelayServer({ port: RELAY_PORT })
-    } else {
-      // Server is running but different version, just use it
+  if (relay) {
+    // Do not let an older client replace a newer Playwriter relay.
+    if (compareVersions(relay.version, VERSION) >= 0 || !restartOnVersionMismatch) {
       return
     }
+    logger?.log(
+      pc.yellow(`CDP relay server version mismatch (server: ${relay.version}, client: ${VERSION}), restarting...`),
+    )
+    await stopRelay({ port: RELAY_PORT, relay, logger })
+  } else if (listeningPids.length > 0) {
+    logger?.log(
+      pc.yellow(`Port ${RELAY_PORT} is in use (pid(s): ${listeningPids.join(', ')}) and does not answer /version...`),
+    )
+    await stopRelay({ port: RELAY_PORT, relay: null, logger })
   } else {
-    const listeningPids = await getListeningPidsForPort({ port: RELAY_PORT }).catch(() => [])
-    if (listeningPids.length > 0) {
-      // Something is on the port but /version didn't respond. It might be a
-      // relay that's still starting (race with another CLI/MCP instance).
-      // Poll /version briefly before deciding to kill it (issue #75).
-      const foundVersion = await waitForRelayVersion({ port: RELAY_PORT })
-      if (foundVersion) {
-        // A relay came up while we waited; use it
-        if (foundVersion === VERSION || compareVersions(foundVersion, VERSION) > 0) {
-          return
-        }
-        if (!restartOnVersionMismatch) {
-          return
-        }
-        logger?.log(
-          pc.yellow(`CDP relay server version mismatch (server: ${foundVersion}, client: ${VERSION}), restarting...`),
-        )
-      } else {
-        logger?.log(
-          pc.yellow(
-            `Port ${RELAY_PORT} is already in use (pid(s): ${listeningPids.join(', ')}). Attempting to stop the existing process...`,
-          ),
-        )
-      }
-      await killRelayServer({ port: RELAY_PORT })
-    }
-
     logger?.log(pc.dim('CDP relay server not running, starting it...'))
   }
 
@@ -325,4 +453,233 @@ async function ensureRelayServerImpl(options: EnsureRelayServerOptions = {}): Pr
 
   const waitedMs = Date.now() - startTime
   throw new Error(`Failed to start CDP relay server within ${waitedMs}ms. Check logs at: ${LOG_FILE_PATH}`)
+}
+
+export type CreatedRelaySession = {
+  id: string
+  /** Opaque tab ownership key. Missing on relays older than this SDK */
+  ownershipKey?: string
+  tabGroup?: string | null
+  tabGroupColor?: TabGroupColor | null
+}
+
+export type PlaywriterBrowserConnection = {
+  browser: Browser
+  /** The browser profile this connection controls. */
+  extensionBrowser: ExtensionBrowser
+  sessionId: string
+  close(): Promise<void>
+  /** Enables `await using connection = await connectViaExtension()`. Same as close(). */
+  [Symbol.asyncDispose](): Promise<void>
+}
+
+/** A browser profile with the Playwriter extension connected to the local relay. */
+export type ExtensionBrowser = {
+  /** Stable across extension reconnects and relay restarts. Safe to persist. */
+  id: string
+  /** Browser brand detected by the extension: Chrome, Brave, Edge, Ghost, ... */
+  browser: string
+  /** Email of the Chrome profile signed-in account, or null if not signed in. */
+  email: string | null
+  /** Tabs the extension has currently attached to Playwriter. */
+  activeTabs: number
+  playwriterVersion: string | null
+}
+
+export type SelectBrowser = (
+  browsers: ExtensionBrowser[],
+) => ExtensionBrowser | undefined | Promise<ExtensionBrowser | undefined>
+
+function toExtensionBrowser(extension: ExtensionStatus): ExtensionBrowser {
+  return {
+    id: extension.stableKey || extension.extensionId,
+    browser: extension.browser || 'Chrome',
+    email: extension.profile?.email || null,
+    activeTabs: extension.activeTargets,
+    playwriterVersion: extension.playwriterVersion,
+  }
+}
+
+function formatBrowserList(browsers: ExtensionBrowser[]): string {
+  return browsers
+    .map((browser) => {
+      return `- ${browser.browser} ${browser.email || '(not signed in)'} id=${browser.id}`
+    })
+    .join('\n')
+}
+
+/**
+ * List browsers with the Playwriter extension connected. Starts the relay if needed
+ * and waits briefly for at least one extension. Returns [] if none connects.
+ */
+export async function listBrowsers({
+  port = RELAY_PORT,
+  logger,
+}: {
+  port?: number
+  logger?: { log: (...args: any[]) => void }
+} = {}): Promise<ExtensionBrowser[]> {
+  await ensureRelayServer({ logger })
+  const extensions = await waitForConnectedExtensions({ port, logger })
+  return extensions.map(toExtensionBrowser)
+}
+
+export async function createRelaySession({
+  port = RELAY_PORT,
+  browserId,
+  tabGroup,
+  tabGroupColor,
+  patchright,
+}: {
+  port?: number
+  /** ExtensionBrowser.id. Required when more than one browser is connected. */
+  browserId?: string
+  tabGroup?: string
+  tabGroupColor?: TabGroupColor
+  patchright?: boolean
+} = {}): Promise<CreatedRelaySession> {
+  const response = await fetch(`http://127.0.0.1:${port}/cli/session/new`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ extensionId: browserId, tabGroup, tabGroupColor, patchright, client: 'sdk' }),
+  })
+  const result = (await response.json()) as CreatedRelaySession & { error?: string }
+  if (!response.ok) {
+    throw new Error(result.error || `Playwriter session create failed with HTTP ${response.status}`)
+  }
+  if (!result.id) {
+    throw new Error('Playwriter session create returned no id')
+  }
+  return result
+}
+
+export async function deleteRelaySession({
+  port = RELAY_PORT,
+  sessionId,
+  closeCreatedTabs = false,
+  ownershipKey,
+}: {
+  port?: number
+  sessionId: string
+  /** From createRelaySession. The relay refuses the delete when it does not match (the relay restarted) */
+  ownershipKey?: string
+  /** Also close the tabs this session created (and popups they opened). Other sessions' tabs stay open. */
+  closeCreatedTabs?: boolean
+}): Promise<{ warning?: string }> {
+  const response = await fetch(`http://127.0.0.1:${port}/cli/session/delete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId, closeCreatedTabs, ownershipKey }),
+  })
+  if (response.status === 404) {
+    return {}
+  }
+  const result = (await response.json().catch(() => ({}))) as { error?: string; warning?: string }
+  if (!response.ok) {
+    throw new Error(result.error || `Playwriter session delete failed with HTTP ${response.status}`)
+  }
+  return { warning: result.warning }
+}
+
+export async function connectViaExtension({
+  port = RELAY_PORT,
+  selectBrowser,
+  tabGroup,
+  tabGroupColor,
+  patchright = false,
+  closeTabsOnEnd = false,
+  logger,
+}: {
+  port?: number
+  /**
+   * Also close the tabs this connection opened (and popups they opened) on close().
+   * Off by default: close your own pages with `await using page = await context.newPage()`
+   * or `page.close()`, so tabs shared with other processes are never closed behind their back.
+   */
+  closeTabsOnEnd?: boolean
+  /**
+   * Pick which browser to use when the extension runs in more than one browser
+   * or profile. Return one item of the array. Called even with a single browser.
+   * Without it, connecting fails if more than one browser is connected.
+   */
+  selectBrowser?: SelectBrowser
+  tabGroup?: string
+  tabGroupColor?: TabGroupColor
+  /**
+   * Connect with Patchright (@playwriter/patchright-core) instead of Playwright, with human-like mouse,
+   * scroll and typing on every page. page.evaluate still runs in the main world; pass true as fourth
+   * argument for Patchright's isolated world.
+   */
+  patchright?: boolean
+  logger?: { log: (...args: any[]) => void }
+} = {}): Promise<PlaywriterBrowserConnection> {
+  const browsers = await listBrowsers({ port, logger })
+  if (browsers.length === 0) {
+    throw new Error(EXTENSION_NOT_CONNECTED_ERROR)
+  }
+
+  const selected = await (async (): Promise<ExtensionBrowser> => {
+    if (selectBrowser) {
+      const choice = await selectBrowser(browsers)
+      const match = choice && browsers.find((browser) => browser.id === choice.id)
+      if (!match) {
+        throw new Error(`selectBrowser returned no connected browser. Connected:\n${formatBrowserList(browsers)}`)
+      }
+      return match
+    }
+    if (browsers.length > 1) {
+      throw new Error(
+        `Playwriter is connected in ${browsers.length} browsers. Pass selectBrowser to connectViaExtension() to pick one:\n${formatBrowserList(browsers)}`,
+      )
+    }
+    return browsers[0]
+  })()
+
+  const session = await createRelaySession({ port, browserId: selected.id, tabGroup, tabGroupColor, patchright })
+  const chromium = await getChromium({ patchright })
+  const browser = await chromium
+    .connectOverCDP(
+      getCdpUrl({
+        port,
+        extensionId: selected.id,
+        sessionId: session.id,
+        tabGroup,
+        tabGroupColor,
+        patchright,
+      }),
+    )
+    .catch(async (cause) => {
+      await deleteRelaySession({ port, sessionId: session.id }).catch(() => undefined)
+      throw cause
+    })
+
+  // Memoized so close() followed by dispose (or double close) runs cleanup once.
+  // browser.contexts() lists every Playwriter tab, including other sessions' tabs, so the
+  // extension closes only the tabs this session created instead of every page we can see.
+  let closing: Promise<void> | undefined
+  const close = () => {
+    closing ??= (async () => {
+      await browser.close().catch(() => undefined)
+      const { warning } = await deleteRelaySession({
+        port,
+        sessionId: session.id,
+        closeCreatedTabs: closeTabsOnEnd,
+        ownershipKey: session.ownershipKey,
+      })
+      if (warning && logger) {
+        logger.log(warning)
+      } else if (warning) {
+        console.warn(warning)
+      }
+    })()
+    return closing
+  }
+
+  return {
+    browser,
+    extensionBrowser: selected,
+    sessionId: session.id,
+    close,
+    [Symbol.asyncDispose]: close,
+  }
 }

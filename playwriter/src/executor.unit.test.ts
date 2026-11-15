@@ -1,5 +1,88 @@
 import { describe, it, expect } from 'vitest'
-import { shouldAutoReturn, wrapCode, isPlaywrightChannelOwner } from './executor.js'
+import {
+  shouldAutoReturn,
+  wrapCode,
+  isPlaywrightChannelOwner,
+  formatConsoleLogs,
+  boundExecuteOutput,
+  searchSnapshot,
+} from './executor.js'
+
+describe('searchSnapshot', () => {
+  const snapshot = Array.from({ length: 40 }, (_, i) => `- button "Item ${i}"`).join('\n')
+
+  it('finds every line with a /g regex and reports the match count', () => {
+    expect(searchSnapshot({ snapshot: '- link "A"\n- link "B"\n- text: x\n- link "C"', search: /link/g }))
+      .toMatchInlineSnapshot(`
+        "3 matches
+        - link "A"
+        - link "B"
+        - text: x
+        - link "C""
+      `)
+  })
+
+  it('matches strings case-insensitively and caps shown matches', () => {
+    const out = searchSnapshot({ snapshot, search: 'BUTTON "item 1' })
+    expect(out.split('\n')[0]).toMatchInlineSnapshot(`"11 matches (showing 10). Use a more specific search to see the rest."`)
+  })
+
+  it('reports no matches', () => {
+    expect(searchSnapshot({ snapshot, search: 'checkbox' })).toBe('No matches found')
+  })
+})
+
+describe('execute output', () => {
+  it('folds identical consecutive log lines', () => {
+    const logs = [
+      ...Array.from({ length: 37 }, () => ({ method: 'log', args: ['tick', 1] })),
+      { method: 'warn', args: [{ a: 1 }] },
+      { method: 'log', args: ['tick', 1] },
+    ]
+    expect(formatConsoleLogs({ logs })).toMatchInlineSnapshot(`
+      "Console output:
+      [log] tick 1 (x37)
+      [warn] { a: 1 }
+      [log] tick 1
+
+      "
+    `)
+  })
+
+  it('keeps the return value when logs are long', () => {
+    const before = Array.from({ length: 200 }, (_, i) => `[log] line ${i}`).join('\n') + '\n'
+    const out = boundExecuteOutput({ before, after: '[return value] summary\n', maxLength: 200 })
+    expect(out.length).toBeLessThanOrEqual(200)
+    expect(out).toMatchInlineSnapshot(`
+      "[log] line 0
+      [log] line 1
+      [log] line 2
+      [log] line 3
+      [log] line 4
+      ... [2765 characters of logs omitted] ...
+      [log] line 196
+      [log] line 197
+      [log] line 198
+      [log] line 199
+      [return value] summary
+      "
+    `)
+  })
+
+  it('splits the budget when both logs and return value are long', () => {
+    const out = boundExecuteOutput({ before: 'L'.repeat(500), after: 'R'.repeat(500), maxLength: 200 })
+    expect(out).toMatchInlineSnapshot(`
+      "LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL
+      ... [422 characters of logs omitted] ...
+      LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR
+      [Truncated to 80 of 500 characters. Use snapshot({ search }), or write large data to a file and return a summary]"
+    `)
+  })
+
+  it('returns short output unchanged', () => {
+    expect(boundExecuteOutput({ before: 'a\n', after: 'b\n' })).toBe('a\nb\n')
+  })
+})
 
 describe('shouldAutoReturn', () => {
   it('returns true for simple expressions', () => {

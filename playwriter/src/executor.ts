@@ -4,7 +4,7 @@
  */
 
 import type { Page, Frame, Browser, BrowserContext, Locator, FrameLocator, ElementHandle } from '@xmorse/playwright-core'
-import { getChromium, isPatchrightEnabled } from './playwright-import.js'
+import { getChromium } from './playwright-import.js'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -15,15 +15,20 @@ import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 import * as acorn from 'acorn'
 import { createSmartDiff } from './diff-utils.js'
-import { getCdpUrl, parseRelayHost, shouldAutoEnablePlaywriter } from './utils.js'
-import { getExtensionOutdatedWarning } from './relay-client.js'
+import { getCdpUrl, parseRelayHost, sleep } from './utils.js'
+import type { TabGroupColor } from './protocol.js'
+import { isRemoteExtensionKey } from './relay-state.js'
+import { REMOTE_EXTENSION_NOT_CONNECTED_ERROR } from './remote-control.js'
+import { EXTENSION_NOT_CONNECTED_ERROR, getExtensionOutdatedWarning } from './relay-client.js'
 import { waitForPageLoad, WaitForPageLoadOptions, WaitForPageLoadResult } from './wait-for-page-load.js'
 import { ICDPSession, getCDPSessionForPage } from './cdp-session.js'
+import type { Protocol } from './cdp-types.js'
 import { Debugger } from './debugger.js'
 import { Editor } from './editor.js'
 import { getStylesForLocator, formatStylesAsText, type StylesResult } from './styles.js'
 import { getReactSource, getReactComponentInfo, type ReactSourceLocation } from './react-source.js'
 import { ScopedFS } from './scoped-fs.js'
+import { SANDBOX_FILENAME, describeThrown, runAsFaultOwner } from './process-guard.js'
 import {
   screenshotWithAccessibilityLabels,
   getAriaSnapshot,
@@ -39,6 +44,9 @@ import { createRecordingApi, createStreamApi } from './screen-recording.js'
 import { createDemoVideo } from './ffmpeg.js'
 import { type GhostCursorClientOptions } from './ghost-cursor.js'
 import { GhostCursorController } from './ghost-cursor-controller.js'
+import { createCloudScope } from './cloud-scope.js'
+import { challengeWarning, detectChallenge, MAX_CHALLENGE_WAIT_MS, PROBE_TIMEOUT_MS } from './challenge-detection.js'
+import type { CloudAuth } from './cloud-client.js'
 import {
   EXECUTION_CONSOLE_METHODS,
   presentExecutionConsoleEvents,
@@ -47,24 +55,100 @@ import {
   type ExecutionConsoleMethod,
   type JsonValue,
 } from './execution-result.js'
-
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const require = createRequire(import.meta.url)
 
+/**
+ * Check if a path looks like a Windows absolute path (e.g. C:\Users or D:/foo).
+ * Works on any platform — uses a regex instead of path.isAbsolute() which is
+ * platform-dependent.
+ */
+export function isWindowsAbsolutePath(p: string): boolean {
+  return /^[A-Za-z]:[/\\]/.test(p)
+}
+
+/**
+ * On POSIX, attempt to translate a Windows absolute path to its WSL mount equivalent.
+ * E.g. C:\Users\me\project → /mnt/c/Users/me/project.
+ * Returns null if the current platform is Windows (no translation needed),
+ * if the path isn't a Windows path, or if the WSL mount point doesn't exist.
+ */
+export function tryTranslateWindowsPathToWSL(windowsPath: string): string | null {
+  if (process.platform === 'win32') {
+    return null
+  }
+  if (!isWindowsAbsolutePath(windowsPath)) {
+    return null
+  }
+  const driveLetter = windowsPath[0].toLowerCase()
+  const mountPoint = `/mnt/${driveLetter}`
+  if (!fs.existsSync(mountPoint)) {
+    return null
+  }
+  // Strip drive letter + colon, normalize backslashes to forward slashes
+  const relativePart = windowsPath.slice(2).replace(/\\/g, '/')
+  return path.posix.join(mountPoint, relativePart)
+}
+
+/**
+ * Resolve a session cwd that may have come from a different OS.
+ * Returns { cwd, warning } where cwd is the resolved absolute path (or null
+ * if unusable) and warning is a user-facing message if translation was needed
+ * or the path was rejected.
+ */
+export function resolveSessionCwd(rawCwd: string | undefined): { cwd: string | null; warning: string | null } {
+  if (!rawCwd) {
+    return { cwd: null, warning: null }
+  }
+
+  // If the path is already absolute on this platform, use it directly
+  if (path.isAbsolute(rawCwd)) {
+    return { cwd: path.resolve(rawCwd), warning: null }
+  }
+
+  // On POSIX receiving a Windows path: try WSL translation
+  if (isWindowsAbsolutePath(rawCwd)) {
+    const translated = tryTranslateWindowsPathToWSL(rawCwd)
+    if (translated) {
+      return {
+        cwd: translated,
+        warning: `CLI cwd '${rawCwd}' is a Windows path. Translated to WSL mount: ${translated}`,
+      }
+    }
+    return {
+      cwd: null,
+      warning: `CLI cwd '${rawCwd}' is a Windows path but no WSL mount found at /mnt/${rawCwd[0].toLowerCase()}. Session fs will be scoped to /tmp only.`,
+    }
+  }
+
+  // Path is relative on this platform and not a Windows path — shouldn't happen
+  // in normal usage but guard against mangled paths
+  return {
+    cwd: null,
+    warning: `CLI cwd '${rawCwd}' is not an absolute path on this platform. Session fs will be scoped to /tmp only.`,
+  }
+}
+
 export class CodeExecutionTimeoutError extends Error {
   constructor(timeout: number) {
-    super(`Code execution timed out after ${timeout}ms`)
+    super(
+      `Code execution timed out after ${timeout}ms and was aborted: its running and later Playwright calls fail and \`signal\` is aborted. ` +
+        `Check the page before retrying.`,
+    )
     this.name = 'CodeExecutionTimeoutError'
   }
 }
 
+export class ExecuteCancelledError extends Error {
+  constructor() {
+    super('Code execution was cancelled because the caller disconnected: its running and later Playwright calls fail.')
+    this.name = 'ExecuteCancelledError'
+  }
+}
+
 const usefulGlobals = {
-  setTimeout,
-  setInterval,
-  clearTimeout,
-  clearInterval,
   URL,
   URLSearchParams,
   fetch,
@@ -141,6 +225,42 @@ export function shouldAutoReturn(code: string): boolean {
   return getAutoReturnExpression(code) !== null
 }
 
+const GET_PAGE_HINT =
+  "Get a page from context instead: reuse one with `context.pages().findLast((p) => p.url().includes('example.com'))` (last = most recently opened), or create one with `const page = await context.newPage()`. Store it in `state.page` to reuse it across calls."
+
+export const PAGE_GLOBAL_REMOVED_ERROR = `The global \`page\` was removed. ${GET_PAGE_HINT}`
+
+export function missingPageError(helper: string): Error {
+  return new Error(`${helper} requires an explicit page, e.g. ${helper}({ page: state.page }). ${GET_PAGE_HINT}`)
+}
+
+function pageFromFrame(
+  frame?: { page?: () => Page | null; owner?: () => { page(): Page } },
+): Page | undefined {
+  if (!frame) return undefined
+  if (typeof frame.page === 'function') {
+    return frame.page() ?? undefined
+  }
+  if (typeof frame.owner === 'function') {
+    return frame.owner().page()
+  }
+  return undefined
+}
+
+/** The sandbox has no default page: helpers need a page, or a locator/frame that owns one. */
+export function resolveSandboxPage(options: {
+  helper: string
+  page?: Page
+  locator?: { page(): Page }
+  frame?: { page?: () => Page | null; owner?: () => { page(): Page } }
+}): Page {
+  const resolved = options.locator?.page() ?? pageFromFrame(options.frame) ?? options.page
+  if (!resolved) {
+    throw missingPageError(options.helper)
+  }
+  return resolved
+}
+
 /**
  * Wraps user code in an async IIFE for vm execution.
  * Uses AST node offsets to extract the expression without trailing semicolons,
@@ -153,14 +273,6 @@ export function wrapCode(code: string): string {
   }
   return `(async () => { ${code} })()`
 }
-
-const EXTENSION_NOT_CONNECTED_ERROR = `The Playwriter Chrome extension is not connected. Make sure you have:
-1. Installed the extension: https://chromewebstore.google.com/detail/playwriter-mcp/jfeammnjpkecdekppnclgkkffahnhfhe
-2. Clicked the extension icon on a tab to enable it (or refreshed the page if just installed)
-3. Or use a cloud browser instead: run \`playwriter cloud login\` in your terminal to rent a browser in the cloud, with auto CAPTCHA solving, residential proxies and anti-detection built in`
-
-const NO_PAGES_AVAILABLE_ERROR =
-  'No Playwright pages are available. Enable Playwriter on a tab or unset PLAYWRITER_AUTO_ENABLE=false to auto-create one.'
 
 const CLOUD_SESSION_EXPIRED_ERROR =
   'Cloud browser session expired or was destroyed. Create a new session with: playwriter session new --browser cloud'
@@ -255,12 +367,13 @@ export interface ExecuteResult {
   isError: boolean
 }
 
-interface WarningEvent {
+interface OutputEvent {
   id: number
+  type: 'warning' | 'page-error'
   message: string
 }
 
-interface WarningScope {
+interface OutputScope {
   cursor: number
 }
 
@@ -279,6 +392,14 @@ export interface CdpConfig {
   /** Launch a headless Chrome via chromium.launch() instead of connecting to an existing one.
    *  Uses direct Playwright browser management, no extension or relay CDP routing needed. */
   headless?: boolean
+  /** CLI session id — sent as ?session= on the /cdp URL so the relay can map the client to its session */
+  sessionId?: string
+  /** Tab group title for this session (extension and remote-control modes) */
+  tabGroup?: string
+  /** Explicit tab group color (extension and remote-control modes) */
+  tabGroupColor?: TabGroupColor
+  /** Sent as ?client= on the /cdp URL for anonymous usage stats */
+  client?: 'mcp'
 }
 
 export interface SessionMetadata {
@@ -294,6 +415,12 @@ export interface SessionInfo {
   browser: string | null
   profile: { email: string; id: string } | null
   cwd: string | null
+  /** Explicit tab group title, null when the mode supplies its default */
+  tabGroup: string | null
+  /** Explicit tab group color, null when derived from the title hash */
+  tabGroupColor: TabGroupColor | null
+  /** Connected with Patchright instead of Playwright */
+  patchright: boolean
 }
 
 export interface CloudSessionInfo {
@@ -312,12 +439,29 @@ export interface ExecutorOptions {
   cwd?: string
   /** Set when this executor is connected to a cloud Browser Use VM */
   cloudSession?: CloudSessionInfo
+  /** Expose local-to-cloud cookie transfer in the execution scope */
+  enableCloudScope?: boolean
+  /** Cloud API credentials kept outside the execution scope */
+  cloudAuth?: CloudAuth
+  /** Connect with Patchright instead of Playwright. The relay also humanizes this connection's input. */
+  patchright?: boolean
 }
 
 function isRegExp(value: any): value is RegExp {
   return (
     typeof value === 'object' && value !== null && typeof value.test === 'function' && typeof value.exec === 'function'
   )
+}
+
+// Console argument as text, like DevTools shows it: primitives by value, objects by description.
+function describeRemoteObject(arg: Protocol.Runtime.RemoteObject): string {
+  if (arg.unserializableValue !== undefined) {
+    return arg.unserializableValue
+  }
+  if (arg.type === 'object' || arg.type === 'function') {
+    return arg.subtype === 'null' ? 'null' : (arg.description ?? arg.type)
+  }
+  return String(arg.value)
 }
 
 function isPromise(value: any): value is Promise<unknown> {
@@ -341,9 +485,144 @@ export function isPlaywrightChannelOwner(value: any): boolean {
   )
 }
 
+export const MAX_EXECUTE_OUTPUT_LENGTH = 10_000
+// Warnings + logs get at least this share when the return value is also large
+const LOGS_MIN_SHARE = 0.6
+
+const INSPECT_OPTIONS: util.InspectOptions = {
+  depth: 4,
+  colors: false,
+  maxArrayLength: 100,
+  maxStringLength: 1000,
+  breakLength: 80,
+}
+
+export function formatValue(value: unknown): string {
+  return typeof value === 'string' ? value : util.inspect(value, INSPECT_OPTIONS)
+}
+
+/** Format captured console calls, folding identical consecutive lines into `(xN)`. */
+export function formatConsoleLogs({
+  logs,
+  title = 'Console output',
+}: {
+  logs: Array<{ method: string; args: unknown[] }>
+  title?: string
+}): string {
+  if (logs.length === 0) {
+    return ''
+  }
+  const folded: Array<{ line: string; count: number }> = []
+  for (const { method, args } of logs) {
+    const line = `[${method}] ${args.map(formatValue).join(' ')}`
+    const last = folded.at(-1)
+    if (last?.line === line) {
+      last.count++
+    } else {
+      folded.push({ line, count: 1 })
+    }
+  }
+  const lines = folded.map(({ line, count }) => (count > 1 ? `${line} (x${count})` : line))
+  return `${title}:\n${lines.join('\n')}\n\n`
+}
+
+/**
+ * Join execute output and truncate it once. `before` (warnings, logs) keeps its head
+ * and tail; `after` (return value or error) is always appended and only cut at the end.
+ */
+export function boundExecuteOutput({
+  before,
+  after,
+  maxLength = MAX_EXECUTE_OUTPUT_LENGTH,
+}: {
+  before: string
+  after: string
+  maxLength?: number
+}): string {
+  if (before.length + after.length <= maxLength) {
+    return before + after
+  }
+  const beforeBudget = Math.min(before.length, Math.max(Math.floor(maxLength * LOGS_MIN_SHARE), maxLength - after.length))
+  const afterBudget = maxLength - beforeBudget
+  const truncatedBefore = (() => {
+    if (before.length <= beforeBudget) {
+      return before
+    }
+    // Upper bound of the marker length, so head + marker + tail fits the budget
+    const keep = Math.max(0, beforeBudget - `\n... [${before.length} characters of logs omitted] ...\n`.length)
+    // Cut on line boundaries unless that drops more than half of a side
+    const half = Math.floor(keep / 2)
+    const headNewline = before.lastIndexOf('\n', half - 1)
+    const headEnd = headNewline >= half / 2 ? headNewline + 1 : half
+    const tailMin = before.length - (keep - headEnd)
+    const tailNewline = before.indexOf('\n', tailMin - 1)
+    const tailStart =
+      tailNewline !== -1 && tailNewline + 1 - tailMin <= (keep - headEnd) / 2 ? tailNewline + 1 : tailMin
+    const head = before.slice(0, headEnd)
+    const separator = head.endsWith('\n') || head === '' ? '' : '\n'
+    return `${head}${separator}... [${tailStart - headEnd} characters of logs omitted] ...\n${before.slice(tailStart)}`
+  })()
+  const truncatedAfter = (() => {
+    if (after.length <= afterBudget) {
+      return after
+    }
+    return (
+      after.slice(0, afterBudget) +
+      `\n[Truncated to ${afterBudget} of ${after.length} characters. Use snapshot({ search }), or write large data to a file and return a summary]`
+    )
+  })()
+  return truncatedBefore + truncatedAfter
+}
+
+const SNAPSHOT_SEARCH_MAX_MATCHES = 10
+const SNAPSHOT_SEARCH_CONTEXT_LINES = 5
+
+/** Matching snapshot lines with context. Strings match case-insensitively. */
+export function searchSnapshot({ snapshot, search }: { snapshot: string; search: string | RegExp }): string {
+  const lines = snapshot.split('\n')
+  const needle = typeof search === 'string' ? search.toLowerCase() : ''
+  const isMatch = (line: string) => {
+    if (typeof search === 'string') {
+      return line.toLowerCase().includes(needle)
+    }
+    // A /g or /y regex keeps lastIndex between test() calls and skips matches
+    search.lastIndex = 0
+    return search.test(line)
+  }
+  const matchIndices = lines.flatMap((line, i) => (isMatch(line) ? [i] : []))
+  if (matchIndices.length === 0) {
+    return 'No matches found'
+  }
+
+  const shown = matchIndices.slice(0, SNAPSHOT_SEARCH_MAX_MATCHES)
+  const includedLines = new Set<number>()
+  for (const idx of shown) {
+    const start = Math.max(0, idx - SNAPSHOT_SEARCH_CONTEXT_LINES)
+    const end = Math.min(lines.length - 1, idx + SNAPSHOT_SEARCH_CONTEXT_LINES)
+    for (let i = start; i <= end; i++) {
+      includedLines.add(i)
+    }
+  }
+
+  const total = matchIndices.length
+  const header =
+    total > shown.length
+      ? `${total} matches (showing ${shown.length}). Use a more specific search to see the rest.`
+      : `${total} ${total === 1 ? 'match' : 'matches'}`
+  const result: string[] = [header]
+  const sortedIndices = [...includedLines].sort((a, b) => a - b)
+  for (let i = 0; i < sortedIndices.length; i++) {
+    const lineIdx = sortedIndices[i]
+    if (i > 0 && sortedIndices[i - 1] !== lineIdx - 1) {
+      result.push('---')
+    }
+    result.push(lines[lineIdx])
+  }
+  return result.join('\n')
+}
+
 export class PlaywrightExecutor {
   private isConnected = false
-  private page: Page | null = null
   private browser: Browser | null = null
   private context: BrowserContext | null = null
 
@@ -356,18 +635,30 @@ export class PlaywrightExecutor {
   private pageLogCursor: Map<Page, number> = new Map()
   private lastSnapshots: WeakMap<Page, Map<string, string>> = new WeakMap()
   private lastRefToLocator: WeakMap<Page, Map<string, string>> = new WeakMap()
-  private warningEvents: WarningEvent[] = []
-  private nextWarningEventId = 0
-  private lastDeliveredWarningEventId = 0
+  private pageDocumentGenerations: WeakMap<Page, number> = new WeakMap()
+  private outputEvents: OutputEvent[] = []
+  private nextOutputEventId = 0
+  private lastDeliveredOutputEventId = 0
 
   // Recording timestamp tracking: when recording is active, each execute()
   // call pushes {start, end} (seconds relative to recordingStartedAt).
-  // Returned by stopRecording() so the model can speed up idle sections.
+  // Returned by the recording handle stop() so the model can speed up idle sections.
   private recordingStartedAt: number | null = null
   private executionTimestamps: Array<{ start: number; end: number }> = []
-  private activeWarningScopes = new Set<WarningScope>()
+  private activeOutputScopes = new Set<OutputScope>()
   private pagesWithListeners = new WeakSet<Page>()
+  /** Pages whose main frame navigated during the running execute script; null outside of one. */
+  private navigatedPages: Set<Page> | null = null
   private suppressPageCloseWarnings = false
+  private operationTail: Promise<void> = Promise.resolve()
+  /** Queued or running operations. Used with lastActivityAt for idle cleanup. */
+  private pendingOperations = 0
+  private lastActivityAt = Date.now()
+  private disposing = false
+  private disposePromise: Promise<void> | null = null
+  /** Pending agent timers, cleared on reset and dispose. */
+  private sandboxTimers = new Set<ReturnType<typeof setTimeout>>()
+  private sandboxTimerGlobals = this.createSandboxTimerGlobals()
 
   private scopedFs: ScopedFS
   private sandboxedRequire: NodeRequire
@@ -381,6 +672,9 @@ export class PlaywrightExecutor {
   private ghostCursorController: GhostCursorController
   /** Non-null when this executor is backed by a cloud Browser Use VM */
   private cloudSession: CloudSessionInfo | null
+  private enableCloudScope: boolean
+  private cloudAuth: CloudAuth | undefined
+  private patchright: boolean
   /** Last minute bucket for which a cloud timeout warning was enqueued (dedup) */
   private lastCloudTimeoutWarningMinute: number | null = null
 
@@ -388,8 +682,19 @@ export class PlaywrightExecutor {
     this.cdpConfig = options.cdpConfig
     this.logger = options.logger || { log: console.log, error: console.error }
     this.sessionMetadata = options.sessionMetadata || { extensionId: null, browser: null, profile: null }
-    this.sessionCwd = options.cwd ? path.resolve(options.cwd) : null
+    // Resolve cwd with cross-OS awareness (Windows CLI + Linux relay via WSL).
+    // resolveSessionCwd handles WSL /mnt/ translation and rejects paths that
+    // can't be resolved on the relay's platform to prevent mangled paths like
+    // /home/user/C:\Users\... (see issue #107).
+    const { cwd: resolvedCwd, warning: cwdWarning } = resolveSessionCwd(options.cwd)
+    this.sessionCwd = resolvedCwd
+    if (cwdWarning) {
+      this.logger.log(`[session cwd] ${cwdWarning}`)
+    }
     this.cloudSession = options.cloudSession || null
+    this.enableCloudScope = options.enableCloudScope ?? false
+    this.cloudAuth = options.cloudAuth
+    this.patchright = options.patchright ?? false
     // ScopedFS expects an array of allowed directories. If cwd is provided, use it; otherwise use defaults.
     this.scopedFs = new ScopedFS(
       this.sessionCwd ? [this.sessionCwd, '/tmp', os.tmpdir()] : undefined,
@@ -403,6 +708,59 @@ export class PlaywrightExecutor {
         },
       },
     })
+  }
+
+  /** Host timers for agent code. A throwing callback becomes a warning instead of killing the process. */
+  private createSandboxTimerGlobals() {
+    const timers = this.sandboxTimers
+    const runCallback = ({ kind, callback, args }: { kind: string; callback: Function; args: unknown[] }) => {
+      try {
+        callback(...args)
+      } catch (error) {
+        const message = describeThrown(error)
+        this.logger.error(`[sandbox] ${kind} callback threw:`, message)
+        this.enqueueWarning(`${kind} callback threw: ${message}`)
+      }
+    }
+    const assertFunction = (callback: unknown) => {
+      if (typeof callback !== 'function') {
+        throw new TypeError('The "callback" argument must be a function')
+      }
+    }
+    const clear = (timer: ReturnType<typeof setTimeout> | undefined) => {
+      if (timer) {
+        timers.delete(timer)
+      }
+      clearTimeout(timer)
+    }
+    return {
+      setTimeout: (callback: Function, ms?: number, ...args: unknown[]) => {
+        assertFunction(callback)
+        const timer = setTimeout(() => {
+          timers.delete(timer)
+          runCallback({ kind: 'setTimeout', callback, args })
+        }, ms)
+        timers.add(timer)
+        return timer
+      },
+      setInterval: (callback: Function, ms?: number, ...args: unknown[]) => {
+        assertFunction(callback)
+        const timer = setInterval(() => {
+          runCallback({ kind: 'setInterval', callback, args })
+        }, ms)
+        timers.add(timer)
+        return timer
+      },
+      clearTimeout: clear,
+      clearInterval: clear,
+    }
+  }
+
+  private clearSandboxTimers() {
+    for (const timer of this.sandboxTimers) {
+      clearTimeout(timer)
+    }
+    this.sandboxTimers.clear()
   }
 
   private createSandboxedRequire(originalRequire: NodeRequire): NodeRequire {
@@ -472,26 +830,72 @@ export class PlaywrightExecutor {
 
     // Apply to future pages
     context.on('page', (page) => {
-      applyToPage(page)
+      void applyToPage(page)
     })
 
     this.logger.log('Proxy bandwidth acceleration enabled: blocking raster images')
   }
 
-  private clearUserState() {
-    Object.keys(this.userState).forEach((key) => delete this.userState[key])
+  private clearExecutionState() {
+    this.userState = {}
+    this.browserLogs = new Map()
+    this.pageLogCursor = new Map()
+    this.lastSnapshots = new WeakMap()
+    this.lastRefToLocator = new WeakMap()
+    this.pageDocumentGenerations = new WeakMap()
+    this.outputEvents = []
+    this.nextOutputEventId = 0
+    this.lastDeliveredOutputEventId = 0
+    this.activeOutputScopes.clear()
+    this.clearSandboxTimers()
   }
 
   private clearConnectionState() {
     this.isConnected = false
     this.browser = null
-    this.page = null
     this.context = null
   }
 
+  private runExclusive<T>({
+    operation,
+    allowDuringDispose = false,
+  }: {
+    operation: () => Promise<T>
+    allowDuringDispose?: boolean
+  }): Promise<T> {
+    if (this.disposing && !allowDuringDispose) {
+      return Promise.reject(new Error('Session is being deleted'))
+    }
+
+    this.pendingOperations++
+    const run = async () => {
+      try {
+        return await operation()
+      } finally {
+        this.pendingOperations--
+        this.lastActivityAt = Date.now()
+      }
+    }
+    const result = this.operationTail.then(run, run)
+    this.operationTail = result.then(
+      () => {},
+      () => {},
+    )
+    return result
+  }
+
+  /** Ms since the last operation finished, or 0 while one is queued or running. */
+  idleMs(): number {
+    return this.pendingOperations > 0 ? 0 : Date.now() - this.lastActivityAt
+  }
+
   enqueueWarning(message: string) {
-    this.nextWarningEventId += 1
-    this.warningEvents.push({ id: this.nextWarningEventId, message })
+    this.enqueueOutputEvent({ type: 'warning', message })
+  }
+
+  private enqueueOutputEvent(event: Omit<OutputEvent, 'id'>) {
+    this.nextOutputEventId += 1
+    this.outputEvents.push({ id: this.nextOutputEventId, ...event })
   }
 
   /** Update the cloud session timeout from external tracking (relay timer). */
@@ -501,45 +905,55 @@ export class PlaywrightExecutor {
     }
   }
 
-  private beginWarningScope(): WarningScope {
-    // Use lastDeliveredWarningEventId as cursor (not nextWarningEventId) so
-    // warnings enqueued by the relay interval between execute() calls are
-    // picked up by the next scope. Using nextWarningEventId would skip them.
-    const scope: WarningScope = {
-      cursor: this.lastDeliveredWarningEventId,
+  private beginOutputScope(): OutputScope {
+    // Use lastDeliveredOutputEventId as cursor (not nextOutputEventId) so
+    // events enqueued between execute() calls are picked up by the next scope.
+    // Using nextOutputEventId would skip them.
+    const scope: OutputScope = {
+      cursor: this.lastDeliveredOutputEventId,
     }
-    this.activeWarningScopes.add(scope)
+    this.activeOutputScopes.add(scope)
     return scope
   }
 
-  private flushWarningsForScope(scope: WarningScope): string {
-    const relevantWarnings = this.warningEvents.filter((warning) => {
-      return warning.id > scope.cursor
+  private flushOutputForScope(scope: OutputScope): string {
+    const relevantEvents = this.outputEvents.filter((event) => {
+      return event.id > scope.cursor
     })
-    const latestWarningId = relevantWarnings.at(-1)?.id
-    if (latestWarningId && latestWarningId > this.lastDeliveredWarningEventId) {
-      this.lastDeliveredWarningEventId = latestWarningId
+    const latestEventId = relevantEvents.at(-1)?.id
+    if (latestEventId && latestEventId > this.lastDeliveredOutputEventId) {
+      this.lastDeliveredOutputEventId = latestEventId
     }
 
-    this.activeWarningScopes.delete(scope)
-    this.pruneDeliveredWarnings()
+    this.activeOutputScopes.delete(scope)
+    this.pruneDeliveredOutputEvents()
 
-    if (relevantWarnings.length === 0) {
+    if (relevantEvents.length === 0) {
       return ''
     }
 
-    return `${relevantWarnings.map((warning) => `[WARNING] ${warning.message}`).join('\n')}\n`
+    return `${relevantEvents
+      .map((event) => `[${event.type === 'warning' ? 'WARNING' : 'PAGE ERROR'}] ${event.message}`)
+      .join('\n')}\n`
   }
 
-  private pruneDeliveredWarnings() {
-    const activeCursors = [...this.activeWarningScopes].map((scope) => {
+  private pruneDeliveredOutputEvents() {
+    const activeCursors = [...this.activeOutputScopes].map((scope) => {
       return scope.cursor
     })
-    const minActiveCursor = activeCursors.length > 0 ? Math.min(...activeCursors) : this.lastDeliveredWarningEventId
-    const pruneBeforeOrAt = Math.min(this.lastDeliveredWarningEventId, minActiveCursor)
-    this.warningEvents = this.warningEvents.filter((warning) => {
-      return warning.id > pruneBeforeOrAt
+    const minActiveCursor = activeCursors.length > 0 ? Math.min(...activeCursors) : this.lastDeliveredOutputEventId
+    const pruneBeforeOrAt = Math.min(this.lastDeliveredOutputEventId, minActiveCursor)
+    this.outputEvents = this.outputEvents.filter((event) => {
+      return event.id > pruneBeforeOrAt
     })
+  }
+
+  private stateKeysForPage(page: Page): string[] {
+    return Object.entries(this.userState)
+      .filter(([, value]) => {
+        return value === page
+      })
+      .map(([key]) => key)
   }
 
   private warnIfExtensionOutdated(playwriterVersion: string | null) {
@@ -562,69 +976,51 @@ export class PlaywrightExecutor {
     }
     this.pagesWithListeners.add(page)
     this.setupPageCloseDetection(page)
+    page.on('crash', () => {
+      const keys = this.stateKeysForPage(page)
+      if (keys.length === 0) {
+        return
+      }
+      const key = `state.${keys[0]}`
+      this.enqueueWarning(
+        `Page crashed (url: ${page.url()}) for ${keys.map((key) => `state.${key}`).join(', ')}. ` +
+          `Do not reset the session or repeat the last script. Create a new tab with ${key} = await context.newPage(), ` +
+          `navigate to the intended URL, then check whether the last action completed before continuing. Other tabs and state are unchanged.`,
+      )
+    })
     this.setupPageConsoleListener(page)
     this.setupNewPageLogging(page)
     this.ghostCursorController.attachToPage({ page })
+    page.on('framenavigated', (frame) => {
+      if (frame === page.mainFrame()) {
+        this.invalidateSnapshotState(page)
+        this.navigatedPages?.add(page)
+      }
+    })
     page.on('close', () => {
+      this.invalidateSnapshotState(page)
       this.ghostCursorController.detachFromPage({ page })
     })
   }
 
+  private invalidateSnapshotState(page: Page) {
+    this.lastSnapshots.delete(page)
+    this.lastRefToLocator.delete(page)
+    this.pageDocumentGenerations.set(page, (this.pageDocumentGenerations.get(page) || 0) + 1)
+  }
+
   private setupPageCloseDetection(page: Page) {
     page.on('close', () => {
-      const stateKeysForClosedPage = Object.entries(this.userState)
-        .filter(([, value]) => {
-          return value === page
-        })
-        .map(([key]) => key)
-
-      const wasCurrentPage = this.page === page
-      let replacementPageInfo: { index: string; url: string } | null = null
-
-      if (wasCurrentPage) {
-        this.page = null
-        const context = this.context || page.context()
-        const openPages = context.pages().filter((candidate) => {
-          return !candidate.isClosed()
-        })
-        if (openPages.length > 0) {
-          const replacementPage = openPages[0]
-          this.page = replacementPage
-          const replacementIndex = context.pages().indexOf(replacementPage)
-          replacementPageInfo = {
-            index: replacementIndex >= 0 ? String(replacementIndex) : 'unknown',
-            url: replacementPage.url() || 'unknown',
-          }
-        }
-      }
-
+      const stateKeysForClosedPage = this.stateKeysForPage(page)
       if (!this.isConnected || this.suppressPageCloseWarnings || stateKeysForClosedPage.length === 0) {
         return
       }
 
       const stateKeyLabel = stateKeysForClosedPage.map((key) => `state.${key}`).join(', ')
       const closedUrl = page.url() || 'unknown'
-
-      if (!wasCurrentPage) {
-        this.enqueueWarning(
-          `Page closed (url: ${closedUrl}) for ${stateKeyLabel}. ` +
-            `Assign a new open page to ${stateKeyLabel} before reusing it.`,
-        )
-        return
-      }
-
-      if (replacementPageInfo) {
-        this.enqueueWarning(
-          `The current page in ${stateKeyLabel} was closed (url: ${closedUrl}). ` +
-            `Switched active page to index ${replacementPageInfo.index} (url: ${replacementPageInfo.url}). ` +
-            `Reassign ${stateKeyLabel} before using it again.`,
-        )
-        return
-      }
-
       this.enqueueWarning(
-        `The current page in ${stateKeyLabel} was closed (url: ${closedUrl}). ` +
-          `No open pages remain. Open a tab with Playwriter enabled, then reassign ${stateKeyLabel}.`,
+        `Page closed (url: ${closedUrl}) for ${stateKeyLabel}. ` +
+          `Assign a new open page to ${stateKeyLabel} before reusing it, e.g. ${stateKeyLabel.split(', ')[0]} = await context.newPage().`,
       )
     })
   }
@@ -662,6 +1058,11 @@ export class PlaywrightExecutor {
       this.pageLogCursor.delete(page)
     })
 
+    if (this.patchright) {
+      this.setupPatchrightLogListener(page)
+      return
+    }
+
     page.on('console', (msg) => {
       try {
         const logEntry = `[${msg.type()}] ${msg.text()}`
@@ -672,8 +1073,53 @@ export class PlaywrightExecutor {
     })
 
     page.on('pageerror', (error) => {
-      this.addBrowserLog({ page, logEntry: `[pageerror] ${error.message}` })
+      this.addPageError({ page, message: error.message })
     })
+  }
+
+  // Patchright keeps Runtime off, so page.on('console') stays silent. Raw Runtime events still arrive while
+  // another client keeps Runtime on, or while getLatestLogs turns it on to make Chrome replay its buffered
+  // messages. Every replay repeats all buffered messages, so timestamps drop the ones already stored.
+  private setupPatchrightLogListener(page: Page) {
+    let lastTimestamp = 0
+    const isNew = (timestamp: number) => {
+      if (timestamp <= lastTimestamp) {
+        return false
+      }
+      lastTimestamp = timestamp
+      return true
+    }
+    getCDPSessionForPage({ page })
+      .then((cdp) => {
+        cdp.on('Runtime.consoleAPICalled', (event) => {
+          if (isNew(event.timestamp)) {
+            this.addBrowserLog({ page, logEntry: `[${event.type}] ${event.args.map(describeRemoteObject).join(' ')}` })
+          }
+        })
+        cdp.on('Runtime.exceptionThrown', ({ timestamp, exceptionDetails }) => {
+          if (isNew(timestamp)) {
+            this.addPageError({ page, message: exceptionDetails.exception?.description?.split('\n')[0] ?? exceptionDetails.text })
+          }
+        })
+      })
+      .catch((e) => {
+        this.logger.error('[Executor] Failed to listen for Patchright page logs:', e)
+      })
+  }
+
+  // Chrome replays buffered console messages and exceptions on Runtime.enable. Patchright turns Runtime
+  // on only for this read, so the page sees a debugger for a few milliseconds, not the whole session.
+  private async readPatchrightLogs(page: Page) {
+    const cdp = await getCDPSessionForPage({ page })
+    await cdp.send('Runtime.enable')
+    await cdp.send('Runtime.disable')
+  }
+
+  private addPageError(options: { page: Page; message: string }) {
+    this.addBrowserLog({ page: options.page, logEntry: `[pageerror] ${options.message}` })
+    if (this.stateKeysForPage(options.page).length > 0) {
+      this.enqueueOutputEvent({ type: 'page-error', message: options.message })
+    }
   }
 
   private addBrowserLog(options: { page: Page; logEntry: string }) {
@@ -780,21 +1226,43 @@ export class PlaywrightExecutor {
     }
   }
 
+  /** Remote dials drop and retry; wait instead of showing the local-extension error. */
+  private async requireConnectedExtension(): Promise<{
+    connected: boolean
+    activeTargets: number
+    playwriterVersion: string | null
+  }> {
+    let status = await this.checkExtensionStatus()
+    const remote = isRemoteExtensionKey(this.cdpConfig.extensionId || '')
+    if (!status.connected && remote) {
+      const deadline = Date.now() + 8000
+      while (!status.connected && Date.now() < deadline) {
+        await sleep(200)
+        status = await this.checkExtensionStatus()
+      }
+    }
+    if (!status.connected) {
+      throw new Error(remote ? REMOTE_EXTENSION_NOT_CONNECTED_ERROR : EXTENSION_NOT_CONNECTED_ERROR)
+    }
+    return status
+  }
+
   private isDirectCdpMode(): boolean {
     return !!this.cdpConfig.directCdpUrl
   }
 
-  private isHeadlessMode(): boolean {
+  isHeadlessMode(): boolean {
     return !!this.cdpConfig.headless
   }
 
   /**
-   * Connect to Chrome and set up context/page. Shared by ensureConnection and reset.
+   * Connect to Chrome and set up the context. Shared by ensureConnection and reset.
+   * Never opens a tab: the sandbox has no default page, code creates or picks its own.
    * In headless mode, launches Chrome via chromium.launch().
    * In direct CDP mode, connects straight to Chrome's WebSocket.
    * In extension mode, checks extension status then connects via relay.
    */
-  private async connectToBrowser(): Promise<{ browser: Browser; page: Page; context: BrowserContext }> {
+  private async connectToBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
     // Headless mode: launch Chrome directly via Playwright (no extension, no relay CDP routing)
     if (this.isHeadlessMode()) {
       return this.connectHeadlessBrowser()
@@ -802,7 +1270,7 @@ export class PlaywrightExecutor {
 
     if (this.isDirectCdpMode()) {
       // Direct CDP: connect straight to Chrome, no relay or extension needed
-      const chromium = await getChromium()
+      const chromium = await getChromium({ patchright: this.patchright })
       const browser = await chromium.connectOverCDP(this.cdpConfig.directCdpUrl!)
 
       browser.on('disconnected', () => {
@@ -822,12 +1290,6 @@ export class PlaywrightExecutor {
 
       context.pages().forEach((p) => this.setupPageListeners(p))
 
-      // In direct CDP mode, pages are always available (all tabs visible).
-      // Use the first non-closed page, or create one.
-      const pages = context.pages().filter((p) => !p.isClosed())
-      const page = pages.length > 0 ? pages[0] : await context.newPage()
-      this.setupPageListeners(page)
-
       await this.setDeviceScaleFactorForMacOS(context)
 
       // Block images, video, and fonts for cloud sessions with proxy enabled
@@ -837,18 +1299,15 @@ export class PlaywrightExecutor {
         await this.applyProxyResourceBlocking(context)
       }
 
-      return { browser, page, context }
+      return { browser, context }
     }
 
     // Extension mode: check status first for better error messages
-    const extensionStatus = await this.checkExtensionStatus()
-    if (!extensionStatus.connected) {
-      throw new Error(EXTENSION_NOT_CONNECTED_ERROR)
-    }
+    const extensionStatus = await this.requireConnectedExtension()
     this.warnIfExtensionOutdated(extensionStatus.playwriterVersion)
 
-    const cdpUrl = getCdpUrl(this.cdpConfig)
-    const chromium = await getChromium()
+    const cdpUrl = getCdpUrl({ ...this.cdpConfig, patchright: this.patchright })
+    const chromium = await getChromium({ patchright: this.patchright })
     const browser = await chromium.connectOverCDP(cdpUrl)
 
     browser.on('disconnected', () => {
@@ -870,11 +1329,10 @@ export class PlaywrightExecutor {
     })
 
     context.pages().forEach((p) => this.setupPageListeners(p))
-    const page = await this.ensurePageForContext({ context, timeout: 10000 })
 
     await this.setDeviceScaleFactorForMacOS(context)
 
-    return { browser, page, context }
+    return { browser, context }
   }
 
   /**
@@ -883,7 +1341,7 @@ export class PlaywrightExecutor {
    * Does NOT add per-session disconnect listeners to avoid accumulation on the shared
    * browser; instead, ensureConnection checks browser.isConnected() on each call.
    */
-  private async connectHeadlessBrowser(): Promise<{ browser: Browser; page: Page; context: BrowserContext }> {
+  private async connectHeadlessBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
     const browser = await PlaywrightExecutor.getOrLaunchHeadlessBrowser()
 
     const context = await browser.newContext()
@@ -895,40 +1353,25 @@ export class PlaywrightExecutor {
         this.setupPageListeners(page)
       })
 
-      const page = await context.newPage()
-      this.setupPageListeners(page)
-
       await this.setDeviceScaleFactorForMacOS(context)
 
       PlaywrightExecutor._headlessExecutors.add(this)
-      return { browser, page, context }
+      return { browser, context }
     } catch (e) {
-      // Clean up the partially created context so it doesn't leak on the
-      // long-lived shared browser.
       await context.close().catch(() => {})
       throw e
     }
   }
 
-  /** Shared headless browser instance across all headless sessions.
-   *  Uses a launch promise to prevent concurrent first-session races from
-   *  spawning multiple browsers. The disconnect handler is registered once
-   *  at launch time and clears both statics so the next session relaunches. */
   private static _sharedHeadlessBrowser: Browser | null = null
   private static _sharedHeadlessBrowserPromise: Promise<Browser> | null = null
-  /** Active headless executors sharing the browser. Using a Set instead of a
-   *  counter makes tracking idempotent: reset() re-adds the same executor (no-op),
-   *  and concurrent deletes can't double-decrement. When the set empties after
-   *  a session delete, the shared browser is auto-closed. */
   private static _headlessExecutors = new Set<PlaywrightExecutor>()
 
   private static async getOrLaunchHeadlessBrowser(): Promise<Browser> {
-    // Check the cached browser is actually alive (not just non-null after a crash)
     if (PlaywrightExecutor._sharedHeadlessBrowser?.isConnected()) {
       return PlaywrightExecutor._sharedHeadlessBrowser
     }
 
-    // Deduplicate concurrent launches: second caller awaits the first's promise
     if (PlaywrightExecutor._sharedHeadlessBrowserPromise) {
       return PlaywrightExecutor._sharedHeadlessBrowserPromise
     }
@@ -940,13 +1383,13 @@ export class PlaywrightExecutor {
 
       const browser = await chromium.launch({
         headless: true,
+        // Playwright passes --no-sandbox unless chromiumSandbox is true.
+        // Agents browse untrusted pages, so keep the Chromium sandbox on,
+        // except as root on Linux (Docker), where Chromium cannot start sandboxed.
+        chromiumSandbox: !(process.platform === 'linux' && process.getuid?.() === 0),
         executablePath,
       })
 
-      // Single handler registered once per browser lifetime.
-      // Only clears statics if this is still the current shared browser;
-      // prevents an old browser's disconnect from wiping state for a newer one
-      // (race: new session launches while old browser.close() is in progress).
       browser.on('disconnected', () => {
         if (PlaywrightExecutor._sharedHeadlessBrowser !== browser) {
           return
@@ -957,9 +1400,6 @@ export class PlaywrightExecutor {
       })
 
       PlaywrightExecutor._sharedHeadlessBrowser = browser
-      // Clear the promise now that the browser is cached; future callers
-      // use _sharedHeadlessBrowser directly. Concurrent waiters already
-      // hold a reference to launchPromise so they still resolve correctly.
       PlaywrightExecutor._sharedHeadlessBrowserPromise = null
       return browser
     })()
@@ -973,9 +1413,6 @@ export class PlaywrightExecutor {
     }
   }
 
-  /** Close the headless context for this session (called on session delete).
-   *  When the last headless executor is removed, the shared browser is also
-   *  closed automatically so the Chrome process doesn't linger. */
   async closeHeadlessContext(): Promise<void> {
     if (!this.isHeadlessMode()) {
       return
@@ -995,38 +1432,30 @@ export class PlaywrightExecutor {
     }
   }
 
-  /** Close the shared headless browser (called on relay shutdown or when last
-   *  session is deleted). Nulls statics before awaiting close so concurrent
-   *  callers of getOrLaunchHeadlessBrowser() launch a fresh browser instead
-   *  of reusing one that is mid-shutdown. */
   static async closeSharedHeadlessBrowser(): Promise<void> {
     const browser = PlaywrightExecutor._sharedHeadlessBrowser
     if (browser) {
-      // Detach from statics first so new sessions don't reuse a dying browser.
-      // The disconnect handler checks identity, so it becomes a no-op for this browser.
       PlaywrightExecutor._sharedHeadlessBrowser = null
       PlaywrightExecutor._sharedHeadlessBrowserPromise = null
       await browser.close().catch(() => {})
     }
   }
 
-  private async ensureConnection(): Promise<{ browser: Browser; page: Page }> {
-    // In headless mode, also check the shared browser is still alive.
-    // After a crash, isConnected() returns false and we need to reconnect.
+  private async ensureConnection(): Promise<{ browser: Browser; context: BrowserContext }> {
+    // In headless mode, check that this session's browser is still alive.
     const browserAlive = this.isHeadlessMode() ? this.browser?.isConnected() : true
-    if (this.isConnected && this.browser && this.page && browserAlive) {
-      return { browser: this.browser, page: this.page }
+    if (this.isConnected && this.browser && this.context && browserAlive) {
+      return { browser: this.browser, context: this.context }
     }
 
     try {
-      const { browser, page, context } = await this.connectToBrowser()
+      const { browser, context } = await this.connectToBrowser()
 
       this.browser = browser
-      this.page = page
       this.context = context
       this.isConnected = true
 
-      return { browser, page }
+      return { browser, context }
     } catch (error) {
       // Cloud sessions that fail to connect are likely expired VMs.
       // Give a clear error instead of a cryptic WebSocket/connection error.
@@ -1037,38 +1466,42 @@ export class PlaywrightExecutor {
     }
   }
 
-  private async getCurrentPage(timeout = 10000): Promise<Page> {
-    if (this.page && !this.page.isClosed()) {
-      return this.page
-    }
-
-    if (this.browser) {
-      const contexts = this.browser.contexts()
-      if (contexts.length > 0) {
-        const context = contexts[0]
-        this.context = context
-        const pages = context.pages().filter((p) => !p.isClosed())
-        if (pages.length > 0) {
-          const page = pages[0]
-          await page.waitForLoadState('domcontentloaded', { timeout }).catch(() => {})
-          this.page = page
-          return page
-        }
-        const page = await this.ensurePageForContext({ context, timeout })
-        this.page = page
-        return page
-      }
-    }
-
-    throw new Error(NO_PAGES_AVAILABLE_ERROR)
+  /** Used by the action recorder (`playwriter recorder`) to attach
+   *  context-level instrumentation. Connects to the browser if needed. */
+  withBrowserContext<T>({ operation }: { operation: (context: BrowserContext) => Promise<T> }): Promise<T> {
+    return this.runExclusive({
+      operation: async () => {
+        const { context } = await this.ensureConnection()
+        return operation(context)
+      },
+    })
   }
 
-  async reset(): Promise<{ page: Page; context: BrowserContext }> {
+  async reset(): Promise<{ context: BrowserContext }> {
+    return this.runExclusive({ operation: () => this.resetInternal() })
+  }
+
+  /** Switch between Playwright and Patchright. A connected session reconnects like reset(), so tabs stay open and state is cleared. */
+  async setPatchright(patchright: boolean): Promise<{ reconnected: boolean }> {
+    return this.runExclusive({
+      operation: async () => {
+        if (this.patchright === patchright) {
+          return { reconnected: false }
+        }
+        this.patchright = patchright
+        if (!this.isConnected) {
+          return { reconnected: false }
+        }
+        await this.resetInternal()
+        return { reconnected: true }
+      },
+    })
+  }
+
+  private async resetInternal(): Promise<{ context: BrowserContext }> {
     this.suppressPageCloseWarnings = true
     try {
       if (this.isHeadlessMode()) {
-        // In headless mode, only close this session's context, not the shared browser.
-        // Other headless sessions share the same browser instance.
         if (this.context) {
           await this.context.close().catch((e) => {
             this.logger.error('Error closing context:', e)
@@ -1084,65 +1517,52 @@ export class PlaywrightExecutor {
     }
 
     this.clearConnectionState()
-    this.clearUserState()
+    this.clearExecutionState()
 
-    const { browser, page, context } = await this.connectToBrowser()
+    const { browser, context } = await this.connectToBrowser()
 
     this.browser = browser
-    this.page = page
     this.context = context
     this.isConnected = true
 
-    return { page, context }
+    return { context }
   }
 
-  async execute(code: string, timeout = 10000): Promise<ExecuteResult> {
+  /** `signal` aborts the script like a timeout does, for example when the HTTP caller disconnects. */
+  async execute(
+    code: string,
+    { timeout = 10000, signal }: { timeout?: number; signal?: AbortSignal } = {},
+  ): Promise<ExecuteResult> {
+    return this.runExclusive({ operation: () => this.executeInternal({ code, timeout, signal }) })
+  }
+
+  private async executeInternal({
+    code,
+    timeout,
+    signal,
+  }: {
+    code: string
+    timeout: number
+    signal?: AbortSignal
+  }): Promise<ExecuteResult> {
     const consoleLogs: Array<{ method: ExecutionConsoleMethod; args: any[] }> = []
-    const warningScope = this.beginWarningScope()
-
-    const formatConsoleArgs = (args: any[]) => {
-      return args
-        .map((arg) => {
-          if (typeof arg === 'string') return arg
-          return util.inspect(arg, {
-            depth: 4,
-            colors: false,
-            maxArrayLength: 100,
-            maxStringLength: 1000,
-            breakLength: 80,
-          })
-        })
-        .join(' ')
-    }
-
-    const formatConsoleLogs = (
-      logs: Array<{ method: ExecutionConsoleMethod; args: any[] }>,
-      prefix = 'Console output',
-    ) => {
-      if (logs.length === 0) {
-        return ''
-      }
-      let text = `${prefix}:\n`
-      logs.forEach(({ method, args }) => {
-        text += `[${method}] ${formatConsoleArgs(args)}\n`
-      })
-      return text + '\n'
-    }
-
+    const outputScope = this.beginOutputScope()
     const buildConsoleEvents = (): readonly ExecutionConsoleEvent[] => {
-      return consoleLogs.map(({ method, args }) => ({ method, text: formatConsoleArgs(args) }))
+      return consoleLogs.map(({ method, args }) => ({ method, text: args.map(formatValue).join(' ') }))
     }
 
-    const truncateOutput = (text: string): string => {
-      const MAX_LENGTH = 10000
-      const output = text.trim()
-      return output.length > MAX_LENGTH
-        ? output.slice(0, MAX_LENGTH) +
-            `\n\n[Truncated to ${MAX_LENGTH} characters. Use search to find specific content]`
-        : output
+    const abortController = new AbortController()
+    let scriptStartedAt = 0
+    // Bot challenge checks use what is left of the execute timeout, so they never extend a successful call.
+    const challengeDeadline = () => {
+      return Math.min(scriptStartedAt + timeout, Date.now() + MAX_CHALLENGE_WAIT_MS)
     }
 
     try {
+      // The caller left while this execute waited for the session lock.
+      if (signal?.aborted) {
+        throw new ExecuteCancelledError()
+      }
       // Warn if cloud VM is approaching its hard timeout (deduped by minute bucket)
       if (this.cloudSession?.timeoutAt) {
         const remainingMs = this.cloudSession.timeoutAt - Date.now()
@@ -1161,9 +1581,7 @@ export class PlaywrightExecutor {
         }
       }
 
-      await this.ensureConnection()
-      const page = await this.getCurrentPage(timeout)
-      const context = this.context || page.context()
+      const { context } = await this.ensureConnection()
 
       this.logger.log('Executing code:', code)
 
@@ -1199,7 +1617,7 @@ export class PlaywrightExecutor {
         interactiveOnly?: boolean
         /** Remove indentation contributed only by filtered-out accessibility wrappers (default: true). */
         normalizeIgnoredIndent?: boolean
-      }) => {
+      } = {}) => {
         const {
           page: targetPage,
           frame,
@@ -1209,10 +1627,9 @@ export class PlaywrightExecutor {
           interactiveOnly = false,
           normalizeIgnoredIndent = true,
         } = options
-        const resolvedPage = targetPage || page
-        if (!resolvedPage) {
-          throw new Error('snapshot requires a page')
-        }
+        const resolvedPage = resolveSandboxPage({ helper: 'snapshot', page: targetPage, locator, frame })
+        const withPageUrl = (body: string) => `URL: ${resolvedPage.url()}\n${body}`
+        const documentGeneration = this.pageDocumentGenerations.get(resolvedPage) || 0
 
         // Use new in-page implementation via getAriaSnapshot
         const {
@@ -1227,6 +1644,9 @@ export class PlaywrightExecutor {
           normalizeIgnoredIndent,
         })
         const snapshotStr = rawSnapshot.toWellFormed?.() ?? rawSnapshot
+        if ((this.pageDocumentGenerations.get(resolvedPage) || 0) !== documentGeneration) {
+          throw new Error('Page navigated while the accessibility snapshot was being captured. Try again.')
+        }
 
         const refToLocator = new Map<string, string>()
         for (const entry of refs) {
@@ -1240,8 +1660,8 @@ export class PlaywrightExecutor {
         const shouldCacheSnapshot = !frame
         // Cache keyed by locator selector so full-page and locator-scoped snapshots
         // don't pollute each other's diff baselines
-        const snapshotScope = locator ? `locator:${locator.selector()}` : 'page'
-        const snapshotKey = `${snapshotScope}:ignored-indent:${normalizeIgnoredIndent ? 'normalized' : 'preserved'}`
+        const detail = `${interactiveOnly ? 'interactive' : 'all'}:ignored-indent:${normalizeIgnoredIndent ? 'normalized' : 'preserved'}`
+        const snapshotKey = locator ? `locator:${locator.selector()}:${detail}` : `page:${detail}`
         let pageSnapshots = this.lastSnapshots.get(resolvedPage)
         if (!pageSnapshots) {
           pageSnapshots = new Map()
@@ -1260,54 +1680,24 @@ export class PlaywrightExecutor {
             label: 'snapshot',
           })
           if (diffResult.type === 'no-change') {
-            return 'No changes since last snapshot. Use showDiffSinceLastCall: false to see full content.'
+            return withPageUrl(
+              'No changes since last snapshot. Use showDiffSinceLastCall: false to see full content.',
+            )
           }
-          return diffResult.content
+          return withPageUrl(diffResult.content)
         }
 
         if (!search) {
-          return `${snapshotStr}\n\nuse refToLocator({ ref: 'e3' }) to get locators for ref strings.`
+          return withPageUrl(
+            `${snapshotStr}\n\nuse refToLocator({ ref: 'e3', page: state.page }) to get locators for ref strings.`,
+          )
         }
 
-        const lines = snapshotStr.split('\n')
-        const matchIndices: number[] = []
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i]
-          const isMatch = isRegExp(search) ? search.test(line) : line.includes(search)
-          if (isMatch) {
-            matchIndices.push(i)
-            if (matchIndices.length >= 10) break
-          }
-        }
-
-        if (matchIndices.length === 0) {
-          return 'No matches found'
-        }
-
-        const CONTEXT_LINES = 5
-        const includedLines = new Set<number>()
-        for (const idx of matchIndices) {
-          const start = Math.max(0, idx - CONTEXT_LINES)
-          const end = Math.min(lines.length - 1, idx + CONTEXT_LINES)
-          for (let i = start; i <= end; i++) {
-            includedLines.add(i)
-          }
-        }
-
-        const sortedIndices = [...includedLines].sort((a, b) => a - b)
-        const result: string[] = []
-        for (let i = 0; i < sortedIndices.length; i++) {
-          const lineIdx = sortedIndices[i]
-          if (i > 0 && sortedIndices[i - 1] !== lineIdx - 1) {
-            result.push('---')
-          }
-          result.push(lines[lineIdx])
-        }
-        return result.join('\n')
+        return withPageUrl(searchSnapshot({ snapshot: snapshotStr, search }))
       }
 
       const refToLocator = (options: { ref: string; page?: Page }): string | null => {
-        const targetPage = options.page || page
+        const targetPage = resolveSandboxPage({ helper: 'refToLocator', page: options.page })
         const map = this.lastRefToLocator.get(targetPage)
         if (!map) {
           return null
@@ -1315,11 +1705,14 @@ export class PlaywrightExecutor {
         return map.get(options.ref) ?? null
       }
 
-      const getLocatorStringForElement = async (element: any) => {
+      const getLocatorStringForElement = async (element: Locator | ElementHandle) => {
         if (!element || typeof element.evaluate !== 'function') {
           throw new Error('getLocatorStringForElement: argument must be a Playwright Locator or ElementHandle')
         }
-        const elementPage = element.page ? element.page() : page
+        const elementPage = 'page' in element ? element.page() : (await element.ownerFrame())?.page()
+        if (!elementPage) {
+          throw new Error('getLocatorStringForElement: could not get the page of this element')
+        }
         const hasGenerator = await elementPage.evaluate(() => !!(globalThis as any).__selectorGenerator)
         if (!hasGenerator) {
           const scriptPath = path.join(__dirname, '..', 'dist', 'selector-generator.js')
@@ -1327,15 +1720,16 @@ export class PlaywrightExecutor {
           const cdp = await getCDPSession({ page: elementPage })
           await cdp.send('Runtime.evaluate', { expression: scriptContent })
         }
-        return await element.evaluate((el: any) => {
+        const generateLocator = (el: any) => {
           const { createSelectorGenerator, toLocator } = (globalThis as any).__selectorGenerator
           const generator = createSelectorGenerator(globalThis)
           const result = generator(el)
           return toLocator(result.selector, 'javascript')
-        })
+        }
+        return 'page' in element ? await element.evaluate(generateLocator) : await element.evaluate(generateLocator)
       }
 
-      const getLatestLogs = async (options?: {
+      const getLatestLogs = async (options: {
         page?: Page
         count?: number
         search?: string | RegExp
@@ -1344,8 +1738,9 @@ export class PlaywrightExecutor {
         // Cursors are tracked per page so navigations and new logs are
         // never missed. Useful for checking page errors after each action.
         sinceLastCall?: boolean
-      }) => {
-        const { page: filterPage, count, search, sinceLastCall = false } = options || {}
+      } = {}) => {
+        const { page: requestedPage, count, search, sinceLastCall = false } = options
+        const filterPage = resolveSandboxPage({ helper: 'getLatestLogs', page: requestedPage })
         let allLogs: string[] = []
 
         // Collect logs, optionally slicing from cursor when sinceLastCall is set
@@ -1358,23 +1753,25 @@ export class PlaywrightExecutor {
           return logs.slice(cursor)
         }
 
-        if (filterPage) {
-          const relatedPages = this.pagesRelatedToPage(filterPage)
-          allLogs = relatedPages.flatMap((relatedPage) => {
-            return collectLogs(relatedPage)
-          })
-        } else {
-          for (const [p] of this.browserLogs) {
-            allLogs.push(...collectLogs(p))
-          }
+        const relatedPages = this.pagesRelatedToPage(filterPage)
+        if (this.patchright) {
+          await Promise.all(
+            relatedPages
+              .filter((relatedPage) => !relatedPage.isClosed())
+              .map((relatedPage) => {
+                return this.readPatchrightLogs(relatedPage).catch((e) => {
+                  this.logger.error('[Executor] Failed to read Patchright page logs:', e)
+                })
+              }),
+          )
         }
+        allLogs = relatedPages.flatMap((relatedPage) => {
+          return collectLogs(relatedPage)
+        })
 
         // Advance cursors after collecting so next sinceLastCall call starts fresh
         if (sinceLastCall) {
-          const pagesToAdvance = filterPage
-            ? this.pagesRelatedToPage(filterPage)
-            : [...this.browserLogs.keys()]
-          for (const p of pagesToAdvance) {
+          for (const p of relatedPages) {
             const logs = this.browserLogs.get(p)
             if (logs) {
               this.pageLogCursor.set(p, logs.length)
@@ -1456,9 +1853,9 @@ export class PlaywrightExecutor {
       }
 
       const inspectPinnedElement = async (pageUrl: string, elementExpression: string) => {
-        const targetPage = context.pages().find((candidate) => candidate.url() === pageUrl) || context.pages()[0]
+        const targetPage = context.pages().findLast((candidate) => candidate.url() === pageUrl)
         if (!targetPage) {
-          throw new Error('No Playwright pages are available')
+          throw new Error(`No Playwriter tab with url ${pageUrl}. Enable Playwriter on that tab and pin the element again.`)
         }
 
         this.userState.page = targetPage
@@ -1492,8 +1889,9 @@ export class PlaywrightExecutor {
         return result
       }
 
-      const screenshotWithAccessibilityLabelsFn = async (options: { page: Page; interactiveOnly?: boolean }) => {
-        return screenshotWithAccessibilityLabels({
+      const screenshotWithAccessibilityLabelsFn = async (options: { page: Page; interactiveOnly?: boolean }): Promise<void> => {
+        const targetPage = resolveSandboxPage({ helper: 'screenshotWithAccessibilityLabels', page: options?.page })
+        const { refToLocator } = await screenshotWithAccessibilityLabels({
           ...options,
           collector: screenshotCollector,
           logger: {
@@ -1505,17 +1903,15 @@ export class PlaywrightExecutor {
             },
           },
         })
+        // Labels show these refs, so refToLocator must resolve them, not an older snapshot's
+        this.lastRefToLocator.set(targetPage, refToLocator)
       }
 
-      // Screen recording functions (via chrome.tabCapture in extension - survives navigation)
-      // Recording uses chrome.tabCapture which requires activeTab permission.
-      // This permission is granted when the user clicks the Playwriter extension icon on a tab.
-      const relayPort = this.cdpConfig.port || 19988
       const self = this
       const ghostCursorController = this.ghostCursorController
 
       const showGhostCursor = async (options?: ({ page?: Page } & GhostCursorClientOptions)) => {
-        const targetPage = options?.page || page
+        const targetPage = resolveSandboxPage({ helper: 'ghostCursor.show', page: options?.page })
         const cursorOptions: GhostCursorClientOptions | undefined = (() => {
           if (!options) {
             return undefined
@@ -1529,15 +1925,26 @@ export class PlaywrightExecutor {
       }
 
       const hideGhostCursor = async (options?: { page?: Page }) => {
-        const targetPage = options?.page || page
+        const targetPage = resolveSandboxPage({ helper: 'ghostCursor.hide', page: options?.page })
         await ghostCursorController.hide({ page: targetPage })
       }
 
+      // Screen recording (native Page.startScreenRecording) and RTMP streaming (screencast), see screen-recording.ts
+      const captureLogger = {
+        log: (...args: unknown[]) => {
+          this.logger.log('[playwriter]', ...args)
+        },
+        error: (...args: unknown[]) => {
+          this.logger.error('[playwriter]', ...args)
+        },
+      }
       const recordingApi = createRecordingApi({
-        context,
-        defaultPage: page,
-        relayPort,
         ghostCursorController,
+        logger: captureLogger,
+        cwd: self.sessionCwd,
+        onWarning: (message) => {
+          self.enqueueWarning(message)
+        },
         onStart: () => {
           self.recordingStartedAt = Date.now()
           self.executionTimestamps = []
@@ -1551,17 +1958,17 @@ export class PlaywrightExecutor {
         },
       })
 
-      // Live RTMP streaming: pipes tabCapture chunks to ffmpeg in the relay
-      // process. Streams keep running after execute() returns and CLI exits.
-      const streamApi = createStreamApi({
-        defaultPage: page,
-        relayPort,
-      })
+      const streamApi = createStreamApi({ logger: captureLogger })
 
       // Ghost Browser API - creates chrome object that mirrors Ghost Browser's APIs
       // See extension/src/ghost-browser-api.d.ts for full API documentation
       const chromeGhostBrowser = createGhostBrowserChrome(async (namespace, method, args) => {
-        const cdp = await getCDPSession({ page })
+        // The relay handles 'ghost-browser' on any session; a tab is only the transport.
+        const transportPage = context.pages().find((p) => !p.isClosed())
+        if (!transportPage) {
+          throw new Error('Ghost Browser API needs at least one Playwriter tab. Create one with `state.page = await context.newPage()`.')
+        }
+        const cdp = await getCDPSession({ page: transportPage })
         const result = await cdp.send('ghost-browser' as any, { namespace, method, args })
         const typed = result as GhostBrowserCommandResult
         if (!typed.success) {
@@ -1571,21 +1978,95 @@ export class PlaywrightExecutor {
       })
 
 
+      const sandboxedGetBuiltinModule = (id: string) => {
+        if (!ALLOWED_MODULES.has(id)) {
+          throw Object.assign(
+            new Error(
+              `Module "${id}" is not allowed in the sandbox. ` +
+                `Only safe Node.js built-ins are permitted: ${[...ALLOWED_MODULES].filter((m) => !m.startsWith('node:')).join(', ')}`,
+            ),
+            { name: 'ModuleNotAllowedError' },
+          )
+        }
+        if (id === 'fs' || id === 'node:fs') {
+          return self.scopedFs
+        }
+        return process.getBuiltinModule(id)
+      }
+
+      const DEFAULT_INSPECT_PROPS = ['overflow-y', 'overflow-x', 'position', 'max-height', 'display', 'flex-direction', 'flex-shrink']
+      const INSPECT_ARIA = ['aria-expanded', 'aria-selected', 'aria-hidden', 'aria-disabled', 'aria-checked', 'aria-pressed', 'aria-current']
+
+      const inspect = async (options: { locator: Locator; properties?: string[] }) => {
+        const { locator, properties } = options
+        const box = await locator.boundingBox()
+        const boxStr = box ? `x=${Math.round(box.x)} y=${Math.round(box.y)} w=${Math.round(box.width)} h=${Math.round(box.height)}` : 'not visible'
+        const domInfo = await locator.evaluate((el, args) => {
+          const cs = window.getComputedStyle(el as any)
+          const h = el as any
+          const tag = el.tagName.toLowerCase()
+          const cls = (el.getAttribute('class') || '').split(/\s+/).filter(Boolean)[0]
+          const lines = [
+            `Element: ${cls ? tag + '.' + cls : tag}`,
+            `Box: ${args.box}`,
+            `Children: ${el.children.length}  Text length: ${(el.textContent || '').trim().length}`,
+            `Scroll Y: size=${el.scrollHeight} client=${el.clientHeight} overflowing=${el.scrollHeight > el.clientHeight} top=${el.scrollTop}`,
+            `Scroll X: size=${el.scrollWidth} client=${el.clientWidth} overflowing=${el.scrollWidth > el.clientWidth} left=${el.scrollLeft}`,
+            `Styles: ${args.props.map((p: string) => `${p}=${cs.getPropertyValue(p) || 'unset'}`).join(' ')}`,
+          ]
+          // Visibility (only non-defaults)
+          const vis = [
+            cs.opacity !== '1' && `opacity=${cs.opacity}`,
+            cs.visibility !== 'visible' && `visibility=${cs.visibility}`,
+            cs.pointerEvents !== 'auto' && `pointer-events=${cs.pointerEvents}`,
+            !args.hasBox && 'not rendered',
+          ].filter(Boolean)
+          if (vis.length) lines.push(`Visibility: ${vis.join(' ')}`)
+          // Input state (form controls only)
+          if (el.matches('input, textarea, select, button, option')) {
+            const parts = [
+              el.matches('input, textarea, select, option') && `value="${String(h.value).slice(0, 200)}"`,
+              el.matches('input') && 'checked' in h && `checked=${h.checked}`,
+              h.disabled && 'disabled',
+              h.readOnly && 'readOnly',
+            ].filter(Boolean)
+            if (parts.length) lines.push(`Input: ${parts.join(' ')}`)
+          }
+          // Aria attributes (only ones that are set)
+          const aria = args.aria.map((a: string) => { const v = el.getAttribute(a); return v !== null ? `${a}=${v}` : null }).filter(Boolean)
+          if (aria.length) lines.push(`Aria: ${aria.join(' ')}`)
+          return lines.join('\n')
+        }, { props: properties?.length ? properties : DEFAULT_INSPECT_PROPS, aria: INSPECT_ARIA, box: boxStr, hasBox: !!box })
+        return domInfo
+      }
+
       let vmContextObj: any = {
-        page,
         context,
         browser: this.browser,
         state: this.userState,
+        signal: abortController.signal,
         console: customConsole,
         snapshot,
         accessibilitySnapshot: snapshot, // backward compat alias
+        inspect,
         refToLocator,
-        getCleanHTML,
-        getPageMarkdown,
+        getCleanHTML: (options: GetCleanHTMLOptions) => {
+          if (!options?.locator) {
+            throw new Error("getCleanHTML requires { locator }, e.g. getCleanHTML({ locator: state.page }) or getCleanHTML({ locator: state.page.locator('main') }).")
+          }
+          return getCleanHTML(options)
+        },
+        getPageMarkdown: (options: GetPageMarkdownOptions) => {
+          resolveSandboxPage({ helper: 'getPageMarkdown', page: options?.page })
+          return getPageMarkdown(options)
+        },
         getLocatorStringForElement,
         getLatestLogs,
         clearAllLogs,
-        waitForPageLoad,
+        waitForPageLoad: (options: WaitForPageLoadOptions) => {
+          resolveSandboxPage({ helper: 'waitForPageLoad', page: options?.page })
+          return waitForPageLoad(options)
+        },
         getCDPSession,
         createDebugger,
         createEditor,
@@ -1605,52 +2086,91 @@ export class PlaywrightExecutor {
         recording: {
           start: recordingApi.start,
           stop: recordingApi.stop,
-          isRecording: recordingApi.isRecording,
-          cancel: recordingApi.cancel,
         },
         stream: {
           start: streamApi.start,
           stop: streamApi.stop,
           status: streamApi.status,
         },
-        // Backward-compatible aliases
-        startRecording: recordingApi.start,
-        stopRecording: recordingApi.stop,
-        isRecording: recordingApi.isRecording,
-        cancelRecording: recordingApi.cancel,
+        cloud: this.enableCloudScope
+          ? createCloudScope({ auth: this.cloudAuth })
+          : undefined,
         createDemoVideo,
         resetPlaywright: async () => {
-          const { page: newPage, context: newContext } = await self.reset()
-          vmContextObj.page = newPage
+          const { context: newContext } = await self.resetInternal()
           vmContextObj.context = newContext
           vmContextObj.browser = self.browser
-          return { page: newPage, context: newContext }
+          vmContextObj.state = self.userState
+          return { context: newContext }
         },
         require: this.sandboxedRequire,
-        import: (specifier: string) => import(specifier),
+        // Restricted alternative to native import() for allowlisted built-ins.
+        importModule: (specifier: string) => {
+          if (!ALLOWED_MODULES.has(specifier)) {
+            throw Object.assign(
+              new Error(
+                `Module "${specifier}" is not allowed in the sandbox. ` +
+                  `Only safe Node.js built-ins are permitted: ${[...ALLOWED_MODULES].filter((m) => !m.startsWith('node:')).join(', ')}`,
+              ),
+              { name: 'ModuleNotAllowedError' },
+            )
+          }
+          if (specifier === 'fs' || specifier === 'node:fs') {
+            return Promise.resolve(this.scopedFs)
+          }
+          return import(specifier)
+        },
         // Ghost Browser API - only works in Ghost Browser, mirrors chrome.ghostPublicAPI etc
         chrome: chromeGhostBrowser,
         ...usefulGlobals,
+        ...this.sandboxTimerGlobals,
         // Expose process with safety overrides:
         // - cwd() returns the session's cwd instead of the relay server's cwd
         // - exit() is blocked to prevent killing the relay server
         // - chdir() is blocked to prevent affecting other sessions
+        // - getBuiltinModule() is blocked because it bypasses ALLOWED_MODULES (issue #105)
+        //   Uses getOwnPropertyDescriptor trap too, otherwise
+        //   Object.getOwnPropertyDescriptor(process, 'getBuiltinModule').value() bypasses get trap
         process: new Proxy(process, {
           get(target, prop, receiver) {
             if (prop === 'cwd') return () => self.sessionCwd || target.cwd()
             if (prop === 'exit') return () => { throw new Error('process.exit() is not allowed in the sandbox') }
             if (prop === 'chdir') return () => { throw new Error('process.chdir() is not allowed in the sandbox, use a new session with a different cwd instead') }
+            if (prop === 'getBuiltinModule') return sandboxedGetBuiltinModule
             return Reflect.get(target, prop, receiver)
+          },
+          // Prevent Object.getOwnPropertyDescriptor(process, 'getBuiltinModule').value()
+          // from bypassing the Proxy get trap
+          getOwnPropertyDescriptor(target, prop) {
+            const desc = Object.getOwnPropertyDescriptor(target, prop)
+            if (!desc) return desc
+            if (prop === 'getBuiltinModule') {
+              return { ...desc, value: sandboxedGetBuiltinModule }
+            }
+            return desc
           },
         }),
       }
 
       const vmContext = vm.createContext(vmContextObj)
+      // No default page: reading `page` throws so agents pick or create their own tab.
+      // Defined inside the context because vm swallows errors thrown by host-side sandbox getters
+      // (the global would just read as "page is not defined").
+      vm.runInContext(
+        `Object.defineProperty(globalThis, 'page', { get() { throw new Error(${JSON.stringify(PAGE_GLOBAL_REMOVED_ERROR)}) } })`,
+        vmContext,
+      )
+      const sandboxEntryPath = path.join(this.sessionCwd || process.cwd(), SANDBOX_FILENAME)
       const autoReturnExpr = getAutoReturnExpression(code)
       const wrappedCode = autoReturnExpr !== null
         ? `(async () => { return await (${autoReturnExpr}) })()`
         : `(async () => { ${code} })()`
       const hasExplicitReturn = autoReturnExpr !== null || /\breturn\b/.test(code)
+      // Native imports use normal Node permissions and resolve from the session cwd.
+      const script = new vm.Script(wrappedCode, {
+        filename: sandboxEntryPath,
+        importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
+      })
 
       // Track execution timestamps relative to recording start (seconds).
       // Used to identify idle gaps that can be sped up in demo videos.
@@ -1660,13 +2180,38 @@ export class PlaywrightExecutor {
         ? (Date.now() - recordingStartSnapshot) / 1000
         : -1
 
+      scriptStartedAt = Date.now()
+      this.navigatedPages = new Set()
       const result = await (async () => {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        let onCallerAbort: (() => void) | undefined
         try {
+          const chromium = await getChromium({ patchright: this.patchright })
+          // Runs in this executor's async context, so a forgotten await becomes a warning in this session.
+          const runScript = () =>
+            runAsFaultOwner({ owner: this, run: () => script.runInContext(vmContext, { timeout, displayErrors: true }) })
           return await Promise.race([
-            vm.runInContext(wrappedCode, vmContext, { timeout, displayErrors: true }),
-            new Promise((_, reject) => setTimeout(() => reject(new CodeExecutionTimeoutError(timeout)), timeout)),
+            chromium.runWithAbortSignal(abortController.signal, runScript),
+            new Promise((_, reject) => {
+              // The race does not stop the script. Abort it so its running and later Playwright calls fail.
+              const stop = (error: Error) => {
+                abortController.abort(error)
+                reject(error)
+              }
+              timer = setTimeout(() => {
+                stop(new CodeExecutionTimeoutError(timeout))
+              }, timeout)
+              onCallerAbort = () => {
+                stop(new ExecuteCancelledError())
+              }
+              signal?.addEventListener('abort', onCallerAbort, { once: true })
+            }),
           ])
         } finally {
+          clearTimeout(timer)
+          if (onCallerAbort) {
+            signal?.removeEventListener('abort', onCallerAbort)
+          }
           // Record timestamp even on error — the execution still occupied real time
           // that should not be sped up in the demo video.
           // Compare against snapshot to avoid cross-session contamination if
@@ -1678,11 +2223,9 @@ export class PlaywrightExecutor {
         }
       })()
 
-      let responseText = formatConsoleLogs(consoleLogs)
-
+      let returnText = ''
       let returnValue: JsonValue | undefined
       let formattedReturnValue: string | null = null
-
       // Only show return value if user explicitly used return
       if (hasExplicitReturn) {
         const resolvedResult = isPromise(result) ? await result : result
@@ -1693,43 +2236,30 @@ export class PlaywrightExecutor {
         // See issue #82.
         if (resolvedResult !== undefined && !isPlaywrightChannelOwner(resolvedResult)) {
           returnValue = toJsonReturnValue(resolvedResult)
-          const formatted =
-            typeof resolvedResult === 'string'
-              ? resolvedResult
-              : util.inspect(resolvedResult, {
-                  depth: 4,
-                  colors: false,
-                  maxArrayLength: 100,
-                  maxStringLength: 1000,
-                  breakLength: 80,
-                })
+          const formatted = formatValue(resolvedResult)
           if (formatted.trim()) {
             formattedReturnValue = formatted
-            responseText += `[return value] ${formatted}\n`
+            returnText = `[return value] ${formatted}\n`
           }
         }
       }
 
-      const warningText = this.flushWarningsForScope(warningScope)
-      responseText += warningText
+      await this.reportBotChallenges({ pages: this.navigatedPages, deadline: challengeDeadline(), signal })
 
-      if (!responseText.trim()) {
-        responseText = 'Code executed successfully (no output)'
-      }
-
-      const finalText = truncateOutput(responseText)
-      const executionConsoleEvents = buildConsoleEvents()
-      const agentText = truncateOutput(
-        [
-          presentExecutionConsoleEvents(executionConsoleEvents),
-          formattedReturnValue && executionConsoleEvents.length === 0
-            ? `[return value] ${formattedReturnValue}`
-            : '',
-          warningText.trim(),
-        ]
-          .filter(Boolean)
-          .join('\n\n') || 'Code executed successfully (no output)',
-      )
+      const outputText = this.flushOutputForScope(outputScope)
+      const responseText = boundExecuteOutput({
+        before: outputText + formatConsoleLogs({ logs: consoleLogs }),
+        after: returnText,
+      })
+      const finalText = responseText.trim() || 'Code executed successfully (no output)'
+      // Agent text keeps console lines without the debug header; the return value is shown only when nothing
+      // was logged, because structured consumers read it from returnValue.
+      const consoleEvents = buildConsoleEvents()
+      const agentText =
+        boundExecuteOutput({
+          before: [presentExecutionConsoleEvents(consoleEvents), outputText.trim()].filter(Boolean).join('\n\n'),
+          after: formattedReturnValue && consoleEvents.length === 0 ? `[return value] ${formattedReturnValue}` : '',
+        }).trim() || 'Code executed successfully (no output)'
 
       const images = [
         ...screenshotCollector.map((s) => ({ data: s.base64, mimeType: s.mimeType })),
@@ -1746,7 +2276,7 @@ export class PlaywrightExecutor {
       return {
         text: finalText,
         agentText,
-        consoleEvents: executionConsoleEvents,
+        consoleEvents,
         ...(returnValue !== undefined ? { returnValue } : {}),
         images,
         screenshots,
@@ -1754,18 +2284,44 @@ export class PlaywrightExecutor {
       }
     } catch (error: any) {
       const errorStack = error.stack || error.message
+      const isExecutionTimeout =
+        error instanceof CodeExecutionTimeoutError || error?.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT'
       const isTimeoutError =
-        error instanceof CodeExecutionTimeoutError || error?.name === 'TimeoutError' || error?.name === 'AbortError'
+        isExecutionTimeout ||
+        error instanceof ExecuteCancelledError ||
+        error?.name === 'TimeoutError' ||
+        error?.name === 'AbortError'
 
       this.logger.error('Error in execute:', errorStack)
 
-      const logsText = formatConsoleLogs(consoleLogs, 'Console output (before error)')
-      const warningText = this.flushWarningsForScope(warningScope)
+      // A failed action often means a challenge appeared, also without a navigation, so check state pages too.
+      if (this.navigatedPages && !(error instanceof ExecuteCancelledError)) {
+        const statePages = Object.values(this.userState).filter((value) => this.pagesWithListeners.has(value))
+        await this.reportBotChallenges({
+          pages: new Set([...this.navigatedPages, ...statePages]),
+          // The call already failed, often by timing out behind a captcha: allow one probe even with no time left.
+          deadline: Math.max(challengeDeadline(), Date.now() + PROBE_TIMEOUT_MS),
+          signal,
+        })
+      }
+
+      const logsText = formatConsoleLogs({ logs: consoleLogs, title: 'Console output (before error)' })
+      const outputText = this.flushOutputForScope(outputScope)
 
       // Cloud sessions: disconnection errors mean the VM expired or was destroyed.
       // Give a clear actionable message instead of a generic "call reset" hint.
       const isDisconnect = error instanceof Error && isDisconnectionError(error)
       const resetHint = (() => {
+        const message = error instanceof Error ? error.message : String(error)
+        if (/\b(?:Target|Page) crashed\b/i.test(message)) {
+          return '\n\n[HINT: This tab crashed. Create a new tab with context.newPage(), replace the crashed reference in state, and navigate to the intended URL. Do not reset the session or repeat the last script: first check whether its actions completed.]'
+        }
+        if (/Target page, context or browser has been closed/i.test(message) && this.browser?.isConnected()) {
+          return '\n\n[HINT: This page reference is closed, but the browser is connected. Select an open page from context.pages() or create one with context.newPage(), then replace the closed reference in state. Do not reset the whole session.]'
+        }
+        if (/net::ERR_/i.test(message)) {
+          return '\n\n[HINT: Navigation failed. Check page.url() and the network error before retrying. Do not reset the session or replay a script that may have submitted a form or changed data.]'
+        }
         if (isTimeoutError) return ''
         if (this.cloudSession && isDisconnect) {
           return `\n\n[Cloud browser expired or disconnected. Create a new session with: playwriter session new --browser cloud]`
@@ -1776,76 +2332,76 @@ export class PlaywrightExecutor {
       // timeout stacks are internal noise (Promise.race / setTimeout); only show the message
       const errorText = isTimeoutError ? error.message : errorStack
       const errorOutput = `Error executing code: ${errorText}${resetHint}`
-      const executionConsoleEvents = buildConsoleEvents()
+      const consoleEvents = buildConsoleEvents()
       return {
-        text: `${logsText}${warningText}\n${errorOutput}`,
-        agentText: truncateOutput(
-          [presentExecutionConsoleEvents(executionConsoleEvents), warningText.trim(), errorOutput]
-            .filter(Boolean)
-            .join('\n\n'),
-        ),
-        consoleEvents: executionConsoleEvents,
+        text: boundExecuteOutput({
+          before: outputText + logsText,
+          after: `\n${errorOutput}`,
+        }),
+        agentText: boundExecuteOutput({
+          before: [presentExecutionConsoleEvents(consoleEvents), outputText.trim()].filter(Boolean).join('\n\n'),
+          after: `\n\n${errorOutput}`,
+        }).trim(),
+        consoleEvents,
         images: [],
         screenshots: [],
         isError: true,
       }
+    } finally {
+      this.navigatedPages = null
     }
   }
 
-  // When extension is connected but has no pages, auto-create unless PLAYWRITER_AUTO_ENABLE=false disables it.
-  // In direct CDP mode, always create a page (no extension check needed).
-  private async ensurePageForContext(options: { context: BrowserContext; timeout: number }): Promise<Page> {
-    const { context, timeout } = options
-    const pages = context.pages().filter((p) => !p.isClosed())
-    if (pages.length > 0) {
-      return pages[0]
+  private async reportBotChallenges({
+    pages,
+    deadline,
+    signal,
+  }: {
+    pages: Set<Page> | null
+    deadline: number
+    signal?: AbortSignal
+  }) {
+    if (!pages || pages.size === 0) {
+      return
     }
-
-    // Direct CDP mode: always create a new page, no extension involved
-    if (this.isDirectCdpMode()) {
-      const page = await context.newPage()
-      this.setupPageListeners(page)
-      await page.waitForLoadState('domcontentloaded', { timeout }).catch(() => {})
-      return page
-    }
-
-    const extensionStatus = await this.checkExtensionStatus()
-    if (!extensionStatus.connected) {
-      throw new Error(EXTENSION_NOT_CONNECTED_ERROR)
-    }
-
-    if (!shouldAutoEnablePlaywriter()) {
-      const waitTimeoutMs = Math.min(timeout, 1000)
-      const startTime = Date.now()
-      while (Date.now() - startTime < waitTimeoutMs) {
-        const availablePages = context.pages().filter((p) => !p.isClosed())
-        if (availablePages.length > 0) {
-          return availablePages[0]
-        }
-        await new Promise((resolve) => setTimeout(resolve, 100))
+    const outcomes = await Promise.all(
+      [...pages].map((page) => {
+        return detectChallenge({ page, deadline, signal }).catch(() => undefined)
+      }),
+    )
+    for (const outcome of outcomes) {
+      if (!outcome) {
+        continue
       }
-      throw new Error(NO_PAGES_AVAILABLE_ERROR)
+      this.logger.log(`[Executor] Bot challenge ${outcome.status}: ${outcome.vendor} ${outcome.kind} after ${outcome.waitedMs}ms`)
+      const warning = challengeWarning(outcome)
+      if (warning) {
+        this.enqueueWarning(warning)
+      }
     }
-
-    const page = await context.newPage()
-    this.setupPageListeners(page)
-    const pageUrl = page.url()
-    if (pageUrl === 'about:blank') {
-      return page
-    }
-
-    // Avoid burning the full timeout on about:blank-like pages.
-    await page.waitForLoadState('domcontentloaded', { timeout }).catch(() => {})
-    return page
   }
 
-  /** Get info about current connection state */
-  getStatus(): { connected: boolean; pageUrl: string | null; pagesCount: number } {
-    return {
-      connected: this.isConnected,
-      pageUrl: this.page?.url() || null,
-      pagesCount: this.context?.pages().length || 0,
+  dispose(): Promise<void> {
+    if (this.disposePromise) {
+      return this.disposePromise
     }
+
+    this.disposing = true
+    this.disposePromise = this.runExclusive({
+      allowDuringDispose: true,
+      operation: async () => {
+        if (this.isHeadlessMode()) {
+          await this.closeHeadlessContext()
+        } else {
+          await this.browser?.close().catch((error) => {
+            this.logger.error('Error disconnecting deleted session:', error)
+          })
+          this.clearConnectionState()
+        }
+        this.clearExecutionState()
+      },
+    })
+    return this.disposePromise
   }
 
   /** Get keys of user-defined state */
@@ -1865,6 +2421,28 @@ export class PlaywrightExecutor {
       browser: this.sessionMetadata.browser,
       profile: this.sessionMetadata.profile,
       cwd: this.sessionCwd,
+      tabGroup: this.cdpConfig.tabGroup || null,
+      tabGroupColor: this.cdpConfig.tabGroupColor || null,
+      patchright: this.patchright,
+    }
+  }
+
+  getTabGroup(): string | null {
+    return this.cdpConfig.tabGroup || null
+  }
+
+  getTabGroupColor(): TabGroupColor | null {
+    return this.cdpConfig.tabGroupColor || null
+  }
+
+  /** Change the tab group future connections/tabs of this session use.
+   *  Existing relay clients are updated separately via updateClientsTabGroup.
+   *  Absent fields keep their current value. */
+  setTabGroupConfig({ tabGroup, tabGroupColor }: { tabGroup?: string; tabGroupColor?: TabGroupColor }): void {
+    this.cdpConfig = {
+      ...this.cdpConfig,
+      tabGroup: tabGroup ?? this.cdpConfig.tabGroup,
+      tabGroupColor: tabGroupColor ?? this.cdpConfig.tabGroupColor,
     }
   }
 }
@@ -1888,8 +2466,18 @@ export class ExecutorManager {
     sessionMetadata?: SessionMetadata
     /** Override cdpConfig for this session (e.g. direct CDP connection) */
     cdpConfig?: CdpConfig
+    /** Tab group title new tabs of this session join (extension mode only) */
+    tabGroup?: string
+    /** Explicit tab group color (extension mode only) */
+    tabGroupColor?: TabGroupColor
     /** Cloud session info (set when connecting to a Browser Use VM) */
     cloudSession?: CloudSessionInfo
+    /** Expose local-to-cloud cookie transfer in the execution scope */
+    enableCloudScope?: boolean
+    /** Cloud API credentials kept outside the execution scope */
+    cloudAuth?: CloudAuth
+    /** Connect with Patchright instead of Playwright */
+    patchright?: boolean
   }): PlaywrightExecutor {
     const { sessionId, cwd, sessionMetadata } = options
     let executor = this.executors.get(sessionId)
@@ -1899,7 +2487,12 @@ export class ExecutorManager {
         if (options.cdpConfig) {
           return options.cdpConfig
         }
-        const baseConfig = typeof this.cdpConfig === 'function' ? this.cdpConfig(sessionId) : this.cdpConfig
+        const baseConfig: CdpConfig = {
+          ...(typeof this.cdpConfig === 'function' ? this.cdpConfig(sessionId) : this.cdpConfig),
+          sessionId,
+          tabGroup: options.tabGroup || undefined,
+          tabGroupColor: options.tabGroupColor || undefined,
+        }
         if (sessionMetadata?.extensionId) {
           return { ...baseConfig, extensionId: sessionMetadata.extensionId }
         }
@@ -1911,14 +2504,49 @@ export class ExecutorManager {
         logger: this.logger,
         cwd,
         cloudSession: options.cloudSession,
+        enableCloudScope: options.enableCloudScope,
+        cloudAuth: options.cloudAuth,
+        patchright: options.patchright,
       })
       this.executors.set(sessionId, executor)
     }
     return executor
   }
 
-  deleteExecutor(sessionId: string): boolean {
-    return this.executors.delete(sessionId)
+  async deleteExecutor(sessionId: string): Promise<boolean> {
+    const executor = this.executors.get(sessionId)
+    if (!executor) {
+      return false
+    }
+    this.executors.delete(sessionId)
+    await executor.dispose()
+    return true
+  }
+
+  /** Delete headless sessions idle longer than idleTimeoutMs. The shared headless
+   *  Chrome closes with the last headless session. Returns the deleted session IDs. */
+  async deleteIdleHeadlessSessions({ idleTimeoutMs }: { idleTimeoutMs: number }): Promise<string[]> {
+    const deleted: string[] = []
+    for (const [sessionId, executor] of [...this.executors]) {
+      // Re-check per session: deleting earlier ones awaits, and new executes may start meanwhile
+      if (!executor.isHeadlessMode() || executor.idleMs() <= idleTimeoutMs) {
+        continue
+      }
+      if (await this.deleteExecutor(sessionId)) {
+        deleted.push(sessionId)
+      }
+    }
+    return deleted
+  }
+
+  async disposeAll(): Promise<void> {
+    const executors = [...this.executors.values()]
+    this.executors.clear()
+    await Promise.all(
+      executors.map((executor) => {
+        return executor.dispose()
+      }),
+    )
   }
 
   getSession(sessionId: string): PlaywrightExecutor | null {

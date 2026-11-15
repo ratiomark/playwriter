@@ -107,28 +107,38 @@ export class Debugger {
     if (this.debuggerEnabled) {
       return
     }
+    // Debugger.disable + enable re-emits scriptParsed. Runtime is shared with Playwright, keep it on.
     await this.cdp.send('Debugger.disable')
-    await this.cdp.send('Runtime.disable')
     this.scripts.clear()
-    const scriptsReady = new Promise<void>((resolve) => {
-      let timeout: ReturnType<typeof setTimeout>
-      const listener = () => {
-        clearTimeout(timeout)
-        timeout = setTimeout(() => {
-          this.cdp.off('Debugger.scriptParsed', listener)
-          resolve()
-        }, 100)
-      }
-      this.cdp.on('Debugger.scriptParsed', listener)
-      timeout = setTimeout(() => {
-        this.cdp.off('Debugger.scriptParsed', listener)
-        resolve()
-      }, 100)
-    })
     await this.cdp.send('Debugger.enable')
     await this.cdp.send('Runtime.enable')
     await this.cdp.send('Runtime.runIfWaitingForDebugger')
-    await scriptsReady
+    // Wait after enable. Chrome re-emits scriptParsed for already-loaded scripts
+    // only then. Starting the quiet timer before enable() returned empty lists
+    // when Debugger.enable took longer than 100ms.
+    await new Promise<void>((resolve) => {
+      let quietTimer: ReturnType<typeof setTimeout> | undefined
+      let settled = false
+      const finish = () => {
+        if (settled) {
+          return
+        }
+        settled = true
+        clearTimeout(quietTimer)
+        clearTimeout(maxTimer)
+        this.cdp.off('Debugger.scriptParsed', onParsed)
+        resolve()
+      }
+      const onParsed = () => {
+        clearTimeout(quietTimer)
+        quietTimer = setTimeout(finish, 100)
+      }
+      const maxTimer = setTimeout(finish, 500)
+      this.cdp.on('Debugger.scriptParsed', onParsed)
+      if (this.scripts.size > 0) {
+        quietTimer = setTimeout(finish, 100)
+      }
+    })
     this.debuggerEnabled = true
   }
 

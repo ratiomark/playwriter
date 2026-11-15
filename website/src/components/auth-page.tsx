@@ -33,6 +33,7 @@ export function AuthPage({
       <Head>
         <Head.Title>{`${title || 'Playwriter'}`}</Head.Title>
         <Head.Meta name="description" content={description} />
+        <Head.Meta name="robots" content="noindex" />
       </Head>
       <div className="flex w-full max-w-sm flex-col items-center gap-6 text-center">
         <Link href="/dashboard">

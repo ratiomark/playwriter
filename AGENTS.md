@@ -1,15 +1,24 @@
-<!-- This AGENTS.md file is generated. Look for an agents.md package.json script to see what files to update instead. -->
-
 this is the playwriter codebase
+
+Active plan: `plans/stealth-bench.md`. Read it before starting work.
+Decisions: `plans/decisions/`. Search them before designing or refactoring.
 
 the extension uses chrome.debugger to manage the user browser
 
 read ./README.md for an overview of how this extension and mcp work
 read playwriter/src/skill.md to understand the MCP docs (source of truth)
 
+keep playwriter/src/skill.md token-efficient. Keep tab-group instructions brief, use the shortest clear single-word names with no spaces, and do not document the tab group options of `playwriter session update` there (only `--patchright`).
+
 ## backward compatibility
 
 breaking changes to the WS protocol MUST never be made. publishing the extension code will never be instant, which means the extension must keep working with newer versions of the MCP and WS relay server.
+
+Chrome Web Store review can delay an extension release by days or weeks. Users can run a new CLI, MCP or relay with an old extension during this time. CLI, MCP and relay code MUST stay compatible with older extension versions:
+
+- never require a new extension message, command or field without a fallback
+- detect missing extension features at runtime, then fall back or show a clear "update the extension" error
+- ship the extension side of a feature first. Make the CLI depend on it only after the store has published that version
 
 ## architecture
 
@@ -71,10 +80,10 @@ to test CLI changes without publishing:
 
 ### reloading extension during development
 
-after making changes to extension code:
+after making changes to extension or playwriter code:
 
 ```bash
-pnpm --filter mcp-extension reload  # builds and opens chrome://extensions page
+pnpm reload  # builds playwriter, restarts the relay daemon, builds and opens chrome://extensions
 ```
 
 then click the reload button on the extension card in Chrome. the extension has a stable dev ID (`pebbngnfojnignonigcnkdilknapkgid`) so you don't need to reconfigure anything.
@@ -83,11 +92,43 @@ then click the reload button on the extension card in Chrome. the extension has 
 
 after EVERY change made inside extension/ folder you MUST bump the manifest.json version. then create a git tag with extension@version after committing.
 
-Do not manually edit CHANGELOG.md files for extension changes. If the extension change also affects a public package release note, add a changeset for that public package instead.
+Do not manually edit CHANGELOG.md files for extension changes. Always add a `playwriter` changeset for user-facing extension changes. Never skip a changeset because the files live in `extension/`.
+
+## telemetry
+
+anonymous usage events live in `playwriter/src/telemetry.ts` and use `@strada.sh/sdk`. add new events to the `TelemetryEvents` type and call `trackEvent()`, never `track()` directly. only the relay emits events. never send code, URLs, page content, emails, hostnames, or paths. error reporting is off on purpose.
+
+## menu copy
+
+menu titles say what the click does, so users discover features: `Record skill: record your clicks and typing for an agent`. keep the short feature name first (`Record skill`, `Share browser`) so docs still match. keep action toasts very short: `Copied prompt`, not a sentence.
+
+Playwriter UI lives in two places: the in-page toolbar on attached tabs (`extension/src/toolbar/toolbar.ts`, isolated world, closed shadow root) and Chrome menus (page right-click and extension icon right-click, see the `Menus` section in `extension/src/background.ts`). keep both in sync: they share recorder and Remote control state in background.ts. never add other injected buttons to pages.
 
 ## github releases
 
-after publishing the CLI (`playwriter` npm package), always create GitHub releases for both the CLI and the extension (if extension code changed).
+before publishing `playwriter`, check if the playwright fork has unreleased changes. if it does, publish `@xmorse/playwright-core` first (see the fork section below):
+
+```bash
+cd playwright
+LAST=$(git tag -l '@xmorse/playwright-core@*' --sort=-v:refname | head -1)
+git log --oneline "$LAST"..HEAD -- packages/playwright-core/
+```
+
+also check the `patchright-playwriter` submodule. if its built version is not on npm, or it has commits since the last publish, bump the version and publish `@playwriter/patchright-core` first with `pnpm publish` (see the patchright section below). `playwriter` depends on it with `workspace:^`, so pnpm writes the local version into the published package:
+
+```bash
+VERSION=$(node -p "require('./patchright-playwriter/playwright/packages/playwright-core/package.json').version")
+npm view "@playwriter/patchright-core@$VERSION" version  # empty: publish it first
+```
+
+after publishing the CLI (`playwriter` npm package), always create GitHub releases for both the CLI and the extension (if extension code changed). this is a manual step of every CLI release. `pnpm release` only builds the zip for the Chrome Web Store and never creates a GitHub release, so the extension GitHub release happens here, never skip it.
+
+check for unreleased extension changes against the last extension **GitHub release**, not the last `extension@` tag (tags are created on every manifest bump):
+
+```bash
+LAST=$(gh release list --limit 50 --json tagName -q '[.[] | select(.tagName | startswith("extension@"))][0].tagName')
+git log --oneline "$LAST"..HEAD -- extension/
+```
 
 **CLI release:**
 
@@ -110,16 +151,34 @@ rm -f playwriter-*.zip && cd extension/dist-release && zip -r ../../playwriter-$
 # create the release, uploading the zip as an asset
 VERSION=$(node -p "require('./extension/manifest.json').version")
 gh release create "extension@$VERSION" "playwriter-$VERSION.zip" --title "Extension $VERSION" --latest=false --notes "$(cat <<'EOF'
+> [!NOTE]
+> This version may not be on the Chrome Web Store yet. Store updates wait for Chrome review, which can take days.
+
 paste changelog entries here
 EOF
 )"
 ```
 
-read `extension/CHANGELOG.md` entries since the last extension GitHub release, merge them into a numbered list following the same changepub format (user-facing outcomes, sorted by relevance, no internal chores).
+always put the Chrome Web Store review note above at the top of extension release notes.
+
+read `extension/CHANGELOG.md` entries and the `extension/` commits since the last extension GitHub release, merge them into a numbered list following the same changepub format (user-facing outcomes, sorted by relevance, no internal chores).
 
 use `--latest=false` for extension releases so they don't override the CLI release as the "Latest" GitHub release. the CLI release should always be the latest one.
 
-### testing
+## testing
+
+### new worktree setup
+
+before running tests for the first time in a new worktree, run these commands from the repository root:
+
+```bash
+pnpm bootstrap
+pnpm --filter playwriter build
+```
+
+`pnpm bootstrap` builds `@playwriter/patchright-core` in the `patchright-playwriter` submodule (`pnpm patchright:build`: clones Playwright, applies patches, needs npm, takes a few minutes), generates Playwright's injected sources and builds the local `@xmorse/playwright-core` fork. the playwriter build then creates client bundles used by the extension test build.
+
+do not run only `pnpm playwright:build` in a fresh worktree. it needs `pnpm install` and the patchright build first. missing setup causes errors such as `Cannot find module 'esbuild'`, or unresolved `playwriter/dist/ghost-cursor-client.js?raw` and `playwriter/dist/bippy.js?raw` imports.
 
 ```bash
 pnpm test              # run all tests (takes ~90 seconds)
@@ -131,7 +190,7 @@ tests run against a real Chrome instance with the extension loaded.
 
 the test script passes `-u` to update inline snapshots automatically.
 
-#### test setup
+### test setup
 
 tests use these utilities from `test-utils.ts`:
 
@@ -167,7 +226,7 @@ const result = await client.callTool({
 })
 ```
 
-#### adding tests
+### adding tests
 
 tests live in `playwriter/src/*.test.ts`. add new tests to existing describe blocks or create new test files.
 
@@ -179,7 +238,7 @@ IMPORTANT: set bash timeout to at least 300000ms (5 minutes) when running `pnpm 
 
 to debug test failures, inspect the relay server log file. during tests, logs are written to `./relay-server.log` in the playwriter folder (not the system temp directory). contains extension, MCP and WS server logs with all CDP events.
 
-### project structure
+## project structure
 
 extension/ contains the chrome extension code. you need to run `pnpm build` to make it ready to be loaded in chrome. the extension folder chrome will use is extension/dist
 
@@ -226,27 +285,21 @@ when reviewing or writing cloud-api, scheduled, or any website code that touches
 
 ## changesets
 
-this repo uses Changesets for public package release notes and version bumps.
+**Always add a changeset before committing** any fix or feature. Same commit as the code. Never wait to be asked.
 
-For every fix or feature that affects a public package, add one `.changeset/*.md` file at the repo root. Do not edit package CHANGELOG.md files directly and do not manually bump public package versions; changesets are consumed at publish time to update versions and changelogs.
+Use `playwriter` for CLI, MCP, website, and extension user-facing changes. Use `@xmorse/playwright-core` when the fork API or behaviour changes. Do not list private packages such as `mcp-extension`.
 
-**Always add a changeset before committing** any fix or feature that touches a public package. The changeset must be included in the same commit as the code change, not added later.
-
-Use `patch` for fixes and `minor` for new features. Include every affected public package in the changeset frontmatter, for example `playwriter` or `@xmorse/playwright-core`. Skip private packages such as `mcp-extension`.
+Use `patch` for fixes and `minor` for new features. Do not edit CHANGELOG.md. Do not bump public package versions by hand.
 
 Before adding a changeset, run `gh issue list --state all --limit 20` and reference a matching issue with `Fixes #123` on its own line when the change fixes one.
 
-If a change touches extension code, still bump `extension/manifest.json` because Chrome extension releases are separate from npm package changesets.
+If a change touches extension code, still bump `extension/manifest.json`.
 
 ## debugging playwriter mcp issues
 
 sometimes the user will ask you to debug an mcp issue. to do this you may want to add logs to the mcp and server. to do this you will also need to restart the server so we use the latest code. restarting the mcp yourself is not possible. instead you will need to ask the user to do it or write a test case, where the mcp can be reloaded. also making changes in the extension will not work. you will have to write a test case for that to work. you can ask the user to reconnect these too. for reloading the extension you can run the `pnpm build` script and do `osascript -e 'tell application "Google Chrome" to open location "chrome://extensions/?id=pebbngnfojnignonigcnkdilknapkgid"'` to make it easier for the user to reload it
 
 if the problem was in the ws server you can restart that yourself killing process listening on 19988 and sending a new mcp call.
-
-## running playwriter cli locally
-
-to run the cli locally with your current changes call `tsx playwriter/src/cli.ts -e ...`. also make sure you kill process on 19988 first to make sure to use the latest relay executor code.
 
 # playwright fork submodule (@xmorse/playwright-core)
 
@@ -279,7 +332,7 @@ if you add runtime code (a new method, property, or type) to the fork without up
 1. **implement the runtime code**
    - client side: `playwright/packages/playwright-core/src/client/*.ts`
    - server side (if needed): `playwright/packages/playwright-core/src/server/*.ts`
-   - protocol (if it crosses the channel): `playwright/packages/protocol/src/channels.d.ts` + dispatchers
+   - protocol (if it crosses the channel): `playwright/packages/protocol/spec/*.yml` + dispatchers, then `node playwright/utils/generate_channels.js` (regenerates channels.d.ts and validator.ts)
 
 2. **add a doc entry in the markdown** — this is what the type generator reads
    - methods: `playwright/docs/src/api/class-page.md`, `class-browsercontext.md`, `class-locator.md`, etc.
@@ -328,7 +381,7 @@ if you add runtime code (a new method, property, or type) to the fork without up
 
 5. **rebuild playwright-core**
    ```bash
-   pnpm playwright:build  # 0.1s
+   pnpm playwright:build  # ~0.5s
    ```
 
 6. **add a changeset** for `@xmorse/playwright-core` describing the public API or behavior change
@@ -359,48 +412,36 @@ this does:
 
 1. `git submodule update --init` - init the playwright submodule
 2. `pnpm install` - install deps and link workspace packages
-3. `node playwright/utils/generate_injected.js` - generate browser scripts to `src/generated/`
-4. `node playwright/packages/playwright-core/build.mjs` - transpile (0.1s)
+3. `node playwright/packages/playwright-core/build.mjs` - generate injected scripts and bundle lib/ (~0.5s)
 
 ### rebuilding after changes
 
 after modifying playwright-core source:
 
 ```bash
-pnpm playwright:build  # 0.1s
+pnpm playwright:build  # ~0.5s
 ```
 
 ### how the simplified build works
 
-upstream playwright bundles all dependencies into single files (zero runtime deps). we skip this by using direct dependencies instead:
+the fork is upstream Playwright **1.64.1** (the same version `patchright-playwriter` builds), so both packages ship the same `types.d.ts`.
 
-**1. dependencies in package.json** - ws, debug, pngjs, commander, etc. are regular deps
+upstream builds the whole monorepo with `utils/build/build.js`. `playwright/packages/playwright-core/build.mjs` runs only the playwright-core part of it:
 
-**2. rewritten bundle files** - `playwright/packages/playwright-core/src/utilsBundle.ts`, `zipBundle.ts`, `mcpBundle.ts` import directly:
-
-```ts
-// before (bundled)
-export const ws = require('./utilsBundleImpl').ws
-
-// after (direct)
-import wsLibrary from 'ws'
-export const ws = wsLibrary
+```
+utils/generate_injected.js     → src/generated/*Source.ts (injected scripts)
+src/bootstrap.ts, entry/*, …   → lib/*.js (per file)
+src/utilsBundle.ts             → lib/utilsBundle.js   (all npm deps bundled)
+src/coreBundle.ts              → lib/coreBundle.js    (everything else, npm imports go through utilsBundle)
 ```
 
-**3. simple build script** (`playwright/packages/playwright-core/build.mjs`) - just esbuild transpile + copy vendored files:
+npm deps are `devDependencies` of `@xmorse/playwright-core` (versions from upstream root package.json), bundled like upstream, so the published package has no runtime deps. bare imports resolve from `playwright/packages/playwright-core/node_modules`.
 
-```bash
-# transpile src/**/*.ts → lib/**/*.js (0.1s)
-# copy third_party/lockfile.js, third_party/extract-zip.js
-```
-
-**4. generated files** - `playwright/packages/playwright-core/src/generated/*.ts` are browser scripts created by `playwright/utils/generate_injected.js`. these only need regenerating if upstream changes injected scripts.
-
-|              | upstream    | ours           |
-| ------------ | ----------- | -------------- |
-| build time   | ~30s        | 0.1s           |
-| dependencies | 0 (bundled) | ~20 (external) |
-| trace-viewer | built       | skipped        |
+|              | upstream | ours    |
+| ------------ | -------- | ------- |
+| build time   | minutes  | ~0.5s   |
+| dependencies | 0        | 0       |
+| trace-viewer | built    | skipped |
 
 ### key source files
 
@@ -431,9 +472,9 @@ do this when user asks to try framer iframes.
 
 # patchright-playwriter fork (@playwriter/patchright-core)
 
-we maintain a separate repo at https://github.com/remorses/patchright-playwriter that produces `@playwriter/patchright-core`. this package combines patchright's stealth patches (undetected Playwright, bypasses Cloudflare/Datadome/etc.) with our playwriter extensions.
+we maintain https://github.com/remorses/patchright-playwriter, the `./patchright-playwriter` submodule. it produces `@playwriter/patchright-core`: patchright's patches plus our playwriter extensions. `playwriter` uses it for `--patchright` sessions and depends on it with `workspace:^`. the built package is `patchright-playwriter/playwright/packages/playwright-core` (gitignored there, made by `pnpm patchright:build`).
 
-the fork lives at `~/Documents/GitHub/patchright-playwriter/`. read its `AGENTS.md` for full build, publish, and sync instructions.
+read its `AGENTS.md` for full build, publish, and sync instructions. commit and push submodule changes there first, then commit the submodule pointer here.
 
 ## applying new playwright fork changes to patchright-playwriter
 
@@ -441,13 +482,13 @@ when we add features or fixes to our playwright fork (the `./playwright` submodu
 
 1. find the last sync date by checking the patchright-playwriter repo's `playwriter.patch` header or commit history:
 ```bash
-cd ~/Documents/GitHub/patchright-playwriter
+cd patchright-playwriter
 git log --oneline -5
 ```
 
 2. in this repo, generate a diff of new changes since that date:
 ```bash
-cd ~/Documents/GitHub/playwriter/playwright
+cd playwright
 BASE=$(git merge-base HEAD upstream/main)
 git log --oneline $BASE..HEAD -- packages/playwright-core/src/ | head -20
 # generate the full diff
@@ -456,7 +497,7 @@ git diff $BASE..HEAD -- packages/playwright-core/src/ > /tmp/playwriter-changes.
 
 3. in the patchright-playwriter repo, rebuild from scratch then apply:
 ```bash
-cd ~/Documents/GitHub/patchright-playwriter
+cd patchright-playwriter
 bash utils/rebuild_local_package.sh
 cd playwright
 git apply --reject /tmp/playwriter-changes.patch
@@ -470,465 +511,3 @@ git log --oneline | head -5  # find the patchright-patches commit hash
 git diff <patchright-commit>..HEAD > ../playwriter.patch
 cd .. && git add playwriter.patch && git commit -m 'update playwriter.patch with latest changes'
 ```
-
-# core guidelines
-
-when summarizing changes at the end of the message, be super short, a few words and in bullet points, use bold text to highlight important keywords. use markdown.
-
-please ask questions and confirm assumptions before generating complex architecture code.
-
-NEVER run commands with & at the end to run them in the background. this is leaky and harmful! instead ask me to run commands in the background using tmux if needed.
-
-NEVER commit yourself unless asked to do so. I will commit the code myself.
-
-NEVER use git to revert files to previous state if you did not create those files yourself! there can be user changes in files you touched, if you revert those changes the user will be very upset!
-
-## files
-
-always use kebab case for new filenames. never use uppercase letters in filenames
-
-never write temporary files to /tmp. instead write them to a local ./tmp folder instead. make sure it is in .gitignore too
-
-## see files in the repo
-
-use `git ls-files | tree --fromfile` to see files in the repo. this command will ignore files ignored by git
-
-## handling unexpected file contents after a read or write
-
-if you find code that was not there since the last time you read the file it means the user or another agent edited the file. do not revert the changes that were added. instead keep them and integrate them with your new changes
-
-IMPORTANT: NEVER commit your changes unless clearly and specifically asked to!
-
-## opening me files in zed to show me a specific portion of code
-
-you can open files when i ask me "open in zed the line where ..." using the command `zed path/to/file:line`
-
-# typescript
-
-- ALWAYS use normal imports instead of dynamic imports, unless there is an issue with es module only packages and you are in a commonjs package (this is rare).
-- when throwing errors always use clause instead of error inside message: `new Error("wrapping error", { cause: e })` instead of `new Error(\`wrapping error ${e}\`)`
-
-- use a single object argument instead of multiple positional args: use object arguments for new typescript functions if the function would accept more than one argument, so it is more readable, ({a,b,c}) instead of (a,b,c). this way you can use the object as a sort of named argument feature, where order of arguments does not matter and it's easier to discover parameters.
-
-- always add the {} block body in arrow functions: arrow functions should never be written as `onClick={(x) => setState('')}`. NEVER. instead you should ALWAYS write `onClick={() => {setState('')}}`. this way it's easy to add new statements in the arrow function without refactoring it.
-
-- in array operations .map, .filter, .reduce and .flatMap are preferred over .forEach and for of loops. For example prefer doing `.push(...array.map(x => x.items))` over mutating array variables inside for loops. Always think of how to turn for loops into expressions using .map, .filter or .flatMap if you ever are about to write a for loop.
-
-- if you encounter typescript errors like "undefined | T is not assignable to T" after .filter(Boolean) operations: use a guarded function instead of Boolean: `.filter(isTruthy)`. implemented as `function isTruthy<T>(value: T): value is NonNullable<T> { return Boolean(value) }`
-
-- minimize useless comments: do not add useless comments if the code is self descriptive. only add comments if requested or if this was a change that i asked for, meaning it is not obvious code and needs some inline documentation. if a comment is required because the part of the code was result of difficult back and forth with me, keep it very short.
-
-- ALWAYS add all information encapsulated in my prompt to comments: when my prompt is super detailed and in depth, all this information should be added to comments in your code. this is because if the prompt is very detailed it must be the fruit of a lot of research. all this information would be lost if you don't put it in the code. next LLM calls would misinterpret the code and miss context.
-
-- NEVER write comments that reference changes between previous and old code generated between iterations of our conversation. do that in prompt instead. comments should be used for information of the current code. code that is deleted does not matter.
-
-- use early returns (and breaks in loops): do not nest code too much. follow the go best practice of if statements: avoid else, nest as little as possible, use top level ifs. minimize nesting. instead of doing `if (x) { if (b) {} }` you should do `if (x && b) {};` for example. you can always convert multiple nested ifs or elses into many linear ifs at one nesting level. use the @think tool for this if necessary.
-
-- typecheck after updating code: after any change to typescript code ALWAYS run the `pnpm typecheck` script of that package, or if there is no typecheck script run `pnpm tsc` yourself
-
-- do not use any: you must NEVER use any. if you find yourself using `as any` or `:any`, use the @think tool to think hard if there are types you can import instead. do even a search in the project for what the type could be. any should be used as a last resort.
-
-- NEVER do `(x as any).field` or `'field' in x` before checking if the code compiles first without it. the code probably doesn't need any or the in check. even if it does not compile, use think tool first! before adding (x as any).something, ALWAYS read the .d.ts to understand the types
-
-- do not declare uninitialized variables that are defined later in the flow. instead use an IIFE with returns. this way there is less state. also define the type of the variable before the iife. here is an example:
-
-- use || over in: avoid 'x' in obj checks. prefer doing `obj?.x || ''` over doing `'x' in obj ? obj.x : ''`. only use the in operator if that field causes problems in typescript checks because typescript thinks the field is missing, as a last resort.
-
-- when creating urls from a path and a base url, prefer using `new URL(path, baseUrl).toString()` instead of normal string interpolation. use type-safe react-router `href` or spiceflow `this.safePath` (available inside routes) if possible
-
-- for node built-in imports, never import singular exported names. instead do `import fs from 'node:fs'`, same for path, os, etc.
-
-- NEVER start the development server with pnpm dev yourself. there is no reason to do so, even with &
-
-- When creating classes do not add setters and getters for a simple private field. instead make the field public directly so user can get it or set it himself without abstractions on top
-
-- if you encounter typescript lint errors for an npm package, read the node_modules/package/\*.d.ts files to understand the typescript types of the package. if you cannot understand them, ask me to help you with it.
-
-- NEVER silently suppress errors in catch {} blocks if they contain more than one function call
-```ts
-// BAD. DO NOT DO THIS
-let favicon: string | undefined;
-if (docsConfig?.favicon) {
-  if (typeof docsConfig.favicon === "string") {
-    favicon = docsConfig.favicon;
-  } else if (docsConfig.favicon?.light) {
-    // Use light favicon as default, could be enhanced with theme detection
-    favicon = docsConfig.favicon.light;
-  }
-}
-// DO THIS. use an iife. Immediately Invoked Function Expression
-const favicon: string = (() => {
-  if (!docsConfig?.favicon) {
-    return "";
-  }
-  if (typeof docsConfig.favicon === "string") {
-    return docsConfig.favicon;
-  }
-  if (docsConfig.favicon?.light) {
-    // Use light favicon as default, could be enhanced with theme detection
-    return docsConfig.favicon.light;
-  }
-  return "";
-})();
-// if you already know the type use it:
-const favicon: string = () => {
-  // ...
-};
-```
-
-- when a package has to import files from another packages in the workspace never add a new tsconfig path, instead add that package as a workspace dependency using `pnpm i "package@workspace:*"`
-
-NEVER use require. always esm imports
-
-always try to use non-relative imports. each package has an absolute import with the package name, you can find it in the tsconfig.json paths section. for example, paths inside website can be imported from website. notice these paths also need to include the src directory.
-
-this is preferable to other aliases like @/ because i can easily move the code from one package to another without changing the import paths. this way you can even move a file and import paths do not change much.
-
-always specify the type when creating arrays, especially for empty arrays. if you don't, typescript will infer the type as `never[]`, which can cause type errors when adding elements later.
-
-**Example:**
-
-```ts
-// BAD: Type will be never[]
-const items = [];
-
-// GOOD: Specify the expected type
-const items: string[] = [];
-const numbers: number[] = [];
-const users: User[] = [];
-```
-
-remember to always add the explicit type to avoid unexpected type inference.
-
-- when using nodejs APIs like fs always import the module and not the named exports. I prefer hacing nodejs APIs accessed on the module namspace like fs, os, path, etc.
-
-DO `import fs from 'fs'; fs.writeFileSync(...)`
-DO NOT `import { writeFileSync } from 'fs';`
-
-- NEVER pass a string to abortController.abort(). instead if you want to pass a reason always pass an Error instance. like `controller.abort(new Error('reason'))`. This way catch blocks receive an Error instance and not something else.
-
-# package manager: pnpm with workspace
-
-this project uses pnpm workspaces to manage dependencies. important scripts are in the root package.json or various packages' package.json
-
-try to run commands inside the package folder that you are working on. for example you should never run `pnpm test` from the root
-
-if you need to install packages always use pnpm
-
-instead of adding packages directly in package.json use `pnpm install package` inside the right workspace folder. NEVER manually add a package by updating package.json
-
-## updating a package
-
-when i ask you to update a package always run `pnpm update -r packagename`. to update to latest also add --latest
-
-Do not do `pnpm add packagename` to update a package. only to add a missing one. otherwise other packages versions will get out of sync.
-
-## fixing duplicate pnpm dependencies
-
-sometimes typescript will fail if there are 2 duplicate packages in the workspace node_modules. this can happen in pnpm if a package is used in 2 different places (even if inside a node_module package, transitive dependency) with a different set of versions for a peer dependency
-
-for example if better-auth depends on zod peer dep and zod is in different versions in 2 dependency subtrees
-
-to identify if a pnpm package is duplicated, search for the string " packagename@" inside `pnpm-lock.yaml`, notice the space in the search string. then if the result returns multiple instances with a different set of peer deps inside the round brackets, it means that this package is being duplicated. here is an example of a package getting duplicated:
-
-```
-
-  better-auth@1.3.6(react-dom@19.1.1(react@19.1.1))(react@19.1.1)(zod@3.25.76):
-    dependencies:
-      '@better-auth/utils': 0.2.6
-      '@better-fetch/fetch': 1.1.18
-      '@noble/ciphers': 0.6.0
-      '@noble/hashes': 1.8.0
-      '@simplewebauthn/browser': 13.1.2
-      '@simplewebauthn/server': 13.1.2
-      better-call: 1.0.13
-      defu: 6.1.4
-      jose: 5.10.0
-      kysely: 0.28.5
-      nanostores: 0.11.4
-      zod: 3.25.76
-    optionalDependencies:
-      react: 19.1.1
-      react-dom: 19.1.1(react@19.1.1)
-
-  better-auth@1.3.6(react-dom@19.1.1(react@19.1.1))(react@19.1.1)(zod@4.0.17):
-    dependencies:
-      '@better-auth/utils': 0.2.6
-      '@better-fetch/fetch': 1.1.18
-      '@noble/ciphers': 0.6.0
-      '@noble/hashes': 1.8.0
-      '@simplewebauthn/browser': 13.1.2
-      '@simplewebauthn/server': 13.1.2
-      better-call: 1.0.13
-      defu: 6.1.4
-      jose: 5.10.0
-      kysely: 0.28.5
-      nanostores: 0.11.4
-      zod: 4.0.17
-    optionalDependencies:
-      react: 19.1.1
-      react-dom: 19.1.1(react@19.1.1)
-
-```
-
-as you can see, better-auth is listed twice with different sets of peer deps. in this case it's because of zod being in version 3 and 4 in two subtrees of our workspace dependencies.
-
-as a first step, try running `pnpm dedupe better-auth` with your package name and see if there is still the problem.
-
-below i will describe how to generally deduplicate a package. i will use zod as an example. it works with any dependency found in the previous step.
-
-to deduplicate the package, we have to make sure we only have 1 version of zod installed in your workspace. DO NOT use overrides for this. instead, fix the problem by manually updating the dependencies that are forcing the older version of zod in the dependency tree.
-
-to do so, we first have to run the command `pnpm -r why zod@3.25.76` to see the reason the older zod version is installed. in this case, the result is something like this:
-
-```
-
-website /Users/morse/Documents/GitHub/holocron/website (PRIVATE)
-
-dependencies:
-@better-auth/stripe 1.2.10
-├─┬ better-auth 1.3.6
-│ └── zod 3.25.76 peer
-└── zod 3.25.76
-db link:../db
-└─┬ docs-website link:../docs-website
-  ├─┬ fumadocs-docgen 2.0.1
-  │ └── zod 3.25.76
-  ├─┬ fumadocs-openapi link:../fumadocs/packages/openapi
-  │ └─┬ @modelcontextprotocol/sdk 1.17.3
-  │   ├── zod 3.25.76
-  │   └─┬ zod-to-json-schema 3.24.6
-  │     └── zod 3.25.76 peer
-  └─┬ searchapi link:../searchapi
-    └─┬ agents 0.0.109
-      ├─┬ @modelcontextprotocol/sdk 1.17.3
-      │ ├── zod 3.25.76
-      │ └─┬ zod-to-json-schema 3.24.6
-      │   └── zod 3.25.76 peer
-      └─┬ ai 4.3.19
-        ├─┬ @ai-sdk/provider-utils 2.2.8
-        │ └── zod 3.25.76 peer
-        └─┬ @ai-sdk/react 1.2.12
-          ├─┬ @ai-sdk/provider-utils 2.2.8
-          │ └── zod 3.25.76 peer
-          └─┬ @ai-sdk/ui-utils 1.2.11
-            └─┬ @ai-sdk/provider-utils 2.2.8
-              └── zod 3.25.76 peer
-```
-
-here we can see zod 3 is installed because of @modelcontextprotocol/sdk, @better-auth/stripe and agents packages. to fix the problem, we can run
-
-```
-pnpm update -r --latest  @modelcontextprotocol/sdk @better-auth/stripe agents
-```
-
-this way, if these packages include the newer version of the dependency, zod will be deduplicated automatically.
-
-in this case, we could have only updated @better-auth/stripe to fix the issue too, that's because @better-auth/stripe is the one that has better-auth as a peer dep. but finding what is the exact problematic package is difficult, so it is easier to just update all packages you notice that we depend on directly in our workspace package.json files.
-
-if after doing this we still have duplicate packages, you will have to ask the user for help. you can try deleting the node_modules and restarting the approach, but it rarely helps.
-
-# testing
-
-.toMatchInlineSnapshot is the preferred way to write tests. leave them empty the first time, update them with -u. check git diff for the test file every time you update them with -u
-
-never use timeouts longer than 5 seconds for expects and other statements timeouts. increase timeouts for tests if required, up to 1 minute
-
-do not create dumb tests that test nothing. do not write tests if there is not already a test file or describe block for that function or module.
-
-if the inputs for the tests is an array of repetitive fields and long content, generate this input data programmatically instead of hardcoding everything. only hardcode the important parts and generate other repetitive fields in a .map or .reduce
-
-tests should validate complex and non-obvious logic. if a test looks like a placeholder, do not add it.
-
-use vitest or bun test to run tests. tests should be run from the current package directory and not root. try using the test script instead of vitest directly. additional vitest flags can be added at the end, like --run to disable watch mode or -u to update snapshots.
-
-to understand how the code you are writing works, you should add inline snapshots in the test files with expect().toMatchInlineSnapshot(), then run the test with `pnpm test -u --run` or `pnpm vitest -u --run` to update the snapshot in the file, then read the file again to inspect the result. if the result is not expected, update the code and repeat until the snapshot matches your expectations. never write the inline snapshots in test files yourself. just leave them empty and run `pnpm test -u --run` to update them.
-
-> always call `pnpm vitest` or `pnpm test` with `--run` or they will hang forever waiting for changes!
-> ALWAYS read back the test if you use the `-u` option to make sure the inline snapshots are as you expect.
-
-- NEVER write the snapshots content yourself in `toMatchInlineSnapshot`. instead leave it as is and call `pnpm test -u` to fill in snapshots content. the first time you call `toMatchInlineSnapshot()` you can leave it empty
-
-- when updating implementation and `toMatchInlineSnapshot` should change, DO NOT remove the inline snapshots yourself, just run `pnpm test -u` instead! This will replace contents of the snapshots without wasting time doing it yourself.
-
-- for very long snapshots you should use `toMatchFileSnapshot(filename)` instead of `toMatchInlineSnapshot()`. put the snapshot files in a snapshots/ directory and use the appropriate extension for the file based on the content
-
-never test client react components. only React and browser independent code. 
-
-most tests should be simple calls to functions with some expect calls, no mocks. test files should be called the same as the file where the tested function is being exported from.
-
-NEVER use mocks. the database does not need to be mocked, just use it. simply do not test functions that mutate the database if not asked.
-
-tests should strive to be as simple as possible. the best test is a simple `.toMatchInlineSnapshot()` call. these can be easily evaluated by reading the test file after the run passing the -u option. you can clearly see from the inline snapshot if the function behaves as expected or not.
-
-try to use only describe and test in your tests. do not use beforeAll, before, etc if not strictly required.
-
-NEVER write tests for react components or react hooks. NEVER write tests for react components. you will be fired if you do.
-
-sometimes tests work directly on database data, using prisma. to run these tests you have to use the package.json script, which will call `doppler run -- vitest` or similar. never run doppler cli yourself as you could delete or update production data. tests generally use a staging database instead.
-
-never write tests yourself that call prisma or interact with database or emails. for these, ask the user to write them for you.
-
-# changesets
-
-After completing a fix or feature for a **public package** (has `version` in package.json, not `private: true`), add a changeset file in `.changeset/` at the repo root. Never edit CHANGELOG.md directly; it is generated automatically at publish time when changesets are consumed.
-
-Never run the `changeset` CLI command interactively. Always create the file manually.
-
-Create a `.md` file with a random kebab-case name (e.g. `cool-lions-dance.md`):
-
-```md
----
-'package-name': patch
----
-
-Description of what changed, with code examples if applicable.
-```
-
-Multiple packages can be listed in one changeset:
-
-```md
----
-'spiceflow': minor
-'create-spiceflow': patch
----
-
-Add federation support for remote RSC components.
-```
-
-## rules
-
-- **Never use `major`.** Use `patch` for fixes and `minor` for new features.
-- **Never edit CHANGELOG.md directly.** It is generated from changesets at publish time.
-- **Never bump `package.json` version manually.** Versions are bumped automatically.
-- **Never run the changeset CLI.** Write the `.md` file yourself.
-- **Only public packages.** Skip changesets for packages marked `private: true` or without a `version` field.
-- **Present tense.** Write "add support for X", "fix bug with Y".
-- **One changeset per logical change.** Two unrelated changes get two files.
-
-## rich content
-
-Changeset descriptions become the public changelog. Write them as rich content aimed at end users:
-
-- Code examples showing new APIs or changed behavior
-- Migration steps if the user needs to update their code
-- Diagrams explaining architecture changes
-- Before/after comparisons
-
-## private packages
-
-For **private packages** (`private: true`, no version), skip changesets entirely. These do not get published.
-
-Load the `changesets` skill for full workflow details.
-
-# writing docs
-
-when generating a .md or .mdx file to document things, always add a frontmatter with title and description. also add a prompt field with the exact prompt used to generate the doc. use @ to reference files and urls and provide any context necessary to be able to recreate this file from scratch using a model. if you used urls also reference them. reference all files you had to read to create the doc. use yaml | syntax to add this prompt and never go over the column width of 80
-# github
-
-
-you can use the `gh` cli to do operations on github for the current repository. For example: open issues, open PRs, check actions status, read workflow logs, etc.
-
-## creating issues and pull requests
-
-when opening issues and pull requests with gh cli, never use markdown headings or sections. instead just use simple paragraphs, lists and code examples. be as short as possible while remaining clear and using good English.
-
-example:
-
-```bash
-gh issue create --title "Fix login timeout" --body "The login form times out after 5 seconds on slow connections. This affects users on mobile networks.
-
-Steps to reproduce:
-1. Open login page on 3G connection
-2. Enter credentials
-3. Click submit
-
-Expected: Login completes within 30 seconds
-Actual: Request times out after 5 seconds
-
-Error in console:
-\`\`\`bash
-Error: Request timeout at /api/auth/login
-\`\`\`"
-```
-
-## get current github repo
-
-`git config --get remote.origin.url`
-
-## checking status of latest github actions workflow run
-
-```bash
-gh run list # lists latest actions runs
-gh run watch <id> --exit-status # if workflow is in progress, wait for the run to complete. the actions run is finished when this command exits. Set a tiemout of at least 10 minutes when running this command
-gh pr checks --watch --fail-fast # watch for current branch pr ci checks to finish
-gh run view <id> --log-failed | tail -n 300 # read the logs for failed steps in the actions run
-gh run view <id> --log | tail -n 300 # read all logs for a github actions run
-```
-
-## responding to PR reviews and comments (gh-pr-review extension)
-
-```bash
-# view reviews and get thread IDs
-gh pr-review review view 42 -R owner/repo --unresolved
-
-# reply to a review comment
-gh pr-review comments reply 42 -R owner/repo \
-  --thread-id PRRT_kwDOAAABbcdEFG12 \
-  --body "Fixed in latest commit"
-
-# resolve a thread
-gh pr-review threads resolve 42 -R owner/repo --thread-id PRRT_kwDOAAABbcdEFG12
-```
-
-## reading github repos source code
-
-```sh
-opensrc zod # npm package name
-
-# Using github: prefix
-opensrc github:owner/repo
-
-# Using owner/repo shorthand
-opensrc facebook/react
-
-# Using full GitHub URL
-opensrc https://github.com/colinhacks/zod
-
-# Fetch a specific branch or tag
-opensrc owner/repo@v1.0.0
-opensrc owner/repo#main
-
-# Mix packages and repos
-```
-
-This will download the source code in ./opensrc. which should be put in .gitignore
-
-# playwright
-
-you can control the browser using the playwright mcp tools. these tools let you control the browser to get information or accomplish actions
-
-if i ask you to test something in the browser, know that the website dev server is already running at http://localhost:7664 for website and :7777 for docs-website (but docs-website needs to use the website domain specifically, for example name-hash.localhost:7777)
-# zod
-
-when you need to create a complex type that comes from a prisma table, do not create a new schema that tries to recreate the prisma table structure. instead just use `z.any() as ZodType<PrismaTable>)` to get type safety but leave any in the schema. this gets most of the benefits of zod without having to define a new zod schema that can easily go out of sync.
-
-## converting zod schema to jsonschema
-
-you MUST use the built in zod v4 toJSONSchema and not the npm package `zod-to-json-schema` which is outdated and does not support zod v4.
-
-```ts
-import { toJSONSchema } from "zod";
-
-const mySchema = z.object({
-  id: z.string().uuid(),
-  name: z.string().min(3).max(100),
-  age: z.number().min(0).optional(),
-});
-
-const jsonSchema = toJSONSchema(mySchema, {
-  removeAdditionalStrategy: "strict",
-});
-```
-
-github.md

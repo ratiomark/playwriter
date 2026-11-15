@@ -1,5 +1,5 @@
 import posthtml from 'posthtml'
-import beautify from 'posthtml-beautify'
+import beautify from 'js-beautify'
 
 export interface FormatHtmlOptions {
   html: string
@@ -369,22 +369,16 @@ export async function formatHtmlForPrompt({
     .use(removeDecorativeSubtreesPlugin())
     .use(removeEmptyElementsPlugin())
     .use(unwrapNestedWrappersPlugin())
-    .use(
-      beautify({
-        rules: {
-          indent: 1, // 1-space indent
-          blankLines: false, // no extra blank lines
-          maxlen: 100000, // effectively never wrap by content length
-        },
-        jsBeautifyOptions: {
-          wrap_line_length: 0, // disable js-beautify wrapping
-          preserve_newlines: false, // reduce stray newlines
-        },
-      }),
-    )
 
   // Process with await
   const result = await processor.process(html)
 
-  return result.html
+  return beautify.html(result.html, {
+    indent_size: 1,
+    preserve_newlines: false,
+    wrap_line_length: 0,
+    extra_liners: [],
+    inline: [],
+    end_with_newline: true,
+  })
 }

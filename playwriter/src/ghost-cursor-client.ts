@@ -1,13 +1,13 @@
 /**
  * Browser-side ghost cursor renderer, injected into every Playwriter-attached tab.
- * Auto-enables on load (top frame only). Idles out after 5s of no activity.
+ * Top frame only. Hidden until the first mouse action, idles out after 5s of no activity.
  *
  * Two-element DOM structure so move and press have independent CSS transitions:
  *   outer (#__playwriter_ghost_cursor__) → translate3d, move easing/duration
  *   inner (first child)                  → scale + opacity, press easing/duration
  */
 
-import { SCREENSTUDIO_POINTER_MACOS_TAHOE_DATA_URL } from './assets/cursors/screen-studio/pointer-macos-tahoe-data-url.js'
+import { SCREENSTUDIO_POINTER_MACOS_TAHOE_SVG } from './assets/cursors/screen-studio/pointer-macos-tahoe-svg.js'
 
 // Top-frame only — skip iframes. try/catch for sandboxed iframes that throw.
 const isTopFrame = (() => {
@@ -111,8 +111,9 @@ const runtime: GhostCursorRuntimeState = {
   y: 0,
   scale: 1,
   hasPosition: false,
-  enabled: false,
-  idleHidden: false,
+  // Starts enabled but hidden: the element is created on the first mouse action.
+  enabled: true,
+  idleHidden: true,
 }
 
 let idleHideTimer: ReturnType<typeof setTimeout> | null = null
@@ -216,6 +217,10 @@ function computeDurationMs(options: { targetX: number; targetY: number }): numbe
   const dx = options.targetX - runtime.x
   const dy = options.targetY - runtime.y
   const distance = Math.hypot(dx, dy)
+  // Zero distance means a teleport (wake from hidden), so jump instead of sliding from the old spot.
+  if (distance === 0) {
+    return 0
+  }
   const rawDurationMs = distance / runtime.options.speedPxPerMs
 
   return clamp({
@@ -285,46 +290,54 @@ function applyRuntimeVisualOptions(): void {
   const hotspot = getHotspotOffsetPx()
   runtime.innerElement.style.transformOrigin = `${hotspot.x}px ${hotspot.y}px`
 
+  runtime.innerElement.replaceChildren()
+  runtime.innerElement.style.backgroundImage = 'none'
+
   if (runtime.options.style === 'screenstudio') {
     runtime.innerElement.style.borderRadius = '0'
     runtime.innerElement.style.border = 'none'
     runtime.innerElement.style.backgroundColor = 'transparent'
-    runtime.innerElement.style.backgroundImage = `url("${SCREENSTUDIO_POINTER_MACOS_TAHOE_DATA_URL}")`
-    runtime.innerElement.style.backgroundRepeat = 'no-repeat'
-    runtime.innerElement.style.backgroundPosition = 'left top'
-    runtime.innerElement.style.backgroundSize = 'contain'
     runtime.innerElement.style.backdropFilter = 'none'
     runtime.innerElement.style.filter = 'none'
     runtime.innerElement.style.boxShadow = 'none'
     runtime.innerElement.style.opacity = getBaseOpacity()
+    setInnerSvg(runtime.innerElement, SCREENSTUDIO_POINTER_MACOS_TAHOE_SVG)
     return
   }
 
   if (runtime.options.style === 'minimal') {
     const triangleSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="-1 -1 26 26"><path fill="white" stroke="${runtime.options.color}" stroke-width="1.5" stroke-linejoin="round" d="m23.284 19.124l-6.866-6.895a.4.4 0 0 1-.118-.296a.43.43 0 0 1 .163-.282l4.439-3.077a1.48 1.48 0 0 0 .621-1.48a1.48 1.48 0 0 0-1.036-1.198L1.623.302a1.14 1.14 0 0 0-1.11.282A1.13 1.13 0 0 0 .29 1.649L5.928 20.44a1.48 1.48 0 0 0 1.183 1.035a1.48 1.48 0 0 0 1.48-.621l3.078-4.44a.37.37 0 0 1 .31-.118a.43.43 0 0 1 .296.104l6.91 6.91a1.48 1.48 0 0 0 2.087 0l2.086-2.086a1.48 1.48 0 0 0-.074-2.101"/></svg>`
-    const triangleDataUrl = `url("data:image/svg+xml,${encodeURIComponent(triangleSvg)}")`
     runtime.innerElement.style.borderRadius = '0'
     runtime.innerElement.style.border = 'none'
     runtime.innerElement.style.backgroundColor = 'transparent'
-    runtime.innerElement.style.backgroundImage = triangleDataUrl
-    runtime.innerElement.style.backgroundRepeat = 'no-repeat'
-    runtime.innerElement.style.backgroundSize = 'contain'
-    runtime.innerElement.style.backgroundPosition = 'left top'
     runtime.innerElement.style.backdropFilter = 'none'
     runtime.innerElement.style.boxShadow = 'none'
     runtime.innerElement.style.filter = 'drop-shadow(0 1px 2px rgba(0, 0, 0, 0.4))'
     runtime.innerElement.style.opacity = getBaseOpacity()
+    setInnerSvg(runtime.innerElement, triangleSvg)
     return
   }
 
   runtime.innerElement.style.borderRadius = '999px'
   runtime.innerElement.style.border = 'none'
   runtime.innerElement.style.backgroundColor = runtime.options.color
-  runtime.innerElement.style.backgroundImage = 'none'
   runtime.innerElement.style.backdropFilter = 'none'
   runtime.innerElement.style.filter = 'none'
   runtime.innerElement.style.boxShadow = '0 2px 10px rgba(0, 0, 0, 0.18), inset 0 0 0 2px rgba(255, 255, 255, 0.55)'
   runtime.innerElement.style.opacity = getBaseOpacity()
+}
+
+function setInnerSvg(host: HTMLElement, markup: string): void {
+  const parsed = new DOMParser().parseFromString(markup, 'image/svg+xml')
+  const svg = parsed.documentElement
+  if (svg.namespaceURI !== 'http://www.w3.org/2000/svg' || svg.localName !== 'svg') {
+    return
+  }
+  const imported = host.ownerDocument.importNode(svg, true)
+  imported.setAttribute('width', '100%')
+  imported.setAttribute('height', '100%')
+  imported.style.display = 'block'
+  host.appendChild(imported)
 }
 
 function clearIdleHideTimer(): void {
@@ -466,29 +479,6 @@ const api: GhostCursorApi = {
 
 if (isTopFrame) {
   globalThis.__playwriterGhostCursor = api
-
-  // Auto-enable. Defer for early injection (addScriptToEvaluateOnNewDocument)
-  // when DOM isn't ready yet. After hard navigations the cursor re-centers
-  // until the next mouse action arrives.
-  try {
-    if (document.readyState === 'loading') {
-      document.addEventListener(
-        'DOMContentLoaded',
-        () => {
-          try {
-            api.enable()
-          } catch {
-            // Non-fatal — DOM may be in an unexpected state.
-          }
-        },
-        { once: true },
-      )
-    } else {
-      api.enable()
-    }
-  } catch {
-    // Restricted contexts (chrome://, devtools://) — silently skip.
-  }
 }
 
 export {}

@@ -1,0 +1,169 @@
+<!-- Tutorial page shown when the user clicks the extension icon before the daemon is running. -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Start the Playwriter daemon</title>
+    <style>
+      :root {
+        --color-bg: #ffffff;
+        --color-text: #262626;
+        --color-heading: #171717;
+        --color-border: #d4d4d4;
+        --color-link: #0969da;
+        --color-link-hover: #0550ae;
+        --color-success: #16a34a;
+        --max-width: 640px;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --color-bg: #0a0a0a;
+          --color-text: #e5e5e5;
+          --color-heading: #fafafa;
+          --color-border: #404040;
+          --color-link: #4493f8;
+          --color-link-hover: #539bf5;
+          --color-success: #22c55e;
+        }
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+        font-size: 16px;
+        line-height: 1.6;
+        color: var(--color-text);
+        background-color: var(--color-bg);
+        padding: 2rem 1rem;
+      }
+
+      main {
+        max-width: var(--max-width);
+        margin: 0 auto;
+      }
+
+      h2 {
+        font-size: 1.75rem;
+        font-weight: 600;
+        color: var(--color-heading);
+        margin-bottom: 1rem;
+        padding-bottom: 0.5rem;
+        border-bottom: 1px solid var(--color-border);
+      }
+
+      p {
+        margin-bottom: 1rem;
+        opacity: 0.8;
+      }
+
+      a {
+        color: var(--color-link);
+        text-decoration: none;
+      }
+
+      a:hover {
+        color: var(--color-link-hover);
+        text-decoration: underline;
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+        font-size: 0.875em;
+      }
+
+      pre {
+        background: transparent !important;
+        border: none !important;
+        padding: 0 !important;
+        margin-bottom: 1rem;
+        overflow: visible;
+        white-space: pre;
+      }
+
+      pre code {
+        background: transparent !important;
+        padding: 0 !important;
+        font-size: 0.875rem;
+        white-space: pre;
+      }
+
+      strong {
+        font-weight: 600;
+        color: var(--color-heading);
+      }
+
+      .hl-green {
+        color: var(--color-success);
+        font-weight: 600;
+      }
+
+      .lead {
+        font-size: 1.0625rem;
+        opacity: 1;
+      }
+
+      code[class*='language-'],
+      pre[class*='language-'] {
+        color: #8959a8;
+        text-shadow: none;
+      }
+      .token.comment {
+        color: #8e908c;
+      }
+      .token.function {
+        color: #f5871f;
+      }
+      .token.keyword {
+        color: #8959a8;
+      }
+      .token.string {
+        color: #718c00;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        code[class*='language-'],
+        pre[class*='language-'] {
+          color: #b294bb;
+        }
+        .token.comment {
+          color: #969896;
+        }
+        .token.function {
+          color: #de935f;
+        }
+        .token.keyword {
+          color: #b294bb;
+        }
+        .token.string {
+          color: #b5bd68;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h2>Daemon not running yet</h2>
+
+      <p class="lead">
+        The icon turns <span class="hl-green">green</span> once a <code>playwriter</code> command runs on this machine.
+        That first command starts the daemon.
+      </p>
+
+      <pre><code class="language-bash">npx -y skills add https://playwriter.dev -g -y
+
+npx playwriter session new
+npx playwriter -s 1 -e "context.newPage().then((p) => p.goto('https://example.com'))"</code></pre>
+
+      <p>Or just ask your agent to use the browser. Then click the icon on any tab to control it.</p>
+    </main>
+    <script src="prism.min.js"></script>
+    <script src="prism-bash.min.js"></script>
+  </body>
+</html>

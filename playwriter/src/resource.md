@@ -3,26 +3,26 @@ You can also find `getByRole` to get elements on the page.
 ```javascript
 // Then use the information from the snapshot to click elements
 // For example, if snapshot shows: { "role": "button", "name": "Sign In" }
-await page.getByRole('button', { name: 'Sign In' }).click()
+await state.page.getByRole('button', { name: 'Sign In' }).click()
 
 // For a link with { "role": "link", "name": "About" }
-await page.getByRole('link', { name: 'About' }).click()
+await state.page.getByRole('link', { name: 'About' }).click()
 
 // For a textbox with { "role": "textbox", "name": "Email" }
-await page.getByRole('textbox', { name: 'Email' }).fill('user@example.com')
+await state.page.getByRole('textbox', { name: 'Email' }).fill('user@example.com')
 
 // For a heading with { "role": "heading", "name": "Welcome to Example.com" }
-const headingText = await page.getByRole('heading', { name: 'Welcome to Example.com' }).textContent()
+const headingText = await state.page.getByRole('heading', { name: 'Welcome to Example.com' }).textContent()
 console.log('Heading text:', headingText)
 ```
 
 ### Complete Example: Find and Click Elements
 
 ```javascript
-await page.getByRole('button', { name: 'Submit Form' }).click()
+await state.page.getByRole('button', { name: 'Submit Form' }).click()
 console.log('Clicked submit button')
 
-await waitForPageLoad({ page })
+await waitForPageLoad({ page: state.page })
 console.log('Form submitted successfully')
 ```
 
@@ -30,11 +30,14 @@ console.log('Form submitted successfully')
 
 ### Page and Context
 
-In Playwright, automation happens through a `page` object (representing a browser tab) and `context` (representing a browser session with cookies, storage, etc.).
+In Playwright, automation happens through a page object (representing a browser tab) and `context` (representing a browser session with cookies, storage, etc.). Playwriter has no default `page` global. Create your own tab and store it in `state.page`, or reuse a tab the user already opened:
 
 ```javascript
-// Assuming you have page and context already available
-const page = await context.newPage()
+// New tab
+state.page = await context.newPage()
+
+// Existing tab the user referenced (last match = most recently opened)
+state.page = context.pages().findLast((p) => p.url().includes('example.com'))
 ```
 
 ### Element Selection
@@ -43,25 +46,25 @@ Playwright uses locators to find elements. The examples below show various selec
 
 ```javascript
 // By role (recommended)
-await page.getByRole('button', { name: 'Submit' })
+await state.page.getByRole('button', { name: 'Submit' })
 
 // By text
-await page.getByText('Welcome')
+await state.page.getByText('Welcome')
 
 // By placeholder
-await page.getByPlaceholder('Enter email')
+await state.page.getByPlaceholder('Enter email')
 
 // By label
-await page.getByLabel('Username')
+await state.page.getByLabel('Username')
 
 // By test id
-await page.getByTestId('submit-button')
+await state.page.getByTestId('submit-button')
 
 // By CSS selector
-await page.locator('.my-class')
+await state.page.locator('.my-class')
 
 // By XPath
-await page.locator('//div[@class="content"]')
+await state.page.locator('//div[@class="content"]')
 ```
 
 ## Navigation
@@ -69,20 +72,20 @@ await page.locator('//div[@class="content"]')
 ### Navigate to URL
 
 ```javascript
-await page.goto('https://example.com')
+await state.page.goto('https://example.com')
 // Wait for page load (smart detection that ignores analytics/ads)
-await page.goto('https://example.com', { waitUntil: 'domcontentloaded' })
-await waitForPageLoad({ page })
+await state.page.goto('https://example.com', { waitUntil: 'domcontentloaded' })
+await waitForPageLoad({ page: state.page })
 ```
 
 ### Navigate Back/Forward
 
 ```javascript
 // Go back to previous page
-await page.goBack()
+await state.page.goBack()
 
 // Go forward to next page
-await page.goForward()
+await state.page.goForward()
 ```
 
 ## Screenshots
@@ -91,18 +94,18 @@ await page.goForward()
 
 ```javascript
 // Screenshot of viewport
-await page.screenshot({ path: 'screenshot.png' })
+await state.page.screenshot({ path: 'screenshot.png' })
 
 // Full page screenshot
-await page.screenshot({ path: 'fullpage.png', fullPage: true })
+await state.page.screenshot({ path: 'fullpage.png', fullPage: true })
 
 // Screenshot of specific element
-const element = await page.getByRole('button', { name: 'Submit' })
+const element = await state.page.getByRole('button', { name: 'Submit' })
 await element.screenshot({ path: 'button.png' })
 
 // Screenshot with custom dimensions
-await page.setViewportSize({ width: 1280, height: 720 })
-await page.screenshot({ path: 'custom-size.png' })
+await state.page.setViewportSize({ width: 1280, height: 720 })
+await state.page.screenshot({ path: 'custom-size.png' })
 ```
 
 ## Mouse Interactions
@@ -111,29 +114,29 @@ await page.screenshot({ path: 'custom-size.png' })
 
 ```javascript
 // Click by role
-await page.getByRole('button', { name: 'Submit' }).click()
+await state.page.getByRole('button', { name: 'Submit' }).click()
 
 // Click at coordinates
-await page.mouse.click(100, 200)
+await state.page.mouse.click(100, 200)
 
 // Double click
-await page.getByText('Double click me').dblclick()
+await state.page.getByText('Double click me').dblclick()
 
 // Right click
-await page.getByText('Right click me').click({ button: 'right' })
+await state.page.getByText('Right click me').click({ button: 'right' })
 
 // Click with modifiers
-await page.getByText('Ctrl click me').click({ modifiers: ['Control'] })
+await state.page.getByText('Ctrl click me').click({ modifiers: ['Control'] })
 ```
 
 ### Hover
 
 ```javascript
 // Hover over element
-await page.getByText('Hover me').hover()
+await state.page.getByText('Hover me').hover()
 
 // Hover at coordinates
-await page.mouse.move(100, 200)
+await state.page.mouse.move(100, 200)
 ```
 
 ## Keyboard Input
@@ -142,34 +145,34 @@ await page.mouse.move(100, 200)
 
 ```javascript
 // Type into input field
-await page.getByLabel('Email').fill('user@example.com')
+await state.page.getByLabel('Email').fill('user@example.com')
 
 // Type character by character (simulates real typing)
-await page.getByLabel('Email').type('user@example.com', { delay: 100 })
+await state.page.getByLabel('Email').type('user@example.com', { delay: 100 })
 
 // Clear and type
-await page.getByLabel('Email').clear()
-await page.getByLabel('Email').fill('new@example.com')
+await state.page.getByLabel('Email').clear()
+await state.page.getByLabel('Email').fill('new@example.com')
 ```
 
 ### Press Keys
 
 ```javascript
 // Press single key
-await page.keyboard.press('Enter')
+await state.page.keyboard.press('Enter')
 
 // Press key combination
-await page.keyboard.press('Control+A')
+await state.page.keyboard.press('Control+A')
 
 // Press sequence of keys
-await page.keyboard.press('Tab')
-await page.keyboard.press('Tab')
-await page.keyboard.press('Space')
+await state.page.keyboard.press('Tab')
+await state.page.keyboard.press('Tab')
+await state.page.keyboard.press('Space')
 
 // Common key shortcuts
-await page.keyboard.press('Control+C') // Copy
-await page.keyboard.press('Control+V') // Paste
-await page.keyboard.press('Control+Z') // Undo
+await state.page.keyboard.press('Control+C') // Copy
+await state.page.keyboard.press('Control+V') // Paste
+await state.page.keyboard.press('Control+Z') // Undo
 ```
 
 ## Form Interactions
@@ -178,32 +181,32 @@ await page.keyboard.press('Control+Z') // Undo
 
 ```javascript
 // Select by value
-await page.selectOption('select#country', 'us')
+await state.page.selectOption('select#country', 'us')
 
 // Select by label
-await page.selectOption('select#country', { label: 'United States' })
+await state.page.selectOption('select#country', { label: 'United States' })
 
 // Select multiple options
-await page.selectOption('select#colors', ['red', 'blue', 'green'])
+await state.page.selectOption('select#colors', ['red', 'blue', 'green'])
 
 // Get selected option
-const selectedValue = await page.$eval('select#country', (el) => el.value)
+const selectedValue = await state.page.$eval('select#country', (el) => el.value)
 ```
 
 ### Checkboxes and Radio Buttons
 
 ```javascript
 // Check checkbox
-await page.getByLabel('I agree').check()
+await state.page.getByLabel('I agree').check()
 
 // Uncheck checkbox
-await page.getByLabel('Subscribe').uncheck()
+await state.page.getByLabel('Subscribe').uncheck()
 
 // Check if checked
-const isChecked = await page.getByLabel('I agree').isChecked()
+const isChecked = await state.page.getByLabel('I agree').isChecked()
 
 // Select radio button
-await page.getByLabel('Option A').check()
+await state.page.getByLabel('Option A').check()
 ```
 
 ## JavaScript Evaluation
@@ -212,37 +215,37 @@ await page.getByLabel('Option A').check()
 
 ```javascript
 // Evaluate simple expression
-const result = await page.evaluate(() => 2 + 2)
+const result = await state.page.evaluate(() => 2 + 2)
 
 // Access page variables
-const pageTitle = await page.evaluate(() => document.title)
+const pageTitle = await state.page.evaluate(() => document.title)
 
 // Modify page
-await page.evaluate(() => {
+await state.page.evaluate(() => {
   document.body.style.backgroundColor = 'red'
 })
 
 // Pass arguments to page context
-const sum = await page.evaluate(([a, b]) => a + b, [5, 3])
+const sum = await state.page.evaluate(([a, b]) => a + b, [5, 3])
 
 // Work with elements
-const elementText = await page.evaluate((el) => el.textContent, await page.getByRole('heading'))
+const elementText = await state.page.evaluate((el) => el.textContent, await state.page.getByRole('heading'))
 ```
 
 ### Execute JavaScript on Element
 
 ```javascript
 // Get element property
-const href = await page.getByRole('link').evaluate((el) => el.href)
+const href = await state.page.getByRole('link').evaluate((el) => el.href)
 
 // Modify element
-await page.getByRole('button').evaluate((el) => {
+await state.page.getByRole('button').evaluate((el) => {
   el.style.backgroundColor = 'green'
   el.disabled = true
 })
 
 // Scroll element into view
-await page.getByText('Section').evaluate((el) => el.scrollIntoView())
+await state.page.getByText('Section').evaluate((el) => el.scrollIntoView())
 ```
 
 ## File Handling
@@ -251,17 +254,17 @@ await page.getByText('Section').evaluate((el) => el.scrollIntoView())
 
 ```javascript
 // Upload single file
-await page.getByLabel('Upload file').setInputFiles('/path/to/file.pdf')
+await state.page.getByLabel('Upload file').setInputFiles('/path/to/file.pdf')
 
 // Upload multiple files
-await page.getByLabel('Upload files').setInputFiles(['/path/to/file1.pdf', '/path/to/file2.pdf'])
+await state.page.getByLabel('Upload files').setInputFiles(['/path/to/file1.pdf', '/path/to/file2.pdf'])
 
 // Clear file input
-await page.getByLabel('Upload file').setInputFiles([])
+await state.page.getByLabel('Upload file').setInputFiles([])
 
 // For file inputs, use setInputFiles directly on the input element
 // Find the file input element (often hidden)
-await page.locator('input[type="file"]').setInputFiles('/path/to/file.pdf')
+await state.page.locator('input[type="file"]').setInputFiles('/path/to/file.pdf')
 ```
 
 ## Network Monitoring
@@ -270,7 +273,7 @@ await page.locator('input[type="file"]').setInputFiles('/path/to/file.pdf')
 
 ```javascript
 // Wait for a specific request to complete and get its response
-const response = await page.waitForResponse(
+const response = await state.page.waitForResponse(
   (response) => response.url().includes('/api/user') && response.status() === 200,
 )
 
@@ -279,12 +282,12 @@ const responseBody = await response.json()
 console.log('API response:', responseBody)
 
 // Wait for specific request
-const request = await page.waitForRequest('**/api/data')
+const request = await state.page.waitForRequest('**/api/data')
 console.log('Request URL:', request.url())
 console.log('Request method:', request.method())
 
 // Get all resources loaded by the page
-const resources = await page.evaluate(() =>
+const resources = await state.page.evaluate(() =>
   performance.getEntriesByType('resource').map((r) => ({
     name: r.name,
     duration: r.duration,
@@ -303,7 +306,7 @@ console.log('Page resources:', resources)
 // Use the console_logs tool to retrieve them
 
 // To trigger console messages from the page:
-await page.evaluate(() => {
+await state.page.evaluate(() => {
   console.log('This message will be captured')
   console.error('This error will be captured')
   console.warn('This warning will be captured')
@@ -319,57 +322,57 @@ await page.evaluate(() => {
 
 ```javascript
 // Wait for element to appear
-await page.waitForSelector('.success-message')
+await state.page.waitForSelector('.success-message')
 
 // Wait for element to disappear
-await page.waitForSelector('.loading', { state: 'hidden' })
+await state.page.waitForSelector('.loading', { state: 'hidden' })
 
-await page.waitForURL(/github\.com.*\/pull/)
-await page.waitForURL(/\/new-org/)
+await state.page.waitForURL(/github\.com.*\/pull/)
+await state.page.waitForURL(/\/new-org/)
 
 // Wait for text to appear
-await page.waitForFunction((text) => document.body.textContent.includes(text), 'Success!')
+await state.page.waitForFunction((text) => document.body.textContent.includes(text), 'Success!')
 
 // Wait for navigation
-await page.waitForURL('**/success')
+await state.page.waitForURL('**/success')
 
 // Wait for page load (smart detection that ignores analytics/ads)
-await waitForPageLoad({ page })
+await waitForPageLoad({ page: state.page })
 
 // Wait for specific condition
-await page.waitForFunction((text) => document.querySelector('.status')?.textContent === text, 'Ready')
+await state.page.waitForFunction((text) => document.querySelector('.status')?.textContent === text, 'Ready')
 ```
 
 ### Wait for Text to Appear or Disappear
 
 ```javascript
 // Wait for specific text to appear on the page
-await page.getByText('Loading complete').first().waitFor({ state: 'visible' })
+await state.page.getByText('Loading complete').first().waitFor({ state: 'visible' })
 console.log('Loading complete text is now visible')
 
 // Wait for text to disappear from the page
-await page.getByText('Loading...').first().waitFor({ state: 'hidden' })
+await state.page.getByText('Loading...').first().waitFor({ state: 'hidden' })
 console.log('Loading text has disappeared')
 
 // Wait for multiple conditions sequentially
 // First wait for loading to disappear, then wait for success message
-await page.getByText('Processing...').first().waitFor({ state: 'hidden' })
-await page.getByText('Success!').first().waitFor({ state: 'visible' })
+await state.page.getByText('Processing...').first().waitFor({ state: 'hidden' })
+await state.page.getByText('Success!').first().waitFor({ state: 'visible' })
 console.log('Processing finished and success message appeared')
 
 // Example: Wait for error message to disappear before proceeding
-await page.getByText('Error: Please try again').first().waitFor({ state: 'hidden' })
-await page.getByRole('button', { name: 'Submit' }).click()
+await state.page.getByText('Error: Please try again').first().waitFor({ state: 'hidden' })
+await state.page.getByRole('button', { name: 'Submit' }).click()
 
 // Example: Wait for confirmation text after form submission
-await page.getByRole('button', { name: 'Save' }).click()
-await page.getByText('Your changes have been saved').first().waitFor({ state: 'visible' })
+await state.page.getByRole('button', { name: 'Save' }).click()
+await state.page.getByText('Your changes have been saved').first().waitFor({ state: 'visible' })
 console.log('Save confirmed')
 
 // Example: Wait for dynamic content to load
-await page.getByRole('button', { name: 'Load More' }).click()
-await page.getByText('Loading more items...').first().waitFor({ state: 'visible' })
-await page.getByText('Loading more items...').first().waitFor({ state: 'hidden' })
+await state.page.getByRole('button', { name: 'Load More' }).click()
+await state.page.getByText('Loading more items...').first().waitFor({ state: 'visible' })
+await state.page.getByText('Loading more items...').first().waitFor({ state: 'hidden' })
 console.log('Additional items loaded')
 ```
 
@@ -377,16 +380,16 @@ console.log('Additional items loaded')
 
 ```javascript
 // Get frame by name
-const frame = page.frame('frameName')
+const frame = state.page.frame('frameName')
 
 // Get frame by URL
-const frame = page.frame({ url: /frame\.html/ })
+const frame = state.page.frame({ url: /frame\.html/ })
 
 // Interact with frame content
 await frame.getByText('In Frame').click()
 
 // Get all frames
-const frames = page.frames()
+const frames = state.page.frames()
 ```
 
 ## Best Practices
@@ -395,15 +398,15 @@ const frames = page.frames()
 
 ```javascript
 // Prefer user-facing attributes
-await page.getByRole('button', { name: 'Submit' })
-await page.getByLabel('Email')
-await page.getByPlaceholder('Search...')
-await page.getByText('Welcome')
+await state.page.getByRole('button', { name: 'Submit' })
+await state.page.getByLabel('Email')
+await state.page.getByPlaceholder('Search...')
+await state.page.getByText('Welcome')
 
 // Use test IDs for complex cases
-await page.getByTestId('complex-component')
+await state.page.getByTestId('complex-component')
 
 // Avoid brittle selectors
-// Bad: await page.locator('.btn-3842');
-// Good: await page.getByRole('button', { name: 'Submit' });
+// Bad: await state.page.locator('.btn-3842');
+// Good: await state.page.getByRole('button', { name: 'Submit' });
 ```

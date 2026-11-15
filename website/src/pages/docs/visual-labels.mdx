@@ -22,7 +22,7 @@ Use `refToLocator` to convert a visual label to a Playwright locator:
 
 ```js
 // From the screenshot, the agent sees label "e5" on a button
-const locator = refToLocator({ ref: 'e5' })
+const locator = refToLocator({ ref: 'e5', page: state.page })
 await state.page.locator(locator).click()
 ```
 

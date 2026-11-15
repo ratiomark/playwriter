@@ -17,10 +17,10 @@ prompt: |
 ## Step-by-step
 
 - Always reuse an existing Framer tab when possible (do not open a new page each run).
-  Use this pattern to pick an existing page first, then navigate only if needed:
+  Use this pattern to pick an existing page first, and open a new tab only if none is found. Later commands use `state.page`:
 
 ```bash
-playwriter -s 1 -e "const target = 'https://framer.com/projects/unframer-source--XOxwdyyCrFEE9uKnKFPq-6gX7n?node=augiA20Il'; const framerPage = context.pages().find((p) => p.url().includes('framer.com/projects/unframer-source')) || page; if (!framerPage.url().includes('framer.com/projects/unframer-source')) { await framerPage.goto(target, { waitUntil: 'domcontentloaded' }); } console.log(framerPage.url());"
+playwriter -s 1 -e "const target = 'https://framer.com/projects/unframer-source--XOxwdyyCrFEE9uKnKFPq-6gX7n?node=augiA20Il'; state.page = context.pages().findLast((p) => p.url().includes('framer.com/projects/unframer-source')); if (!state.page) { state.page = await context.newPage(); await state.page.goto(target, { waitUntil: 'domcontentloaded' }); } console.log(state.page.url());"
 ```
 
 - Never call `bringToFront()` in this flow. It steals focus and interrupts manual work while tests are running.
@@ -35,7 +35,7 @@ playwriter -s 1 -e "const target = 'https://framer.com/projects/unframer-source-
 - Verify the palette is open (look for the command dialog and MCP entry in the snapshot output):
 
 ```bash
-playwriter -s 1 -e "console.log(await snapshot({ page, search: /dialog|Search…|MCP/ }));"
+playwriter -s 1 -e "console.log(await snapshot({ page: state.page, search: /dialog|Search…|MCP/ }));"
 ```
 
 - Search for **MCP**, press Enter, then wait about 1 second for the plugin iframe to appear.
@@ -43,37 +43,37 @@ playwriter -s 1 -e "console.log(await snapshot({ page, search: /dialog|Search…
 - Verify the plugin iframe exists (should include `plugins.framercdn.com`):
 
 ```bash
-playwriter -s 1 -e "const iframes = await page.locator('iframe').all(); for (const f of iframes) { console.log(await f.getAttribute('src')); }"
+playwriter -s 1 -e "const iframes = await state.page.locator('iframe').all(); for (const f of iframes) { console.log(await f.getAttribute('src')); }"
 ```
 
 - Wait until the MCP iframe is present (verifies the action worked):
 
 ```bash
-playwriter -s 1 -e "const iframe = page.locator(\"iframe[src*='plugins.framercdn.com']\"); await iframe.first().waitFor({ timeout: 10000 }); console.log('iframe ready');"
+playwriter -s 1 -e "const iframe = state.page.locator(\"iframe[src*='plugins.framercdn.com']\"); await iframe.first().waitFor({ timeout: 10000 }); console.log('iframe ready');"
 ```
 
 - Grab the iframe’s locator by URL:
 
 ```bash
-playwriter -s 1 -e "const iframe = page.locator(\"iframe[src*='plugins.framercdn.com']\"); console.log(await iframe.count());"
+playwriter -s 1 -e "const iframe = state.page.locator(\"iframe[src*='plugins.framercdn.com']\"); console.log(await iframe.count());"
 ```
 
 - Run the accessibility snapshot on that iframe using `contentFrame()` (FrameLocator is auto-resolved to Frame):
 
 ```bash
-playwriter -s 1 -e "const frame = await page.locator(\"iframe[src*='plugins.framercdn.com']\").contentFrame(); console.log(await snapshot({ page, frame }));"
+playwriter -s 1 -e "const frame = await state.page.locator(\"iframe[src*='plugins.framercdn.com']\").contentFrame(); console.log(await snapshot({ page: state.page, frame }));"
 ```
 
-- Alternative: use `page.frames()` to get the Frame directly:
+- Alternative: use `state.page.frames()` to get the Frame directly:
 
 ```bash
-playwriter -s 1 -e "const frame = page.frames().find(f => f.url().includes('plugins.framercdn.com')); console.log(await snapshot({ page, frame }));"
+playwriter -s 1 -e "const frame = state.page.frames().find(f => f.url().includes('plugins.framercdn.com')); console.log(await snapshot({ page: state.page, frame }));"
 ```
 
 - Validate the snapshot contains MCP UI text (confirms the panel is actually loaded):
 
 ```bash
-playwriter -s 1 -e "const frame = await page.locator(\"iframe[src*='plugins.framercdn.com']\").contentFrame(); console.log(await snapshot({ page, frame, search: /Control Framer with MCP|Login With Google/ }));"
+playwriter -s 1 -e "const frame = await state.page.locator(\"iframe[src*='plugins.framercdn.com']\").contentFrame(); console.log(await snapshot({ page: state.page, frame, search: /Control Framer with MCP|Login With Google/ }));"
 ```
 
 ## Expected iframe URL

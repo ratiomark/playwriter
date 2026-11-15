@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { LOG_CDP_FILE_PATH } from './utils.js'
+import { LOG_CDP_FILE_PATH, redactRemoteControlSecrets } from './utils.js'
 
 export type CdpLogEntry = {
   timestamp: string
@@ -18,6 +18,7 @@ export type CdpLogger = {
 }
 
 const DEFAULT_MAX_STRING_LENGTH = Number(process.env.PLAYWRITER_CDP_LOG_MAX_STRING_LENGTH || 2000)
+const EXCLUDED_METHODS = new Set(['Page.screencastFrame'])
 
 function truncateString(value: string, maxLength: number): string {
   if (value.length <= maxLength) {
@@ -31,7 +32,7 @@ function createTruncatingReplacer({ maxStringLength }: { maxStringLength: number
   const seen = new WeakSet<object>()
   return (_key: string, value: unknown) => {
     if (typeof value === 'string') {
-      return truncateString(value, maxStringLength)
+      return truncateString(redactRemoteControlSecrets(value), maxStringLength)
     }
     if (typeof value === 'object' && value !== null) {
       if (seen.has(value)) {
@@ -103,7 +104,14 @@ export function createCdpLogger({
     }
     const lines = buffer
     buffer = []
-    await fs.promises.appendFile(resolvedLogFilePath, lines.join('\n') + '\n')
+    // Best effort: a deleted log folder or a full disk must not reject the queue, or logging stops for good
+    const written = await fs.promises.appendFile(resolvedLogFilePath, lines.join('\n') + '\n').then(
+      () => true,
+      () => false,
+    )
+    if (!written) {
+      return
+    }
     lineCount += lines.length
     if (lineCount > resolvedMaxEntries) {
       await rotate()
@@ -111,6 +119,11 @@ export function createCdpLogger({
   }
 
   const log = (entry: CdpLogEntry): void => {
+    const method =
+      entry.message && typeof entry.message === 'object' ? Reflect.get(entry.message, 'method') : undefined
+    if (typeof method === 'string' && EXCLUDED_METHODS.has(method)) {
+      return
+    }
     const replacer = createTruncatingReplacer({ maxStringLength: maxLength })
     const line = JSON.stringify(entry, replacer)
     buffer.push(line)

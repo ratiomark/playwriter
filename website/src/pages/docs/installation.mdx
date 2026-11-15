@@ -1,12 +1,12 @@
 ---
 title: Installation
-description: Install the Chrome extension, CLI, and agent skill in under a minute.
+description: Install the Playwriter Chrome extension, CLI, and agent skill in under a minute, then click the icon on any tab.
 icon: lucide:download
 ---
 
 ## Install the extension
 
-Install from the [Chrome Web Store](https://chromewebstore.google.com/detail/playwriter-mcp/jfeammnjpkecdekppnclgkkffahnhfhe), then click the extension icon on any tab. The icon turns **green** when connected.
+Install from the [Chrome Web Store](https://chromewebstore.google.com/detail/playwriter/jfeammnjpkecdekppnclgkkffahnhfhe), then click the extension icon on any tab. The icon turns **green** when connected.
 
 The extension works with Chrome, Chromium, Brave, Arc, Edge, and any Chromium-based browser.
 
@@ -35,7 +35,7 @@ npx playwriter@latest session new
 The **skill** teaches your AI agent how to use Playwriter: which selectors to use, how to read snapshots, how to avoid common mistakes, and all available utilities.
 
 ```bash
-npx -y skills add remorses/playwriter
+npx -y skills add https://playwriter.dev -g -y
 ```
 
 This works with any agent that supports skills (OpenCode, Cursor, Claude Code, etc.). The skill is the recommended way to use Playwriter with agents; it gives them comprehensive instructions so they can use the full API without trial and error.
@@ -44,9 +44,9 @@ This works with any agent that supports skills (OpenCode, Cursor, Claude Code, e
 
 ```bash
 playwriter session new                    # creates sandbox, outputs id (e.g. 1)
-playwriter -s 1 -e 'await page.goto("https://example.com")'
-playwriter -s 1 -e 'console.log(await snapshot({ page }))'
-playwriter -s 1 -e 'await page.locator("aria-ref=e5").click()'
+playwriter -s 1 -e 'state.page = await context.newPage(); await state.page.goto("https://example.com")'
+playwriter -s 1 -e 'console.log(await snapshot({ page: state.page }))'
+playwriter -s 1 -e 'await state.page.locator("aria-ref=e5").click()'
 ```
 
 ## Start Chrome for Testing
@@ -57,7 +57,7 @@ If you don't have Chrome running or want a clean instance with the extension pre
 playwriter browser start
 ```
 
-This auto-finds **Chrome for Testing** or Chromium on your system, launches it with recording flags enabled, and loads the bundled Playwriter extension. You can also pass a specific browser binary:
+This auto-finds **Chrome for Testing** or Chromium on your system, launches it, and loads the bundled Playwriter extension. You can also pass a specific browser binary:
 
 ```bash
 playwriter browser start /path/to/chrome
@@ -73,7 +73,7 @@ After installing the extension and CLI:
 
 ```bash
 playwriter session new
-playwriter -s 1 -e 'console.log(await page.title())'
+playwriter -s 1 -e 'console.log(context.pages().map((p) => p.url()))'
 ```
 
-If you see the page title printed, everything is working.
+If you see the tab URL printed, everything is working.

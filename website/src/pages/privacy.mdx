@@ -1,0 +1,197 @@
+---
+title: Privacy policy for the Playwriter Chrome extension
+sidebarTitle: Privacy
+description: Learn what browser data Playwriter handles locally and when you explicitly share your browser through encrypted Remote control.
+icon: lucide:shield-check
+prompt: |
+  User prompt: "ok update the content. explain what needs to be updated in
+  chrome page as well. read the chrome page for content that is not in repo
+  and i need to update manually"
+  Use @extension/permissions.md, @extension/README.md,
+  @website/src/pages/docs/security.mdx, and the Playwriter listing at
+  @https://chromewebstore.google.com.
+---
+
+{/* Public privacy policy for the Playwriter Chrome extension and Remote control. */}
+
+**Effective date:** August 28, 2026
+
+Playwriter is **local by default**. The Chrome extension connects to a relay on
+your own computer unless you explicitly enable a remote feature.
+
+When you enable **Remote control**, browser data passes through an encrypted
+Playwriter tunnel to the person or agent that has your secret link. Playwriter
+does not use this data for analytics, advertising, profiling, or sale.
+
+## What this policy covers
+
+This policy covers the **Playwriter Chrome extension**, its local relay, one-tab
+Remote control, and user-configured full relay remote access.
+
+Playwriter **cloud browser accounts and billing** use separate website services.
+This extension policy does not change the terms of those services.
+
+## Data handled in local mode
+
+The extension handles data needed for **automation commands** on tabs that you
+connect. Depending on the commands you run, this can include:
+
+- **Website content**, including text, images, screenshots, and accessibility data
+- **Browsing activity**, including page URLs, navigation, and network requests
+- **User activity**, including clicks, typing, scrolling, and form interaction
+- **Developer data**, including console messages, source code, and network responses
+- **Authentication data**, including cookies or browser storage when a command asks for it
+- **Recordings**, when you explicitly start screen or skill recording
+
+In normal local mode, this data travels between the extension and the
+**localhost relay** on your computer. Playwriter does not send local-mode browser
+payloads to Playwriter servers.
+
+## Local identifiers
+
+The extension creates a random **installation identifier** in
+`chrome.storage.local`. It also reads the Chrome profile account ID and email, if
+Chrome makes them available.
+
+These values distinguish browser profiles and extension installations connected
+to the same **local relay**. They are sent to the relay on your own computer.
+They are not included in the Remote control handshake.
+
+## Anonymous usage stats
+
+The **local relay** (the Playwriter CLI and MCP process, not the extension)
+sends anonymous usage events to Strada, our analytics provider. Each event has
+the event name, a random installation ID stored in `~/.playwriter/telemetry-id`,
+the Playwriter version, OS, CPU architecture, Node.js version, session type,
+hourly command counts, and the extension version and browser name.
+
+These events **never include** code, URLs, page content, screenshots, emails,
+account IDs, hostnames, or file paths. The Chrome profile email is never sent.
+
+Set `PLAYWRITER_TELEMETRY=0` or `DO_NOT_TRACK=1` and restart the relay with
+`playwriter serve restart` to turn this off.
+
+## Remote control
+
+Remote control is **off by default**. It starts only after you click **Remote control**
+in the Playwriter toolbar and accept a disclosure.
+
+While a share is active, the recipient can use **every tab where Playwriter is
+enabled** and open new tabs. This is not a security boundary. Broad CDP access
+can expose screenshots, page content, URLs, network and console data, input
+events, cookies, authentication data, and browser storage.
+
+The data passes through an encrypted WebSocket tunnel under
+**`playwriter.dev`**. The current tunnel implementation routes payloads in memory
+and does not write them to a Playwriter database or object storage.
+
+The tunnel ID is stored in the link's **URL fragment** for the initial viewer-page
+request. The viewer then uses that ID to connect to the tunnel hostname, so
+Cloudflare and the tunnel service necessarily process the hostname and connection
+metadata.
+
+## Who can receive shared data
+
+Remote control uses a **bearer link**. Anyone who has the link receives broad
+browser automation access until you revoke it.
+
+The recipient can be a person using the browser viewer or an agent using the
+**Playwriter CLI**. You choose the recipient by deciding who receives the link.
+Playwriter cannot control what that recipient does with information they receive.
+
+**Do not share the link** with anyone you do not trust. Do not post it in public
+channels.
+
+## Full relay remote access
+
+You can explicitly expose the local relay with **`playwriter serve`**, a strong
+authentication token, and your own network or tunnel configuration. This can
+give a remote client access to every tab connected to that relay.
+
+In this mode, browser payloads and local relay metadata can pass through the
+**transport that you configure**. This can include the Chrome profile email,
+account ID, and installation ID used to identify local extension connections.
+
+Only expose the full relay to a client you trust. Stop the server or tunnel to
+**revoke full relay access**.
+
+## Storage and retention
+
+Playwriter does **not persist Remote control payloads**. Tunnel frames are routed
+in memory while the connection is active.
+
+The extension stores the tunnel ID and scoped tab IDs in
+`chrome.storage.session`. This lets a share survive an extension service-worker
+restart. The state is removed when you revoke the share or the browser session
+ends.
+
+The local **installation identifier** remains in `chrome.storage.local` until the
+extension's storage is cleared or the extension is removed.
+
+Infrastructure providers can retain **security and connection metadata** under
+their own policies. This can include IP addresses, timestamps, hostnames, and
+transport diagnostics. Playwriter does not ask them to store tab payloads.
+
+## Service providers
+
+Playwriter uses **Cloudflare** to provide encrypted tunnel transport. Cloudflare
+processes traffic and connection metadata as an infrastructure provider.
+
+The Remote control recipient is a **user-selected third party**, not a Playwriter
+service provider. Sharing the bearer link is your instruction to send the shared
+tab data to that recipient.
+
+## Data Playwriter does not use
+
+The extension does not use browser data for:
+
+- **Advertising** or ad targeting
+- **Analytics**, telemetry, or cross-site tracking. The anonymous usage stats above contain no browser data
+- **User profiling** or credit decisions
+- **Sale** to data brokers or other third parties
+
+Playwriter staff **do not inspect Remote control payloads** during normal operation.
+Access would occur only when required for security, legal compliance, or a
+specific support request that you authorize.
+
+## Your controls
+
+**You control browser access** at all times:
+
+- Click the **extension icon** to connect or disconnect a tab
+- Click **Remote control** in the toolbar and confirm before any remote tunnel starts
+- Click **Stop sharing** in the toolbar (or the icon menu) to revoke the bearer link immediately
+- Close or disconnect the tab where you started sharing to end the share
+- Close Chrome to remove session-scoped tunnel state
+- Remove the extension to clear its browser access and local extension storage
+
+## Security
+
+Playwriter uses **HTTPS and WSS encryption** for remote traffic. Remote control
+is not a security sandbox. The recipient gets the same CDP access as a local
+Playwriter agent and must be fully trusted. A short denylist blocks only
+whole-profile cookie APIs and cache clears.
+
+No security measure can make a **bearer link** safe after it is shared with an
+untrusted recipient. Treat the link like a password.
+
+Read the full [**security model**](./docs/security.mdx),
+[**Remote control security**](./docs/remote-control.mdx), and
+[**Remote control guide**](./docs/remote-access.mdx) before sharing sensitive tabs.
+
+## Chrome Web Store Limited Use
+
+The use of information received from Google APIs will adhere to the
+**Chrome Web Store User Data Policy**, including the Limited Use requirements.
+
+Playwriter limits browser data handling to **browser automation**, debugging,
+recording, and user-authorized remote control. It does not use that data for an
+unrelated purpose.
+
+## Changes and contact
+
+**Material changes** to this policy or Playwriter's data handling will be disclosed
+before the changed handling starts.
+
+For **privacy questions**, open a private security report or contact the maintainer
+through the [Playwriter GitHub repository](https://github.com/remorses/playwriter).

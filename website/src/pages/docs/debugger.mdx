@@ -167,4 +167,4 @@ const { cookies } = await cdp.send('Network.getCookies', { urls: [state.page.url
 const { metrics: perfMetrics } = await cdp.send('Performance.getMetrics')
 ```
 
-Always use `getCDPSession({ page })`, never `context.newCDPSession()`. The latter doesn't work through the Playwriter relay.
+Always use `getCDPSession({ page: state.page })`, never `context.newCDPSession()`. The latter doesn't work through the Playwriter relay.

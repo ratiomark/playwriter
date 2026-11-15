@@ -1,14 +1,14 @@
 /**
- * Full-bleed hero sections for the Playwriter landing and cloud browsers pages.
- * Breaks out of the Above column constraint via w-screen + negative margin
- * (same pattern as sigillo's hero-section.tsx).
+ * Hero sections for the Playwriter landing and cloud browsers pages.
  *
- * HeroSection: main landing page (Chrome Extension + GitHub CTAs)
- * CloudHeroSection: cloud browsers page (Login with Google CTA)
- * Both share the same VideoBackgroundShader background and star rating badge.
+ * HeroSection / CloudHeroSection: stay within the Above column (page width)
+ * via w-full, same as gpuix's hero-section.tsx.
+ * ChangelogHeroSection: still breaks out full-bleed via w-screen + negative margin.
+ * All share the same VideoBackgroundShader background and star rating badge.
  */
 'use client'
 
+import { useEffect, useState } from 'react'
 import { VideoBackgroundShader } from '@holocron.so/vite/mdx'
 
 function GithubIcon({ size = 14 }: { size?: number }) {
@@ -100,39 +100,28 @@ function StarRating({ rating }: { rating: number }) {
   )
 }
 
-function ArrowDownIcon() {
-  return (
-    <svg
-      width={12}
-      height={12}
-      viewBox='0 0 24 24'
-      fill='none'
-      stroke='currentColor'
-      strokeWidth={2}
-      strokeLinecap='round'
-      strokeLinejoin='round'
-    >
-      <path d='M12 5v14M19 12l-7 7-7-7' />
-    </svg>
-  )
-}
-
+// note: canvasClassName opacity utilities do NOT work — VideoBackgroundShader sets
+// inline `opacity: 1` on the same element once the canvas is ready, overriding any
+// class-based opacity. Dim via an outer wrapper div instead.
 function HeroBackground({ dotColor = 'rgba(255, 106, 0, 0.7)' }: { dotColor?: string }) {
   return (
-    <VideoBackgroundShader
-      src='/assets/hero-bg.mp4'
-      className='absolute inset-0 w-full h-full'
-      canvasClassName='dark:opacity-60 opacity-40'
-      dotColor={dotColor}
-      dotSize={6}
-      minDotSize={1}
-      dotMargin={1}
-      animSpeed={3}
-      gamma={0.8}
-      enableMask={false}
-      fluidStrength={0.15}
-      fluidCurl={80}
-    />
+    <div className='absolute inset-0 w-full h-full opacity-70'>
+      <VideoBackgroundShader
+        src='/assets/hero-bg.mp4'
+        className='absolute inset-0 w-full h-full'
+        dotStyle='ascii'
+        dotColor={dotColor}
+        dotSize={10}
+        chars=' .:-~=playwriter'
+        animSpeed={3}
+        gamma={0.8}
+        enableMask={false}
+        fadeTop={false}
+        fadeBottom={false}
+        fluidStrength={0.15}
+        fluidCurl={80}
+      />
+    </div>
   )
 }
 
@@ -143,66 +132,64 @@ const CHROME_EXTENSION_URL =
 const GITHUB_URL = 'https://github.com/remorses/playwriter'
 
 export function HeroSection() {
+  const [fontsReady, setFontsReady] = useState(false)
+
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      setFontsReady(true)
+    }, 3000)
+    void document.fonts.ready.then(() => {
+      setFontsReady(true)
+    })
+    return () => {
+      clearTimeout(timeout)
+    }
+  }, [])
+
   return (
-    <div className='relative mt-2 lg:mt-4 mb-4 lg:mb-6 w-screen ml-[calc(-50vw+50%)] flex flex-col items-center overflow-hidden'>
+    <div className='relative mt-4 lg:mt-8 mb-6 lg:mb-10 w-full flex flex-col items-center overflow-hidden'>
       <HeroBackground />
 
       {/* Foreground content */}
-      <div className='relative z-[2] flex flex-col items-center justify-center px-6 pt-10 sm:pt-14 pb-4'>
-        <div className='flex flex-col items-center text-center'>
-          <img
-            src='/playwriter-logo.svg'
-            alt='Playwriter'
-            className='h-8 mb-5 dark:invert'
-          />
-          <h1 className='flex flex-col items-center leading-tight'>
-            <span
-              className='text-[28px] sm:text-[36px] md:text-[44px] text-foreground'
-              style={{ fontFamily: HERO_FONT }}
-            >
-              let agents control
-            </span>
-            <span
-              className='text-[28px] sm:text-[36px] md:text-[44px] text-foreground -mt-1 sm:-mt-2'
-              style={{ fontFamily: HERO_FONT }}
-            >
-              your Chrome browser
-            </span>
-          </h1>
+      <div
+        className='relative z-[2] flex flex-col items-center justify-center text-center max-w-[820px] mx-auto w-full px-5 py-8 sm:py-10 lg:py-12 gap-4'
+        style={{
+          opacity: fontsReady ? 1 : 0,
+          transition: 'opacity 0.3s cubic-bezier(0.23, 1, 0.32, 1)',
+        }}
+      >
+        <h1
+          className='flex flex-col items-center leading-[1.1] text-[32px] sm:text-[42px] md:text-[52px] text-foreground'
+          style={{ fontFamily: HERO_FONT }}
+        >
+          <span>let agents control</span>
+          <span>your Chrome browser</span>
+        </h1>
 
-          {/* CTA buttons */}
-          <div className='flex items-center gap-3 mt-7 sm:mt-8'>
-            <a
-              href={CHROME_EXTENSION_URL}
-              target='_blank'
-              rel='noopener noreferrer'
-              className='flex items-center gap-2 px-4 py-2 bg-white text-black hover:opacity-90 transition-opacity rounded-md font-medium text-xs cursor-pointer no-underline'
-            >
-              <ChromeIcon size={16} />
-              Chrome Extension
-            </a>
-            <a
-              href={GITHUB_URL}
-              target='_blank'
-              rel='noopener noreferrer'
-              className='flex items-center gap-2 px-4 py-2 border border-foreground/15 bg-white dark:bg-background hover:border-foreground/25 transition-colors rounded-md font-medium text-xs cursor-pointer no-underline'
-            >
-              <GithubIcon size={14} />
-              GitHub
-            </a>
-          </div>
-
-          {/* 4.7 star rating */}
-          <StarRating rating={4.7} />
-
+        {/* CTA buttons */}
+        <div className='flex gap-2.5 flex-wrap justify-center'>
           <a
-            href='#getting-started'
-            className='mt-6 mb-2 flex flex-col items-center gap-1 text-[11px] font-mono text-foreground/30 hover:text-foreground/60 transition-colors no-underline'
+            href={CHROME_EXTENSION_URL}
+            target='_blank'
+            rel='noopener noreferrer'
+            className='inline-flex items-center gap-2 rounded-md bg-white text-black backdrop-blur-sm h-9 px-4 text-sm font-medium no-underline hover:opacity-90 transition-opacity cursor-pointer'
           >
-            Learn more
-            <ArrowDownIcon />
+            <ChromeIcon size={16} />
+            Get Chrome Extension
+          </a>
+          <a
+            href={GITHUB_URL}
+            target='_blank'
+            rel='noopener noreferrer'
+            className='inline-flex items-center gap-2 rounded-md backdrop-blur-sm h-9 px-4 text-sm font-medium text-foreground no-underline hover:bg-accent/50 transition-colors cursor-pointer'
+          >
+            <GithubIcon size={14} />
+            GitHub
           </a>
         </div>
+
+        {/* 4.7 star rating */}
+        <StarRating rating={4.7} />
       </div>
     </div>
   )
@@ -210,80 +197,69 @@ export function HeroSection() {
 
 export function ChangelogHeroSection() {
   return (
-    <div className='relative z-0 mt-2 lg:mt-4 mb-4 lg:mb-6 w-screen ml-[calc(-50vw+50%)] flex flex-col items-center overflow-hidden'>
+    <div className='relative z-0 mt-4 lg:mt-8 mb-6 lg:mb-10 w-screen ml-[calc(-50vw+50%)] flex flex-col items-center overflow-hidden'>
       <HeroBackground dotColor='rgba(100, 140, 255, 0.7)' />
 
-      <div className='relative z-[2] flex flex-col items-center justify-center px-6 pt-20 sm:pt-28 pb-20 sm:pb-28'>
-        <div className='flex flex-col items-center text-center'>
-          <img
-            src='/playwriter-logo.svg'
-            alt='Playwriter'
-            className='h-8 mb-5 dark:invert'
-          />
-          <h1 className='flex flex-col items-center leading-tight'>
-            <span
-              className='text-[28px] sm:text-[36px] md:text-[44px] text-foreground'
-              style={{ fontFamily: HERO_FONT }}
-            >
-              changelog
-            </span>
-          </h1>
-        </div>
+      <div className='relative z-[2] flex flex-col items-center justify-center text-center px-6 py-8 sm:py-10 lg:py-12'>
+        <h1
+          className='leading-[1.1] text-[32px] sm:text-[42px] md:text-[52px] text-foreground'
+          style={{ fontFamily: HERO_FONT }}
+        >
+          changelog
+        </h1>
       </div>
     </div>
   )
 }
 
 export function CloudHeroSection() {
+  const [fontsReady, setFontsReady] = useState(false)
+
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      setFontsReady(true)
+    }, 3000)
+    void document.fonts.ready.then(() => {
+      setFontsReady(true)
+    })
+    return () => {
+      clearTimeout(timeout)
+    }
+  }, [])
+
   return (
-    <div className='relative mt-2 lg:mt-4 mb-4 lg:mb-6 w-screen ml-[calc(-50vw+50%)] flex flex-col items-center overflow-hidden'>
+    <div className='relative mt-4 lg:mt-8 mb-6 lg:mb-10 w-full flex flex-col items-center overflow-hidden'>
       <HeroBackground dotColor='rgba(255, 50, 50, 0.7)' />
 
       {/* Foreground content */}
-      <div className='relative z-[2] flex flex-col items-center justify-center px-6 pt-10 sm:pt-14 pb-4'>
-        <div className='flex flex-col items-center text-center'>
-          <img
-            src='/playwriter-logo.svg'
-            alt='Playwriter'
-            className='h-8 mb-5 dark:invert'
-          />
-          <h1 className='flex flex-col items-center leading-tight'>
-            <span
-              className='text-[28px] sm:text-[36px] md:text-[44px] text-foreground'
-              style={{ fontFamily: HERO_FONT }}
-            >
-              stealth browsers that
-            </span>
-            <span
-              className='text-[28px] sm:text-[36px] md:text-[44px] text-foreground -mt-1 sm:-mt-2'
-              style={{ fontFamily: HERO_FONT }}
-            >
-              bypass bot detection
-            </span>
-          </h1>
+      <div
+        className='relative z-[2] flex flex-col items-center justify-center text-center max-w-[820px] mx-auto w-full px-5 py-8 sm:py-10 lg:py-12 gap-4'
+        style={{
+          opacity: fontsReady ? 1 : 0,
+          transition: 'opacity 0.3s cubic-bezier(0.23, 1, 0.32, 1)',
+        }}
+      >
+        <h1
+          className='flex flex-col items-center leading-[1.1] text-[32px] sm:text-[42px] md:text-[52px] text-foreground'
+          style={{ fontFamily: HERO_FONT }}
+        >
+          <span>stealth browsers that</span>
+          <span>bypass bot detection</span>
+        </h1>
 
-          {/* CTA button */}
-          <div className='flex items-center gap-3 mt-7 sm:mt-8'>
-            <a
-              href='/dashboard'
-              className='flex items-center gap-2 px-4 py-2 bg-white text-black hover:opacity-90 transition-opacity rounded-md font-medium text-xs cursor-pointer no-underline'
-            >
-              <GoogleIcon size={16} />
-              Login with Google
-            </a>
-          </div>
-
-          {/* 4.7 star rating */}
-          <StarRating rating={4.7} />
-
+        {/* CTA button */}
+        <div className='flex gap-2.5 flex-wrap justify-center'>
           <a
-            href='#pricing'
-            className='mt-6 mb-2 flex flex-col items-center gap-1 text-[11px] font-mono text-foreground/30 hover:text-foreground/60 transition-colors no-underline'
+            href='/login'
+            className='inline-flex items-center gap-2 rounded-md bg-white text-black backdrop-blur-sm h-9 px-4 text-sm font-medium no-underline hover:opacity-90 transition-opacity cursor-pointer'
           >
-            Learn more
-            <ArrowDownIcon />
+            <GoogleIcon size={16} />
+            Login with Google
           </a>
         </div>
+
+        {/* 4.7 star rating */}
+        <StarRating rating={4.7} />
       </div>
     </div>
   )

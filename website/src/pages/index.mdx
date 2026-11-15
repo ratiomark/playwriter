@@ -1,7 +1,7 @@
 ---
 title: Let Agents Control Your Real Chrome Browser
 sidebarTitle: Home
-description: Control your real Chrome browser with Playwright from an agent, CLI, or MCP server.
+description: Control your real Chrome browser with Playwright from an agent, CLI, or MCP server. Keep logins, cookies, and extensions. No headless Chrome.
 icon: lucide:home
 rendering: static
 prompt: |
@@ -28,13 +28,22 @@ If Playwriter is useful to you, [star it on GitHub](https://github.com/remorses/
 </Tip>
 </Aside>
 
-<Image
-  src='/screenshot@2x.png'
-  alt='Playwriter controlling Chrome with accessibility labels overlay'
-  width={1280}
-  height={800}
-
+<div className='bleed'>
+<video
+  src='https://assets.playwriter.dev/playwriter-demo.mp4'
+  poster='/playwriter-demo-poster.jpg'
+  aria-label='Agents using Playwriter to fill a form, generate images on Midjourney and ChatGPT, read Hacker News, and debug a dev server in Chrome'
+  width={1920}
+  height={940}
+  autoPlay
+  muted
+  loop
+  playsInline
+  controls
+  preload='metadata'
+  style={{ width: '100%', height: 'auto', display: 'block', borderRadius: 12 }}
 />
+</div>
 
 
 Other browser MCPs either **spawn a fresh Chrome** or give agents a fixed set of tools. New Chrome
@@ -51,7 +60,7 @@ tool definitions. And it runs in your existing browser, so **nothing extra gets 
 
 ### Install the extension
 
-1. Install the [Chrome extension](https://chromewebstore.google.com/detail/playwriter-mcp/jfeammnjpkecdekppnclgkkffahnhfhe)
+1. Install the [Chrome extension](https://chromewebstore.google.com/detail/playwriter/jfeammnjpkecdekppnclgkkffahnhfhe)
 2. Click the extension icon on a tab. It turns green when connected
 
 ### Install CLI + skill
@@ -66,20 +75,21 @@ Then install the **skill**. It teaches your agent how to use Playwriter: which
 selectors to use, how to avoid timeouts, how to read snapshots, and all available utilities.
 
 ```bash
-npx -y skills add remorses/playwriter
+npx -y skills add https://playwriter.dev -g -y
 ```
 
 ### First commands
 
 The extension connects your browser to a **local WebSocket relay** on
-`localhost:19988`. The CLI sends Playwright code through the relay. No remote servers, no
-accounts, nothing leaves your machine.
+`localhost:19988`. The CLI sends Playwright code through the relay. By default, no remote
+server is involved and no browser payload leaves your machine. Remote control is
+optional and starts only after you confirm a disclosure.
 
 ```bash
 playwriter session new              # new sandbox, outputs id (e.g. 1)
-playwriter -e "page.goto('https://example.com')"
-playwriter -e "snapshot({ page })"
-playwriter -e "page.locator('aria-ref=e5').click()"
+playwriter -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
+playwriter -e "snapshot({ page: state.page })"
+playwriter -e "state.page.locator('aria-ref=e5').click()"
 ```
 
 ## How it works
@@ -96,20 +106,19 @@ WebSocket to a local relay. Your agent (CLI, MCP, or a Playwright script) connec
 Chrome restart, no flags, no special setup.
 
 ```diagram
-┌─────────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
-│   BROWSER           │     │   LOCALHOST          │     │   CLIENT        │
-│                     │     │                      │     │                 │
-│  ┌───────────────┐  │     │ WebSocket Server     │     │  ┌───────────┐  │
-│  │   Extension   │<───────┬───>  :19988          │     │  │ CLI / MCP │  │
-│  └───────┬───────┘  │ WS  │                      │     │  └───────────┘  │
-│          │          │     │  /extension          │     │        │        │
-│    chrome.debugger  │     │       │              │     │        v        │
-│          v          │     │       v              │     │  ┌────────────┐ │
-│  ┌───────────────┐  │     │  /cdp/:id <───────────────>│  │ execute    │ │
-│  │ Tab 1 (green) │  │     └──────────────────────┘  WS │  └────────────┘ │
-│  │ Tab 2 (green) │  │                                  │        │        │
-│  │ Tab 3 (gray)  │  │     Tab 3 not controlled         │ Playwright API  │
-└─────────────────────┘     (extension not clicked)      └─────────────────┘
+┌─────────────────────┐      ┌──────────────────────┐      ┌─────────────────┐
+│  BROWSER            │  WS  │  LOCALHOST           │  WS  │  CLIENT         │
+│                     │      │                      │      │                 │
+│  Extension          │<────>│  WebSocket Server    │<────>│  CLI / MCP      │
+│      │              │      │  :19988              │      │      │          │
+│  chrome.debugger    │      │                      │      │      v          │
+│      │              │      │  /extension          │      │  execute tool   │
+│      v              │      │      │               │      │      │          │
+│  Tab 1 (green)      │      │      v               │      │      v          │
+│  Tab 2 (green)      │      │  /cdp/:id            │      │  Playwright API │
+│  Tab 3 (gray)       │      └──────────────────────┘      └─────────────────┘
+└─────────────────────┘
+  Tab 3 not controlled (extension not clicked)
 ```
 
 The relay **multiplexes sessions**, so multiple agents or CLI instances can work with the same
@@ -152,7 +161,7 @@ interactive element as text, with Playwright locators attached.
 agent can parse them without vision.
 
 ```bash
-playwriter -e "snapshot({ page })"
+playwriter -e "snapshot({ page: state.page })"
 
 # Output:
 # - banner:
@@ -164,16 +173,16 @@ playwriter -e "snapshot({ page })"
 
 ### Search and diff
 
-Each line ends with a **locator** you can pass directly to `page.locator()`.
+Each line ends with a **locator** you can pass directly to `state.page.locator()`.
 Subsequent calls return a **diff**, so you only see what changed. Use `search` to
 filter large pages.
 
 ```bash
 # Search for specific elements
-playwriter -e "snapshot({ page, search: /button|submit/i })"
+playwriter -e "snapshot({ page: state.page, search: /button|submit/i })"
 
 # Always print URL first, then snapshot
-playwriter -e "console.log('URL:', page.url()); snapshot({ page }).then(console.log)"
+playwriter -e "console.log('URL:', state.page.url()); snapshot({ page: state.page }).then(console.log)"
 ```
 
 ## Visual labels
@@ -183,10 +192,10 @@ When the agent needs to understand **where things are on screen**,
 interactive element. The agent sees the screenshot, reads the labels, and clicks by reference.
 
 ```bash
-playwriter -e "screenshotWithAccessibilityLabels({ page })"
+playwriter -e "screenshotWithAccessibilityLabels({ page: state.page })"
 # Returns screenshot + accessibility snapshot with aria-ref selectors
 
-playwriter -e "page.locator('aria-ref=e5').click()"
+playwriter -e "state.page.locator('aria-ref=e5').click()"
 ```
 
 Labels are **color-coded by element type**: yellow for links, orange for buttons, coral for
@@ -207,7 +216,7 @@ playwriter session new    # => 2
 playwriter session list   # shows sessions + state keys
 
 # Session 1 stores data
-playwriter -s 1 -e "state.users = page.$$eval('.user', els => els.map(e => e.textContent))"
+playwriter -s 1 -e "state.users = state.page.$$eval('.user', els => els.map(e => e.textContent))"
 
 # Session 2 can't see it
 playwriter -s 2 -e "console.log(state.users)"  # undefined
@@ -215,14 +224,17 @@ playwriter -s 2 -e "console.log(state.users)"  # undefined
 
 ### Dedicated pages
 
-Create your own page to **avoid interference** from other agents. Reuse an existing
-`about:blank` tab or create a fresh one, and store it in `state`.
+There is **no default page**. Create your own tab and store it in `state`, so other
+agents do not interfere. To use a tab the user already opened, find it by URL.
 
 ```bash
-playwriter -s 1 -e "state.myPage = context.pages().find(p => p.url() === 'about:blank') ?? context.newPage(); state.myPage.goto('https://example.com')"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
 
-# All subsequent calls use state.myPage
-playwriter -s 1 -e "state.myPage.title()"
+# Or pick the tab the user opened (last match is the most recent)
+playwriter -s 1 -e "state.page = context.pages().findLast((p) => p.url().includes('github.com'))"
+
+# All subsequent calls use state.page
+playwriter -s 1 -e "state.page.title()"
 ```
 
 ## Debugger and editor
@@ -233,7 +245,7 @@ access, not a watered-down subset.
 
 ```bash
 # Set breakpoints and debug
-playwriter -e "state.cdp = getCDPSession({ page }); state.dbg = createDebugger({ cdp: state.cdp }); state.dbg.enable()"
+playwriter -e "state.cdp = getCDPSession({ page: state.page }); state.dbg = createDebugger({ cdp: state.cdp }); state.dbg.enable()"
 playwriter -e "state.scripts = state.dbg.listScripts({ search: 'app' }); state.scripts.map(s => s.url)"
 playwriter -e "state.dbg.setBreakpoint({ file: state.scripts[0].url, line: 42 })"
 
@@ -253,14 +265,14 @@ rendering, or debug failing requests. Captured data lives in `state` and persist
 
 ```bash
 # Start intercepting
-playwriter -e "state.responses = []; page.on('response', async res => { if (res.url().includes('/api/')) { try { state.responses.push({ url: res.url(), status: res.status(), body: await res.json() }); } catch {} } })"
+playwriter -e "state.responses = []; state.page.on('response', async res => { if (res.url().includes('/api/')) { try { state.responses.push({ url: res.url(), status: res.status(), body: await res.json() }); } catch {} } })"
 
 # Trigger actions, then analyze
-playwriter -e "page.click('button.load-more')"
+playwriter -e "state.page.click('button.load-more')"
 playwriter -e "console.log('Captured', state.responses.length, 'API calls'); state.responses.forEach(r => console.log(r.status, r.url.slice(0, 80)))"
 
 # Replay an API call directly
-playwriter -e "page.evaluate(async (url) => { const res = await fetch(url); return res.json(); }, state.responses[0].url)"
+playwriter -e "state.page.evaluate(async (url) => { const res = await fetch(url); return res.json(); }, state.responses[0].url)"
 ```
 
 **Faster than scraping the DOM.** The agent captures the real API calls, inspects their schemas,
@@ -270,33 +282,35 @@ client-side rendering.
 ## Screen recording
 
 Have the agent **record what it's doing** as MP4 video. The recording uses
-`chrome.tabCapture` and runs in the extension context, so it
+CDP screencast piped to `ffmpeg`, so it needs no permission click and
 **survives page navigation**.
 
 ```bash
 # Start recording
-playwriter -e "startRecording({ page, outputPath: './recording.mp4', frameRate: 30 })"
+playwriter -e "state.video = await recording.start({ page: state.page, outputPath: './recording.mp4', frameRate: 30 })"
 
 # Navigate, interact — recording continues
-playwriter -e "page.click('a'); page.waitForLoadState('domcontentloaded')"
-playwriter -e "page.goBack()"
+playwriter -e "await state.page.click('a'); await state.page.waitForLoadState('domcontentloaded')"
+playwriter -e "await state.page.goBack()"
 
 # Stop and save
-playwriter -e "stopRecording({ page })"
+playwriter -e "await state.video.stop()"
 ```
 
-Unlike `getDisplayMedia`, this approach **persists across navigations** because the extension holds
-the `MediaRecorder`, not the page. You can also check recording status with `isRecording` or cancel
-without saving with `cancelRecording`.
+It works in extension, direct CDP and headless mode, and can record **page audio** with
+`audio: true`. With `clock: 'manual'` only `wait(ms)` windows are recorded, so agent latency never
+shows in the video. The handle also has `isRecording`, `cancel()` and `setPage()` to switch tabs.
+Requires `ffmpeg` on `PATH`.
 
 ## Comparison
 
 See how Playwriter compares to other browser automation tools:
 
 - [**vs Chrome Direct CDP**](./docs/vs-chrome-cdp.mdx) — Chrome's permission dialog blocks autonomous agents. Playwriter's extension avoids it entirely.
-- [**vs Playwright MCP**](./docs/vs-playwright-mcp.mdx) — Fresh browser vs your real Chrome with logins and extensions.
+- [**vs Playwright MCP**](./docs/vs-playwright-mcp.mdx) — Separate managed profile vs your real Chrome, plus raw CDP, native video, and cloud.
 - [**vs Playwright CLI**](./docs/vs-playwright-cli.mdx) — Same Playwright API, but running in your existing browser with CDP access.
 - [**vs BrowserMCP**](./docs/vs-browser-mcp.mdx) — One execute tool vs 12+ fixed tools with high context overhead.
+- [**vs agent-browser**](./docs/vs-agent-browser.mdx) — One programmable tool and reusable scripts vs 50+ fixed commands.
 - [**vs Claude Extension**](./docs/vs-claude-extension.mdx) — Any MCP client, text snapshots instead of screenshots, full CDP access.
 
 ## Remote access
@@ -314,7 +328,7 @@ npx -y traforo -p 19988 -t my-machine -- npx -y playwriter serve --token <secret
 # From anywhere — set env vars and use normally
 export PLAYWRITER_HOST=https://my-machine-tunnel.traforo.dev
 export PLAYWRITER_TOKEN=<secret>
-playwriter -e "page.goto('https://example.com')"
+playwriter -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
 ```
 
 ### LAN
@@ -326,12 +340,12 @@ support, multi-machine automation, dev from a VM or devcontainer.
 
 ## Security
 
-Everything runs **on your machine**. The relay binds to `localhost:19988` and only
+By default, everything runs **on your machine**. The relay binds to `localhost:19988` and only
 accepts connections from the extension. No remote server, no account, no telemetry.
 
-- **Local only:** WebSocket server binds to localhost. Nothing leaves your machine.
+- **Local by default:** WebSocket server binds to localhost. Traffic leaves your machine only when you explicitly enable Remote control, remote access, or cloud browsers.
 - **Origin validation:** only the Playwriter extension origin is accepted. Browsers cannot spoof the Origin header, so malicious websites cannot connect.
-- **Explicit consent:** only tabs where you clicked the extension icon are controlled. No background access.
+- **Controlled tab scope:** tabs are controlled after an extension click. Playwriter never opens a tab on its own. New tabs are created only when code calls `context.newPage()`.
 - **Visible automation:** Chrome shows an automation banner on controlled tabs.
 
 ## More resources

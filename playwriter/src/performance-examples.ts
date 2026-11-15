@@ -1,6 +1,6 @@
 // Example snippets for profiling website performance with Playwriter and CDP.
 
-import { console, getCDPSession, page } from './debugger-examples-types.js'
+import { console, getCDPSession, state } from './debugger-examples-types.js'
 
 type PerfMetrics = {
   paints: Record<string, number>
@@ -36,7 +36,7 @@ type EventTimingEntry = {
 
 // Example: Collect navigation timing and basic web vitals from the current page
 async function collectWebVitals() {
-  await page.evaluate(() => {
+  await state.page.evaluate(() => {
     const metrics: PerfMetrics = {
       paints: {},
       lcp: 0,
@@ -74,9 +74,9 @@ async function collectWebVitals() {
     }).observe({ type: 'layout-shift', buffered: true } as never)
   })
 
-  await page.reload({ waitUntil: 'domcontentloaded' })
+  await state.page.reload({ waitUntil: 'domcontentloaded' })
 
-  const report = await page.evaluate(() => {
+  const report = await state.page.evaluate(() => {
     const perfGlobal = globalThis as typeof globalThis & {
       __pwPerfMetrics?: PerfMetrics
     }
@@ -100,7 +100,7 @@ async function collectWebVitals() {
 
 // Example: Measure the biggest transferred requests with raw CDP network events
 async function collectHeaviestRequests() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   await cdp.send('Network.enable')
   await cdp.send('Network.setCacheDisabled', { cacheDisabled: true })
 
@@ -118,7 +118,7 @@ async function collectHeaviestRequests() {
     finished.set(event.requestId, event.encodedDataLength)
   })
 
-  await page.reload({ waitUntil: 'domcontentloaded' })
+  await state.page.reload({ waitUntil: 'domcontentloaded' })
 
   const largest = [...responses.entries()]
     .map(([requestId, response]) => {
@@ -136,7 +136,7 @@ async function collectHeaviestRequests() {
 
 // Example: Check whether interactivity is blocked by long tasks or slow events
 async function measureInteractivity() {
-  await page.evaluate(() => {
+  await state.page.evaluate(() => {
     const perfGlobal = globalThis as typeof globalThis & {
       __pwLongTasks?: LongTaskEntry[]
       __pwEventTimings?: EventTimingEntry[]
@@ -165,10 +165,10 @@ async function measureInteractivity() {
     }).observe({ type: 'event', buffered: true, durationThreshold: 16 } as never)
   })
 
-  const button = page.getByRole('button').first()
+  const button = state.page.getByRole('button').first()
   await button.click()
 
-  const report = await page.evaluate(() => {
+  const report = await state.page.evaluate(() => {
     const perfGlobal = globalThis as typeof globalThis & {
       __pwLongTasks?: LongTaskEntry[]
       __pwEventTimings?: EventTimingEntry[]

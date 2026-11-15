@@ -156,8 +156,8 @@ Once connected, the cloud browser works exactly like a local one. All Playwright
 snapshots, screenshots, and MCP tools work the same way:
 
 ```bash
-playwriter -s 1 -e "await page.goto('https://example.com')"
-playwriter -s 1 -e "console.log(await snapshot({ page }))"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
+playwriter -s 1 -e "console.log(await snapshot({ page: state.page }))"
 ```
 
 ### 5. Check status
@@ -189,6 +189,31 @@ Cloud browsers work with the MCP server too. Set env vars in your MCP client con
 
 The MCP server discovers cloud browsers alongside local ones. Agents can request a cloud browser
 when they need stealth browsing, geo-targeted access, or CAPTCHA bypass without any extra prompting.
+
+## Alternative: remote-control the user's own browser
+
+Cloud browsers are **fresh machines**: no cookies, no logins, no history. Sometimes you need the
+opposite — an agent acting inside a browser where the user is **already logged in**. For that,
+Playwriter has **Remote control**: the user clicks **Remote control** in the Playwriter toolbar on a tab,
+confirms the sharing disclosure, gets a secret tunnel URL copied to their
+clipboard, and sends it to the agent.
+The agent connects from any machine:
+
+```bash
+playwriter session new --remote <id>
+```
+
+The user needs no playwriter install, only the extension. The agent can use every Playwriter tab and
+open new ones. It is not a security sandbox: the recipient must be fully trusted. The
+user revokes access anytime with **Stop sharing** on the Remote ON dropdown. See [Remote Access](/docs/remote-access)
+for details.
+
+| | Cloud browser | Remote control |
+| --- | --- | --- |
+| **Logins** | fresh profile, none | user's real sessions |
+| **Scope** | full browser | every Playwriter tab, plus new tabs |
+| **Stealth/proxies** | yes | no (real user browser) |
+| **User setup** | none | extension + one click |
 
 ## Subscribe
 

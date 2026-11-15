@@ -30,13 +30,13 @@ function CliContent() {
         {`# Interactive login, then start a cloud browser and use it
 playwriter cloud login
 playwriter session new --browser cloud
-playwriter -s 1 -e "await page.goto('https://example.com')"
-playwriter -s 1 -e "console.log(await snapshot({ page }))"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
+playwriter -s 1 -e "console.log(await snapshot({ page: state.page }))"
 
 # Or just set your API key and run directly
 export PLAYWRITER_API_KEY=pw_xxxxx
 playwriter session new --browser cloud --proxy us
-playwriter -s 1 -e "await page.goto('https://example.com')"`}
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"`}
       </CodeBlock>
     </div>
   )

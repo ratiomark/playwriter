@@ -9,7 +9,8 @@ import { fileURLToPath } from 'node:url'
 import type { Protocol } from 'devtools-protocol'
 import { Sema } from 'async-sema'
 import type { ICDPSession } from './cdp-session.js'
-import { getCDPSessionForPage } from './cdp-session.js'
+import { evaluateInPlaywriterWorld, getCDPSessionForPage } from './cdp-session.js'
+import { evaluateIsolated } from './playwright-import.js'
 
 // Import sharp at module level - resolves to null if not available
 const sharpPromise = import('sharp')
@@ -44,12 +45,10 @@ function getA11yClientCode(): string {
   return a11yClientCode
 }
 
+// Always inject: a page can keep a stale __a11y from an older playwriter version.
+// Same round trip count as checking first, and the bundle is ~8 KB.
 async function ensureA11yClient(page: Page): Promise<void> {
-  const hasA11y = await page.evaluate(() => !!(globalThis as any).__a11y)
-  if (!hasA11y) {
-    const code = getA11yClientCode()
-    await page.evaluate(code)
-  }
+  await evaluateIsolated({ target: page, fn: getA11yClientCode() })
 }
 
 // ============================================================================
@@ -361,7 +360,7 @@ function buildBaseLocator({
   const trimmedName = name.trim()
   if (trimmedName.length > 0) {
     const escapedName = escapeLocatorValue(trimmedName)
-    return `role=${role}[name="${escapedName}"]`
+    return `role=${role}[name="${escapedName}"i]`
   }
   return `role=${role}`
 }
@@ -385,18 +384,42 @@ function getAxRole(node: Protocol.Accessibility.AXNode): string {
   return role.toLowerCase()
 }
 
+// Chrome reports an implicit level for every listitem, so only show it where it means something
+const LEVEL_ROLES = new Set(['heading', 'treeitem'])
+
+/** Element state in Playwright aria snapshot syntax, e.g. `[checked] [level=2]`. */
+export function getAxState(node: Protocol.Accessibility.AXNode): string | undefined {
+  const props = new Map((node.properties ?? []).map((p) => [p.name, getAxValueString(p.value)]))
+  const parts: string[] = []
+  const checked = props.get('checked')
+  if (checked === 'true') parts.push('[checked]')
+  if (checked === 'mixed') parts.push('[checked=mixed]')
+  if (props.get('disabled') === 'true') parts.push('[disabled]')
+  if (props.get('expanded') === 'true') parts.push('[expanded]')
+  const level = props.get('level')
+  if (level && LEVEL_ROLES.has(getAxRole(node))) parts.push(`[level=${level}]`)
+  const pressed = props.get('pressed')
+  if (pressed === 'true') parts.push('[pressed]')
+  if (pressed === 'mixed') parts.push('[pressed=mixed]')
+  if (props.get('selected') === 'true') parts.push('[selected]')
+  return parts.length > 0 ? parts.join(' ') : undefined
+}
+
 export type SnapshotLine = {
   text: string
   baseLocator?: string
   hasChildren?: boolean
   role?: string
   name?: string
+  state?: string
   indent?: number
 }
 
 export type SnapshotNode = {
   role: string
   name: string
+  /** e.g. `[checked] [disabled]`, from getAxState */
+  state?: string
   baseLocator?: string
   ref?: string
   backendNodeId?: Protocol.DOM.BackendNodeId
@@ -408,12 +431,14 @@ export type SnapshotNode = {
 function buildSnapshotLine({
   role,
   name,
+  state,
   baseLocator,
   indent,
   hasChildren,
 }: {
   role: string
   name: string
+  state?: string
   baseLocator?: string
   indent: number
   hasChildren: boolean
@@ -424,7 +449,10 @@ function buildSnapshotLine({
     const escapedName = name.replace(/"/g, '\\"')
     text += ` "${escapedName}"`
   }
-  return { text, baseLocator, hasChildren, role, name, indent }
+  if (state) {
+    text += ` ${state}`
+  }
+  return { text, baseLocator, hasChildren, role, name, state, indent }
 }
 
 function buildTextLine(text: string, indent: number): SnapshotLine {
@@ -442,6 +470,7 @@ export function buildSnapshotLines(nodes: SnapshotNode[], indent = 0): SnapshotL
         : buildSnapshotLine({
             role: node.role,
             name: node.name,
+            state: node.state,
             baseLocator: node.baseLocator,
             indent: nodeIndent,
             hasChildren: node.children.length > 0,
@@ -496,6 +525,7 @@ export function buildRawSnapshotTree(options: {
   return {
     role,
     name,
+    state: getAxState(node),
     backendNodeId: node.backendDOMNodeId,
     ignored: node.ignored,
     children,
@@ -599,7 +629,9 @@ export function filterInteractiveSnapshotTree(options: {
   if (includeInteractive) {
     const domInfo = options.node.backendNodeId ? options.domByBackendId.get(options.node.backendNodeId) : undefined
     const stable = domInfo ? getStableRefFromAttributes(domInfo.attributes) : null
-    const isPromoted = options.node.backendNodeId != null && (options.promotedContentEditableIds?.has(options.node.backendNodeId) ?? false)
+    const isPromoted =
+      options.node.backendNodeId != null &&
+      (options.promotedContentEditableIds?.has(options.node.backendNodeId) ?? false)
     baseLocator = buildBaseLocator({ role, name, stable, isPromotedContentEditable: isPromoted })
     ref = options.createRefForNode({ backendNodeId: options.node.backendNodeId, role, name })
   }
@@ -607,6 +639,7 @@ export function filterInteractiveSnapshotTree(options: {
   const nodeEntry: SnapshotNode = {
     role,
     name: nameToUse,
+    state: options.node.state,
     baseLocator,
     ref: ref ?? undefined,
     backendNodeId: options.node.backendNodeId,
@@ -700,7 +733,9 @@ export function filterFullSnapshotTree(options: {
   if (includeInteractive) {
     const domInfo = options.node.backendNodeId ? options.domByBackendId.get(options.node.backendNodeId) : undefined
     const stable = domInfo ? getStableRefFromAttributes(domInfo.attributes) : null
-    const isPromoted = options.node.backendNodeId != null && (options.promotedContentEditableIds?.has(options.node.backendNodeId) ?? false)
+    const isPromoted =
+      options.node.backendNodeId != null &&
+      (options.promotedContentEditableIds?.has(options.node.backendNodeId) ?? false)
     baseLocator = buildBaseLocator({ role, name, stable, isPromotedContentEditable: isPromoted })
     ref = options.createRefForNode({ backendNodeId: options.node.backendNodeId, role, name })
   }
@@ -708,6 +743,7 @@ export function filterFullSnapshotTree(options: {
   const nodeEntry: SnapshotNode = {
     role,
     name: nameToUse,
+    state: options.node.state,
     baseLocator,
     ref: ref ?? undefined,
     backendNodeId: options.node.backendNodeId,
@@ -736,9 +772,17 @@ function buildLocatorLineText({ line, locator }: { line: SnapshotLine; locator: 
   if (name && !hasNameInLocator) {
     parts.push(`"${escapedName}"`)
   }
+  // State goes before the locator so the locator can still be copied as is
+  if (line.state) {
+    parts.push(line.state)
+  }
 
   const base = parts.length > 0 ? `${prefix}- ${parts.join(' ')}` : `${prefix}-`
   return `${base} ${locator}`
+}
+
+function locatorIdentity(locator: string): string {
+  return locator.startsWith('role=') ? locator.toUpperCase() : locator
 }
 
 export function finalizeSnapshotOutput(
@@ -750,7 +794,8 @@ export function finalizeSnapshotOutput(
     if (!line.baseLocator) {
       return acc
     }
-    acc.set(line.baseLocator, (acc.get(line.baseLocator) ?? 0) + 1)
+    const key = locatorIdentity(line.baseLocator)
+    acc.set(key, (acc.get(key) ?? 0) + 1)
     return acc
   }, new Map<string, number>())
 
@@ -759,9 +804,10 @@ export function finalizeSnapshotOutput(
     if (!line.baseLocator) {
       return acc
     }
-    const count = locatorCounts.get(line.baseLocator) ?? 0
-    const index = locatorIndices.get(line.baseLocator) ?? 0
-    locatorIndices.set(line.baseLocator, index + 1)
+    const key = locatorIdentity(line.baseLocator)
+    const count = locatorCounts.get(key) ?? 0
+    const index = locatorIndices.get(key) ?? 0
+    locatorIndices.set(key, index + 1)
     const locator = count > 1 ? `${line.baseLocator} >> nth=${index}` : line.baseLocator
     acc.push(locator)
     return acc
@@ -943,6 +989,27 @@ async function resolveFrame({ frame, page }: { frame?: Frame | FrameLocator; pag
 // Main Functions
 // ============================================================================
 
+/** Resolves after the next rendered frame. Runs in the page, so it must be self-contained. */
+function waitForRenderedFrame(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const window = document.defaultView
+    if (!window) {
+      resolve()
+      return
+    }
+    if (document.visibilityState !== 'visible') {
+      document.documentElement.getBoundingClientRect()
+      resolve()
+      return
+    }
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        resolve()
+      })
+    })
+  })
+}
+
 /**
  * Get an accessibility snapshot with utilities to look up refs for elements.
  * Uses the browser accessibility tree (CDP) and maps nodes to DOM attributes.
@@ -993,23 +1060,30 @@ export async function getAriaSnapshot({
   const frameId = resolvedFrame?.frameId() ?? null
 
   if (frameId) {
-    const { targetInfos } = (await session.send('Target.getTargets')) as Protocol.Target.GetTargetsResponse
+    const { targetInfos } = await session.send('Target.getTargets')
     const frameUrl = resolvedFrame!.url()
     const iframeTarget = targetInfos.find((t) => {
       return t.type === 'iframe' && t.url === frameUrl
     })
     if (iframeTarget) {
-      const { sessionId } = (await session.send('Target.attachToTarget', {
+      const { sessionId } = await session.send('Target.attachToTarget', {
         targetId: iframeTarget.targetId,
         flatten: true,
-      })) as Protocol.Target.AttachToTargetResponse
+      })
       oopifSessionId = sessionId
       await session.send('Runtime.runIfWaitingForDebugger', undefined, oopifSessionId)
     }
   }
 
-  await session.send('DOM.enable', undefined, oopifSessionId)
-  await session.send('Accessibility.enable', undefined, oopifSessionId)
+  await Promise.all([
+    session.send('DOM.enable', undefined, oopifSessionId),
+    session.send('Accessibility.enable', undefined, oopifSessionId),
+    // Blink updates its AX cache during rendering, after framework navigation changes the DOM.
+    // Isolated world on the main frame, so page scripts do not see the call.
+    resolvedFrame
+      ? evaluateIsolated({ target: resolvedFrame, fn: waitForRenderedFrame })
+      : evaluateInPlaywriterWorld({ page, expression: `(${waitForRenderedFrame.toString()})()`, awaitPromise: true }),
+  ])
   const scopeAttr = 'data-pw-scope'
   const scopeValue = crypto.randomUUID()
   let scopeApplied = false
@@ -1017,20 +1091,24 @@ export async function getAriaSnapshot({
 
   try {
     if (scopeLocator) {
-      await scopeLocator.evaluate(
-        (element, data) => {
+      await evaluateIsolated({
+        target: scopeLocator,
+        fn: (element, data) => {
           element.setAttribute(data.attr, data.value)
         },
-        { attr: scopeAttr, value: scopeValue },
-      )
+        arg: { attr: scopeAttr, value: scopeValue },
+      })
       scopeApplied = true
     }
 
-    const { nodes: domNodes } = (await session.send(
+    // AX tree first: every node in it is also in the later DOM, so injected Playwriter UI is always found below
+    const axParams = !oopifSessionId && frameId ? { frameId } : undefined
+    const { nodes: axNodes } = await session.send('Accessibility.getFullAXTree', axParams, oopifSessionId)
+    const { nodes: domNodes } = await session.send(
       'DOM.getFlattenedDocument',
       { depth: -1, pierce: true },
       oopifSessionId,
-    )) as Protocol.DOM.GetFlattenedDocumentResponse
+    )
     const { domById, domByBackendId, childrenByParent } = buildDomIndex(domNodes)
 
     let scopeRootNodeId: Protocol.DOM.NodeId | null = null
@@ -1046,17 +1124,28 @@ export async function getAriaSnapshot({
     }
 
     const allowedBackendIds = scopeRootNodeId ? buildBackendIdSet(scopeRootNodeId, childrenByParent, domById) : null
-
-    const axParams = !oopifSessionId && frameId ? { frameId } : undefined
-    const { nodes: axNodes } = (await session.send(
-      'Accessibility.getFullAXTree',
-      axParams,
-      oopifSessionId,
-    )) as Protocol.Accessibility.GetFullAXTreeResponse
+    // Playwriter's own toolbar, overlays and cursor are injected async, so they must never reach the snapshot
+    const playwriterUiBackendIds = new Set(
+      [...domById.values()]
+        .filter(({ attributes }) => {
+          return (
+            attributes.has('data-playwriter-toolbar') ||
+            attributes.has('data-playwriter-overlay') ||
+            attributes.get('id') === '__playwriter_ghost_cursor__'
+          )
+        })
+        .flatMap(({ nodeId }) => {
+          return [...buildBackendIdSet(nodeId, childrenByParent, domById)]
+        }),
+    )
 
     const axById = new Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>()
     for (const node of axNodes) {
       axById.set(node.nodeId, node)
+      // Also drops AX children with no DOM node, like CSS generated text
+      if (node.backendDOMNodeId && playwriterUiBackendIds.has(node.backendDOMNodeId)) {
+        node.childIds = []
+      }
     }
 
     // Index AX nodes by backendDOMNodeId for O(1) lookups during promotion
@@ -1159,6 +1248,9 @@ export async function getAriaSnapshot({
     }
 
     const isNodeInScope = (node: Protocol.Accessibility.AXNode): boolean => {
+      if (node.backendDOMNodeId && playwriterUiBackendIds.has(node.backendDOMNodeId)) {
+        return false
+      }
       if (!allowedBackendIds) {
         return true
       }
@@ -1246,7 +1338,7 @@ export async function getAriaSnapshot({
         return null
       }
       const escapedName = info.name.replace(/"/g, '\\"')
-      return `role=${info.role}[name="${escapedName}"]`
+      return `role=${info.role}[name="${escapedName}"i]`
     }
 
     const getRefsForLocators = async (locators: Array<Locator | ElementHandle>): Promise<Array<AriaRef | null>> => {
@@ -1257,17 +1349,16 @@ export async function getAriaSnapshot({
       const targetHandles = await Promise.all(
         locators.map(async (loc) => {
           try {
-            return 'elementHandle' in loc
-              ? await (loc as Locator).elementHandle({ timeout: 1000 })
-              : (loc as ElementHandle)
+            return 'elementHandle' in loc ? await loc.elementHandle({ timeout: 1000 }) : loc
           } catch {
             return null
           }
         }),
       )
 
-      const matchingRefs = await page.evaluate(
-        ({ targets, refData }) => {
+      const matchingRefs = await evaluateIsolated({
+        target: page,
+        fn: ({ targets, refData }) => {
           return targets.map((target) => {
             if (!target) {
               return null
@@ -1308,11 +1399,11 @@ export async function getAriaSnapshot({
             return null
           })
         },
-        {
+        arg: {
           targets: targetHandles,
           refData: result.refs,
         },
-      )
+      })
 
       return matchingRefs.map((ref) => {
         if (!ref) {
@@ -1336,9 +1427,13 @@ export async function getAriaSnapshot({
     }
   } finally {
     if (scopeApplied && scopeLocator) {
-      await scopeLocator.evaluate((element, attr) => {
-        element.removeAttribute(attr)
-      }, scopeAttr)
+      await evaluateIsolated({
+        target: scopeLocator,
+        fn: (element, attr) => {
+          element.removeAttribute(attr)
+        },
+        arg: scopeAttr,
+      })
     }
     if (oopifSessionId) {
       await session.send('Target.detachFromTarget', { sessionId: oopifSessionId }).catch((e) => {
@@ -1410,7 +1505,7 @@ async function getLabelBoxesForRefs({
           const response = await Promise.race([
             session.send('DOM.getBoxModel', {
               backendNodeId: ref.backendNodeId,
-            }) as Promise<Protocol.DOM.GetBoxModelResponse>,
+            }),
             new Promise<null>((resolve) => {
               setTimeout(() => {
                 resolve(null)
@@ -1485,6 +1580,8 @@ export async function showAriaRefLabels({
 }): Promise<{
   snapshot: string
   labelCount: number
+  /** Short ref (e.g. `e3`) to locator string, for the refs in this snapshot */
+  refToLocator: Map<string, string>
 }> {
   const startTime = Date.now()
   const log = logger?.info ?? logger?.error ?? console.error
@@ -1499,12 +1596,19 @@ export async function showAriaRefLabels({
 
   try {
     const snapshotStart = Date.now()
-    const { snapshot, refs } = await getAriaSnapshot({ page, locator, interactiveOnly, cdp })
+    const { snapshot, refs, getSelectorForRef } = await getAriaSnapshot({ page, locator, interactiveOnly, cdp })
     const shortRefMap = new Map(
       refs.map((entry) => {
         return [entry.ref, entry.shortRef]
       }),
     )
+    const refToLocator = new Map<string, string>()
+    for (const entry of refs) {
+      const selector = getSelectorForRef(entry.ref)
+      if (selector) {
+        refToLocator.set(entry.shortRef, selector)
+      }
+    }
     const interactiveRefs = refs.filter((ref) => Boolean(ref.backendNodeId) && INTERACTIVE_ROLES.has(ref.role))
     log(
       `[showAriaRefLabels] getAriaSnapshot: ${Date.now() - snapshotStart}ms (${refs.length} refs, ${interactiveRefs.length} interactive)`,
@@ -1523,8 +1627,9 @@ export async function showAriaRefLabels({
     log(`[showAriaRefLabels] getLabelBoxesForRefs: ${Date.now() - labelsStart}ms (${labels.length} boxes)`)
 
     const renderStart = Date.now()
-    const labelCount = await page.evaluate(
-      ({ entries, root, interactiveOnly: intOnly }) => {
+    const labelCount = await evaluateIsolated({
+      target: page,
+      fn: ({ entries, root, interactiveOnly: intOnly }) => {
         const a11y = (
           globalThis as {
             __a11y?: {
@@ -1545,13 +1650,13 @@ export async function showAriaRefLabels({
         }
         throw new Error('a11y client not loaded')
       },
-      { entries: shortLabels, root: rootHandle, interactiveOnly },
-    )
+      arg: { entries: shortLabels, root: rootHandle, interactiveOnly },
+    })
 
     log(`[showAriaRefLabels] renderA11yLabels: ${Date.now() - renderStart}ms (${labelCount} labels)`)
     log(`[showAriaRefLabels] total: ${Date.now() - startTime}ms`)
 
-    return { snapshot, labelCount }
+    return { snapshot, labelCount, refToLocator }
   } finally {
     await cdp.detach()
   }
@@ -1561,21 +1666,24 @@ export async function showAriaRefLabels({
  * Remove all aria ref labels from the page.
  */
 export async function hideAriaRefLabels({ page }: { page: Page }): Promise<void> {
-  await page.evaluate(() => {
-    const a11y = (globalThis as any).__a11y
-    if (a11y) {
-      a11y.hideA11yLabels()
-    } else {
-      // Fallback if client not loaded
-      const doc = document
-      const win = window as any
-      const timerKey = '__playwriter_labels_timer__'
-      if (win[timerKey]) {
-        win.clearTimeout(win[timerKey])
-        win[timerKey] = null
+  await evaluateIsolated({
+    target: page,
+    fn: () => {
+      const a11y = (globalThis as any).__a11y
+      if (a11y) {
+        a11y.hideA11yLabels()
+      } else {
+        // Fallback if client not loaded
+        const doc = document
+        const win = window as any
+        const timerKey = '__playwriter_labels_timer__'
+        if (win[timerKey]) {
+          win.clearTimeout(win[timerKey])
+          win[timerKey] = null
+        }
+        doc.getElementById('__playwriter_labels__')?.remove()
       }
-      doc.getElementById('__playwriter_labels__')?.remove()
-    }
+    },
   })
 }
 
@@ -1608,10 +1716,10 @@ export async function screenshotWithAccessibilityLabels({
   interactiveOnly?: boolean
   collector: ScreenshotResult[]
   logger?: { info?: (...args: unknown[]) => void; error?: (...args: unknown[]) => void }
-}): Promise<void> {
+}): Promise<{ refToLocator: Map<string, string> }> {
   const log = logger?.info ?? logger?.error
   const showLabelsStart = Date.now()
-  const { snapshot, labelCount } = await showAriaRefLabels({ page, locator, interactiveOnly, logger })
+  const { snapshot, labelCount, refToLocator } = await showAriaRefLabels({ page, locator, interactiveOnly, logger })
   if (log) {
     log(`showAriaRefLabels: ${Date.now() - showLabelsStart}ms`)
   }
@@ -1629,10 +1737,12 @@ export async function screenshotWithAccessibilityLabels({
   const screenshotPath = path.join(tmpDir, filename)
 
   // Get viewport size to clip screenshot to visible area
-  const viewport = (await page.evaluate('({ width: window.innerWidth, height: window.innerHeight })')) as {
-    width: number
-    height: number
-  }
+  const viewport = await evaluateIsolated({
+    target: page,
+    fn: () => {
+      return { width: window.innerWidth, height: window.innerHeight }
+    },
+  })
 
   // Check if sharp is available for resizing
   const sharp = await sharpPromise
@@ -1644,11 +1754,13 @@ export async function screenshotWithAccessibilityLabels({
   // Take viewport screenshot as PNG for Kitty Graphics Protocol compatibility.
   // PNG is lossless and the only format extracted by kitty-graphics-agent (f=100).
   const screenshotStart = Date.now()
-  const rawBuffer = await page.screenshot({
-    type: 'png',
-    scale: 'css',
-    clip: { x: 0, y: 0, width: clipWidth, height: clipHeight },
-  })
+  const rawBuffer = await page
+    .screenshot({
+      type: 'png',
+      scale: 'css',
+      clip: { x: 0, y: 0, width: clipWidth, height: clipHeight },
+    })
+    .finally(() => hideAriaRefLabels({ page }))
   if (log) {
     log(`page.screenshot: ${Date.now() - screenshotStart}ms`)
   }
@@ -1678,9 +1790,6 @@ export async function screenshotWithAccessibilityLabels({
   // Convert to base64
   const base64 = buffer.toString('base64')
 
-  // Hide labels
-  await hideAriaRefLabels({ page })
-
   // Add to collector array
   collector.push({
     path: screenshotPath,
@@ -1689,6 +1798,7 @@ export async function screenshotWithAccessibilityLabels({
     snapshot,
     labelCount,
   })
+  return { refToLocator }
 }
 
 // Re-export for backward compatibility

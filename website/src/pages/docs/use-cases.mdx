@@ -1,6 +1,6 @@
 ---
 title: Use Cases
-description: Practical examples of what you can do with Playwriter, from QA testing to task automation.
+description: Practical Playwriter examples for QA testing, task automation, API reverse engineering, and web development in your real Chrome.
 icon: lucide:lightbulb
 ---
 
@@ -12,8 +12,8 @@ Let your coding agent **verify its own work** in a real browser. The agent write
 
 ```bash
 # Agent writes React component, then verifies
-playwriter -s 1 -e 'await page.goto("http://localhost:3000/new-feature")'
-playwriter -s 1 -e 'console.log(await snapshot({ page }))'
+playwriter -s 1 -e 'state.page = await context.newPage(); await state.page.goto("http://localhost:3000/new-feature")'
+playwriter -s 1 -e 'console.log(await snapshot({ page: state.page }))'
 # Agent sees broken layout, fixes the code, checks again
 ```
 
@@ -31,12 +31,12 @@ Run tests against your **real Chrome profile** with real login state. No need to
 
 ```bash
 # Test authenticated flows without login setup
-playwriter -s 1 -e 'await page.goto("https://myapp.com/dashboard")'
-playwriter -s 1 -e 'console.log(await snapshot({ page, search: /error|warning/i }))'
+playwriter -s 1 -e 'state.page = await context.newPage(); await state.page.goto("https://myapp.com/dashboard")'
+playwriter -s 1 -e 'console.log(await snapshot({ page: state.page, search: /error|warning/i }))'
 
 # Verify forms, buttons, navigation
-playwriter -s 1 -e 'await page.locator("button:has-text(\"Save\")").click()'
-playwriter -s 1 -e 'console.log(await snapshot({ page, search: /success|saved/i }))'
+playwriter -s 1 -e 'await state.page.locator("button:has-text(\"Save\")").click()'
+playwriter -s 1 -e 'console.log(await snapshot({ page: state.page, search: /success|saved/i }))'
 ```
 
 Great for manual QA workflows that agents can now automate: fill forms, click through flows, verify results, and report back.
@@ -49,7 +49,7 @@ Automate repetitive browser tasks that need your logged-in session.
 
 ```bash
 playwriter -s 1 -e $'
-state.page = context.pages().find(p => p.url() === "about:blank") ?? await context.newPage()
+state.page = await context.newPage()
 await state.page.goto("https://www.youtube.com/playlist?list=PLxxxxxx")
 await waitForPageLoad({ page: state.page, timeout: 5000 })
 const videos = await state.page.$$eval("a#video-title", els => els.map(e => ({ title: e.textContent.trim(), href: e.href })))
@@ -68,7 +68,7 @@ playwriter -s 1 -f fill-forms.js
 
 ```bash
 playwriter -s 1 -e $'
-state.page = context.pages().find(p => p.url() === "about:blank") ?? await context.newPage()
+state.page = await context.newPage()
 await state.page.goto("https://analytics.example.com/export")
 const [download] = await Promise.all([
   state.page.waitForEvent("download"),
@@ -86,7 +86,7 @@ Use **network interception** to discover undocumented APIs behind JavaScript-ren
 ```bash
 # Start intercepting API calls
 playwriter -s 1 -e $'
-state.page = context.pages().find(p => p.url() === "about:blank") ?? await context.newPage()
+state.page = await context.newPage()
 state.responses = []
 state.page.on("response", async res => {
   if (res.url().includes("/api/")) {
@@ -117,25 +117,25 @@ npx -y traforo -p 19988 -- npx -y playwriter serve --token SHARED_SECRET
 export PLAYWRITER_HOST=https://user-machine-tunnel.traforo.dev
 export PLAYWRITER_TOKEN=SHARED_SECRET
 playwriter session new
-playwriter -s 1 -e 'console.log(await snapshot({ page }))'
+playwriter -s 1 -e 'state.page = context.pages().findLast((p) => p.url().includes("myapp.com")); console.log(await snapshot({ page: state.page }))'
 ```
 
 The user sees Chrome's automation banner so they always know when their browser is being controlled. They can revoke access by closing the terminal. See [Remote Access](./remote-access.mdx) for the full guide.
 
 ## Screen recording
 
-Have the agent **record what it's doing** as an MP4 video. The recording uses `chrome.tabCapture` and survives page navigation.
+Have the agent **record what it's doing** as an MP4 video. The recording pipes CDP screencast frames to `ffmpeg`, needs no permission click, and survives page navigation.
 
 ```bash
-# Start recording
-playwriter -s 1 -e 'await recording.start({ page, outputPath: "/tmp/demo.mp4" })'
+# Open a tab and start recording
+playwriter -s 1 -e 'state.page = await context.newPage(); await state.page.goto("https://example.com"); state.video = await recording.start({ page: state.page, outputPath: "/tmp/demo.mp4" })'
 
 # Do things — recording continues through navigation
-playwriter -s 1 -e 'await page.goto("https://example.com")'
-playwriter -s 1 -e 'await page.click("a")'
+playwriter -s 1 -e 'await state.page.click("a")'
+playwriter -s 1 -e 'await state.page.goBack()'
 
 # Stop and save
-playwriter -s 1 -e 'await recording.stop({ page })'
+playwriter -s 1 -e 'await state.video.stop()'
 ```
 
 Useful for creating **demo videos**, recording bug reproductions, or documenting workflows. The agent can also speed up idle sections with `createDemoVideo` to produce polished demos.
@@ -146,7 +146,7 @@ Sites like Instagram, Twitter, and Facebook return empty HTML shells to `curl` a
 
 ```bash
 playwriter -s 1 -e $'
-state.page = context.pages().find(p => p.url() === "about:blank") ?? await context.newPage()
+state.page = await context.newPage()
 await state.page.goto("https://www.instagram.com/p/ABC123/", { waitUntil: "domcontentloaded" })
 await waitForPageLoad({ page: state.page, timeout: 8000 })
 const content = await getPageMarkdown({ page: state.page, showDiffSinceLastCall: false })

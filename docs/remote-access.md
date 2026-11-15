@@ -54,7 +54,7 @@ Playwriter's relay server runs on the host machine alongside Chrome. A [traforo]
 ┌────────────────────────────────────────────────────────────┐
 │  REMOTE MACHINE (CLI or MCP)                               │
 │                                                            │
-│  playwriter -s 1 -e "await page.goto('https://...')"      │
+│  playwriter -s 1 -e "await state.page.goto(url)"          │
 │                                                            │
 │  PLAYWRITER_HOST=https://{id}-tunnel.traforo.dev           │
 │  PLAYWRITER_TOKEN=<secret>                                 │
@@ -98,8 +98,8 @@ The **CLI with the skill** is the recommended approach. The skill file (`playwri
 
 ```bash
 playwriter session new          # outputs: 1
-playwriter -s 1 -e "await page.goto('https://example.com')"
-playwriter -s 1 -e "console.log(await snapshot({ page }))"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
+playwriter -s 1 -e "console.log(await snapshot({ page: state.page }))"
 ```
 
 Alternatively, pass host and token as flags instead of env vars:
@@ -135,7 +135,7 @@ The env vars tell the MCP to skip starting a local relay and connect to the remo
 import { chromium } from 'playwright-core'
 
 const browser = await chromium.connectOverCDP('wss://my-machine-tunnel.traforo.dev/cdp/session1?token=MY_SECRET_TOKEN')
-const page = browser.contexts()[0].pages()[0]
+const page = await browser.contexts()[0].newPage()
 await page.goto('https://example.com')
 // Don't call browser.close() - it would close the user's Chrome
 ```
@@ -152,7 +152,7 @@ await page.goto('https://example.com')
 for machine in machine-a machine-b machine-c; do
   PLAYWRITER_HOST="https://${machine}-tunnel.traforo.dev" \
   PLAYWRITER_TOKEN=shared-secret \
-  playwriter -s 1 -e "console.log(await page.title())"
+  playwriter -s 1 -e "console.log(await Promise.all(context.pages().map((p) => p.title())))"
 done
 ```
 
@@ -162,7 +162,7 @@ done
 
 The relay server **must run on the same machine as Chrome**. The Chrome extension connects to the relay via localhost WebSocket, and the `/extension` endpoint only accepts connections from `127.0.0.1`. This means `playwriter serve` always runs on the  host — never inside the container.
 
-From Docker, set `PLAYWRITER_HOST` to reach the host relay.
+From Docker, set `PLAYWRITER_HOST` and `PLAYWRITER_TOKEN` to reach the host relay.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -177,37 +177,34 @@ From Docker, set `PLAYWRITER_HOST` to reach the host relay.
 ┌──────────────────────────────────────────────┴──────────────┐
 │  DOCKER CONTAINER                                           │
 │                                                             │
-│  PLAYWRITER_HOST=host.docker.internal                       │
+│  PLAYWRITER_HOST=host.docker.internal + PLAYWRITER_TOKEN    │
 │                                                             │
-│  playwriter -s 1 -e "await page.goto('https://...')"       │
+│  playwriter -s 1 -e "await state.page.goto(url)"            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **Step 1 — Host:** start the relay server on the host machine (where Chrome is running):
 
 ```bash
-playwriter serve --host localhost
+playwriter serve --host 0.0.0.0 --token MY_SECRET_TOKEN
 ```
 
-Using `--host localhost` binds to `127.0.0.1` so no token is needed. Docker containers reach it through `host.docker.internal` which routes to the host's loopback interface. If you use `--host 0.0.0.0` (the default), a `--token` is required since it exposes the server to all network interfaces.
+Docker reaches the host through a non-loopback interface, so the relay must bind to `0.0.0.0`. A token is required because this exposes the relay to the host network.
 
-**Step 2 — Docker:** set `PLAYWRITER_HOST` in your container to point at the host:
-
-```dockerfile
-ENV PLAYWRITER_HOST=host.docker.internal
-```
-
-Or pass it at runtime:
+**Step 2 — Docker:** pass the host and the same token into your container:
 
 ```bash
-docker run -e PLAYWRITER_HOST=host.docker.internal myimage
+docker run \
+  -e PLAYWRITER_HOST=host.docker.internal \
+  -e PLAYWRITER_TOKEN=MY_SECRET_TOKEN \
+  myimage
 ```
 
 Then use playwriter normally inside the container:
 
 ```bash
 playwriter session new
-playwriter -s 1 -e "await page.goto('https://example.com')"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
 ```
 
 ### Platform support for `host.docker.internal`
@@ -221,7 +218,11 @@ playwriter -s 1 -e "await page.goto('https://example.com')"
 On Linux, `host.docker.internal` is **not provided automatically** by Docker Engine. You must add it explicitly:
 
 ```bash
-docker run --add-host=host.docker.internal:host-gateway -e PLAYWRITER_HOST=host.docker.internal myimage
+docker run \
+  --add-host=host.docker.internal:host-gateway \
+  -e PLAYWRITER_HOST=host.docker.internal \
+  -e PLAYWRITER_TOKEN=MY_SECRET_TOKEN \
+  myimage
 ```
 
 Or in Docker Compose:
@@ -232,6 +233,7 @@ services:
     build: .
     environment:
       - PLAYWRITER_HOST=host.docker.internal
+      - PLAYWRITER_TOKEN=MY_SECRET_TOKEN
     extra_hosts:
       - "host.docker.internal:host-gateway"
 ```
@@ -251,7 +253,8 @@ If your AI assistant or MCP client runs inside Docker:
       "command": "npx",
       "args": ["-y", "playwriter@latest"],
       "env": {
-        "PLAYWRITER_HOST": "host.docker.internal"
+        "PLAYWRITER_HOST": "host.docker.internal",
+        "PLAYWRITER_TOKEN": "MY_SECRET_TOKEN"
       }
     }
   }

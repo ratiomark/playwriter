@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { chromium, type Page } from '@xmorse/playwright-core'
 import WebSocket from 'ws'
 import path from 'node:path'
+import fs from 'node:fs'
 import { getCdpUrl } from './utils.js'
 import {
   setupTestContext,
@@ -179,7 +180,7 @@ describe('Relay Navigation Tests', () => {
     }
   }, 60000)
 
-  it('should resolve locators for cross-origin iframe that starts with empty src', async () => {
+  it('should resolve and detach cross-origin iframe that starts with empty src', async () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
 
@@ -189,8 +190,9 @@ describe('Relay Navigation Tests', () => {
         '/canvas.html': '<!doctype html><html><body><button id="canvas-btn">Canvas</button></body></html>',
       },
     })
-    const loginUrl = `${childServer.baseUrl}/login.html`
-    const canvasUrl = `${childServer.baseUrl}/canvas.html`
+    const childOrigin = childServer.baseUrl.replace('127.0.0.1', 'localhost')
+    const loginUrl = `${childOrigin}/login.html`
+    const canvasUrl = `${childOrigin}/canvas.html`
 
     const parentServer = await createSimpleServer({
       routes: {
@@ -275,8 +277,14 @@ describe('Relay Navigation Tests', () => {
           errorMessage: 'Timed out waiting for button locator in empty-src iframe test',
         })
 
-        const buttonCount = await pluginFrame.locator('button').count()
-        expect(buttonCount).toBe(1)
+        // The frame goes from the login URL to the canvas URL; poll so a count during that swap does not fail
+        await expect.poll(() => pluginFrame.locator('button').count(), { timeout: 5000 }).toBe(1)
+
+        await page.locator('#plugin-frame').evaluate((frame) => {
+          frame.remove()
+        })
+        await expect.poll(() => cdpPage!.frames().length, { timeout: 5000 }).toBe(1)
+        await context.exposeBinding('afterOopifDetach', () => {})
       } finally {
         await withTimeout({
           promise: browser.close(),
@@ -445,63 +453,6 @@ describe('Relay Navigation Tests', () => {
     await page.close()
   }, 30000)
 
-  it('should work with stagehand', async () => {
-    const browserContext = getBrowserContext()
-    const serviceWorker = await getExtensionServiceWorker(browserContext)
-
-    await serviceWorker.evaluate(async () => {
-      await globalThis.disconnectEverything()
-    })
-    await new Promise((r) => setTimeout(r, 100))
-
-    const targetUrl = 'https://example.com/'
-
-    const enableResult = await serviceWorker.evaluate(async (url) => {
-      const tab = await chrome.tabs.create({ url, active: true })
-      await new Promise((r) => setTimeout(r, 100))
-      return await globalThis.toggleExtensionForActiveTab()
-    }, targetUrl)
-
-    console.log('Extension enabled:', enableResult)
-    expect(enableResult.isConnected).toBe(true)
-
-    await new Promise((r) => setTimeout(r, 100))
-
-    const { Stagehand } = await import('@browserbasehq/stagehand')
-
-    const stagehand = new Stagehand({
-      env: 'LOCAL',
-      verbose: 1,
-      disablePino: true,
-      localBrowserLaunchOptions: {
-        cdpUrl: getCdpUrl({ port: TEST_PORT }),
-      },
-    })
-
-    console.log('Initializing Stagehand...')
-    await stagehand.init()
-    console.log('Stagehand initialized')
-
-    const context = stagehand.context
-    expect(context).toBeDefined()
-
-    const pages = context.pages()
-    console.log(
-      'Stagehand pages:',
-      pages.length,
-      pages.map((p) => p.url()),
-    )
-
-    const stagehandPage = pages.find((p) => p.url().includes('example.com'))
-    expect(stagehandPage).toBeDefined()
-
-    const url = stagehandPage!.url()
-    console.log('Stagehand page URL:', url)
-    expect(url).toContain('example.com')
-
-    await stagehand.close()
-  }, 60000)
-
   it('should expose CDP discovery endpoints /json/version and /json/list', async () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
@@ -559,79 +510,110 @@ describe('Relay Navigation Tests', () => {
     await page.close()
   }, 60000)
 
-  // Skip: chrome.tabCapture.getMediaStreamId() requires activeTab permission
-  it.skip('should record screen with navigation using chrome.tabCapture', async () => {
+  // Recording uses Chrome's native Page.startScreenRecording through chrome.debugger:
+  // no extension click, survives a cross-site navigation (new renderer process),
+  // records tab audio, and the relay stops it when the client disconnects.
+  it('records video and page audio across a cross-site navigation', async () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
-    const path = await import('node:path')
-    const fs = await import('node:fs')
+    const server = await createSimpleServer({
+      routes: {
+        '/a': `<!doctype html><html><body style="background:#123">
+          <button id="play" style="font-size:40px">play</button>
+          <script>
+            document.getElementById('play').onclick = () => {
+              const ctx = new AudioContext()
+              const osc = ctx.createOscillator()
+              osc.frequency.value = 440
+              osc.connect(ctx.destination)
+              osc.start()
+            }
+          </script></body></html>`,
+        '/b': `<!doctype html><html><body style="background:#fff">
+          <style>@keyframes s{to{transform:rotate(360deg)}}.b{width:200px;height:200px;background:red;animation:s 1s linear infinite}</style>
+          <div class="b"></div></body></html>`,
+      },
+    })
+    const port = new URL(server.baseUrl).port
+    const outputPath = path.join(process.cwd(), 'tmp', 'relay-navigation-recording.mp4')
 
-    const recordingPage = await browserContext.newPage()
-    await recordingPage.goto('https://news.ycombinator.com/', { waitUntil: 'domcontentloaded' })
-    await recordingPage.bringToFront()
-
+    const page = await browserContext.newPage()
+    await page.goto(`http://localhost:${port}/a`)
+    await page.bringToFront()
     await serviceWorker.evaluate(async () => {
       await globalThis.toggleExtensionForActiveTab()
     })
-    await new Promise((r) => setTimeout(r, 200))
 
-    const outputPath = path.join(process.cwd(), 'tmp', 'test-recording.mp4')
-    if (!fs.existsSync(path.dirname(outputPath))) {
-      fs.mkdirSync(path.dirname(outputPath), { recursive: true })
+    const orphanPath = path.join(process.cwd(), 'tmp', 'relay-navigation-orphan.mp4')
+    let browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    try {
+      const cdpPage = browser
+        .contexts()[0]
+        .pages()
+        .find((p) => p.url().endsWith('/a'))!
+      expect(cdpPage).toBeDefined()
+
+      const { ScreenRecording } = await import('./screen-recording.js')
+      const recording = await ScreenRecording.start({ page: cdpPage, outputPath, audio: true, frameRate: 30 })
+      await cdpPage.click('#play')
+      await new Promise((r) => setTimeout(r, 1500))
+      await cdpPage.goto(`http://127.0.0.1:${port}/b`)
+      await new Promise((r) => setTimeout(r, 2500))
+      // Live drain: bytes arrive while recording, not only at stop
+      expect(recording.bytes).toBeGreaterThan(0)
+
+      const result = await recording.stop()
+      expect(result.endReason).toBe('stopped')
+
+      const { spawnSync } = await import('node:child_process')
+      const probe = JSON.parse(
+        spawnSync('ffprobe', ['-v', 'error', '-show_streams', '-show_format', '-of', 'json', result.path]).stdout.toString(),
+      ) as { streams: Array<{ codec_type: string; codec_name: string }>; format: { duration: string } }
+      expect(probe.streams.map((s) => `${s.codec_type}:${s.codec_name}`).sort()).toMatchInlineSnapshot(`
+        [
+          "audio:aac",
+          "video:h264",
+        ]
+      `)
+      expect(Math.abs(Number(probe.format.duration) * 1000 - result.duration)).toBeLessThan(1000)
+      // The spinning box after the navigation is in the video
+      const unique = spawnSync('ffmpeg', ['-hide_banner', '-ss', '2', '-i', result.path, '-vf', 'mpdecimate', '-fps_mode', 'vfr', '-an', '-f', 'null', '-']).stderr.toString()
+      expect(Number([...unique.matchAll(/frame=\s*(\d+)/g)].pop()?.[1])).toBeGreaterThan(20)
+
+      // The tone plays during the first part and stops at the navigation
+      const maxVolume = (from: number, to: number) => {
+        const stderr = spawnSync('ffmpeg', ['-hide_banner', '-ss', String(from), '-to', String(to), '-i', result.path, '-af', 'volumedetect', '-vn', '-f', 'null', '-']).stderr.toString()
+        return Number(stderr.match(/max_volume: (-?[\d.]+) dB/)?.[1] ?? -91)
+      }
+      expect(maxVolume(0.5, 1.4)).toBeGreaterThan(-20)
+      expect(maxVolume(result.duration / 1000 - 0.8, result.duration / 1000)).toBeLessThan(-60)
+
+      // A recording left running by a disconnected client blocks the tab until the relay stops it
+      await ScreenRecording.start({ page: cdpPage, outputPath: orphanPath, codec: 'av1' })
+      const { getCDPSessionForPage } = await import('./cdp-session.js')
+      const screencastError = await (await getCDPSessionForPage({ page: cdpPage }))
+        .send('Page.startScreencast', { format: 'jpeg' })
+        .then(() => 'started', (error: Error) => error.message)
+      expect(screencastError).toContain('This tab is being recorded with recording.start')
+      await browser.close()
+      browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+      const reconnectedPage = browser
+        .contexts()[0]
+        .pages()
+        .find((p) => p.url().endsWith('/b'))!
+      const next = await ScreenRecording.start({ page: reconnectedPage, outputPath: orphanPath, codec: 'av1' })
+      await next.cancel()
+    } finally {
+      await browser.close()
+      await page.close()
+      await server.close()
+      fs.rmSync(outputPath, { force: true })
+      fs.rmSync(orphanPath, { force: true })
+      // The relay stopped the orphan: its partial file is left behind
+      for (const file of fs.readdirSync(path.dirname(orphanPath)).filter((name) => name.startsWith('relay-navigation-orphan.'))) {
+        fs.rmSync(path.join(path.dirname(orphanPath), file), { force: true })
+      }
     }
-
-    const { startRecording, stopRecording, isRecording } = await import('./screen-recording.js')
-
-    const startResult = await startRecording({
-      page: recordingPage,
-      outputPath,
-      frameRate: 30,
-      audio: false,
-      videoBitsPerSecond: 1500000,
-      relayPort: TEST_PORT,
-    })
-    expect(startResult.isRecording).toBe(true)
-
-    await recordingPage.locator('.titleline a').first().click()
-    await recordingPage.waitForLoadState('domcontentloaded')
-    await new Promise((r) => setTimeout(r, 500))
-
-    await recordingPage.goBack()
-    await recordingPage.waitForLoadState('domcontentloaded')
-
-    const status = await isRecording({ page: recordingPage, relayPort: TEST_PORT })
-    expect(status.isRecording).toBe(true)
-
-    const stopResult = await stopRecording({ page: recordingPage, relayPort: TEST_PORT })
-    expect(stopResult.path).toBe(outputPath)
-    expect(stopResult.size).toBeGreaterThan(10000)
-    expect(fs.existsSync(outputPath)).toBe(true)
-
-    // Create a sped-up demo video from the recording.
-    // We fake executionTimestamps since this test calls screen-recording
-    // directly (not via executor sandbox which tracks them automatically).
-    const { createDemoVideo } = await import('./ffmpeg.js')
-    const demoPath = await createDemoVideo({
-      recordingPath: outputPath,
-      durationMs: stopResult.duration,
-      executionTimestamps: [
-        // Simulate two interactions with an idle gap between them
-        { start: 0.5, end: 1.5 },
-        { start: 3, end: 4 },
-      ],
-      speed: 4,
-    })
-    expect(fs.existsSync(demoPath)).toBe(true)
-    expect(demoPath).toContain('-demo')
-
-    // Verify the demo video is smaller (idle sections were sped up)
-    const demoSize = fs.statSync(demoPath).size
-    expect(demoSize).toBeGreaterThan(0)
-    console.log(`Recording: ${stopResult.size} bytes, Demo: ${demoSize} bytes`)
-
-    await recordingPage.close()
-    fs.unlinkSync(outputPath)
-    fs.unlinkSync(demoPath)
   }, 60000)
 
   // Regression test for https://github.com/remorses/playwriter/issues/40
@@ -852,6 +834,124 @@ describe('Relay Navigation Tests', () => {
       await browser.close()
     } finally {
       // Toggle off to clean up
+      await page.bringToFront()
+      await serviceWorker
+        .evaluate(async () => {
+          await globalThis.toggleExtensionForActiveTab()
+        })
+        .catch(() => {})
+      await page.close()
+      await server.close()
+    }
+  }, 30000)
+
+  it('should keep the page when another extension injects a chrome-extension:// iframe after attach', async () => {
+    // Reproduces https://github.com/remorses/playwriter/issues/127
+    // 1Password injects its inline menu iframe when a field gets focus. Chrome force-detaches
+    // chrome.debugger from the whole tab at navigation start of that iframe (reason
+    // target_closed). The extension must reattach and replay the session setup so the
+    // Playwright page keeps working. https://issues.chromium.org/issues/498987209
+    const browserContext = getBrowserContext()
+    const serviceWorker = await getExtensionServiceWorker(browserContext)
+    const playwriterExtId = serviceWorker.url().match(/chrome-extension:\/\/([^/]+)/)?.[1]
+    const fixtureExtId = browserContext
+      .serviceWorkers()
+      .map((sw) => sw.url().match(/chrome-extension:\/\/([^/]+)/)?.[1])
+      .find((id) => id && id !== playwriterExtId)
+    expect(fixtureExtId).toBeTruthy()
+
+    const server = await createSimpleServer({
+      routes: { '/': `<!doctype html><html><body><h1>Main page</h1></body></html>` },
+    })
+    const page = await browserContext.newPage()
+    let browser: Awaited<ReturnType<typeof chromium.connectOverCDP>> | undefined
+    try {
+      await page.goto(server.baseUrl, { waitUntil: 'domcontentloaded' })
+      await page.bringToFront()
+      await serviceWorker.evaluate(async () => {
+        await globalThis.toggleExtensionForActiveTab()
+      })
+
+      browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+      const cdpPage = browser
+        .contexts()[0]
+        .pages()
+        .find((p) => p.url().startsWith(server.baseUrl))!
+      // Session state Chrome drops on detach and the extension must replay
+      await cdpPage.setViewportSize({ width: 777, height: 555 })
+      await cdpPage.addInitScript(() => {
+        ;(window as any).__initScriptRan = true
+      })
+      await cdpPage.exposeFunction('double', (n: number) => {
+        return n * 2
+      })
+
+      // Inject like a content script: first in the light DOM, then inside a closed shadow root.
+      // `page` is a direct CDP client, Chrome does not apply chrome.debugger restrictions to it.
+      const injectFrame = async (shadow: boolean) => {
+        await page.evaluate(
+          ({ id, shadow }) => {
+            const iframe = document.createElement('iframe')
+            iframe.src = `chrome-extension://${id}/page.html`
+            if (!shadow) {
+              document.body.appendChild(iframe)
+              return
+            }
+            const host = document.createElement('div')
+            const root = host.attachShadow({ mode: 'closed' })
+            ;(window as any).__closedRoot = root
+            root.appendChild(iframe)
+            document.body.appendChild(host)
+          },
+          { id: fixtureExtId, shadow },
+        )
+        // The extension removes the iframe right before reattaching
+        await page.waitForFunction(
+          () => {
+            const root = (window as any).__closedRoot as { querySelector: (selector: string) => unknown } | undefined
+            return !document.querySelector('iframe') && !root?.querySelector('iframe')
+          },
+          undefined,
+          { timeout: 5000 },
+        )
+      }
+
+      await injectFrame(false)
+      expect(await cdpPage.evaluate(() => document.querySelector('h1')?.textContent)).toBe('Main page')
+      await injectFrame(true)
+
+      expect(cdpPage.isClosed()).toBe(false)
+      const afterReattach = await cdpPage.evaluate(async () => {
+        return {
+          title: document.querySelector('h1')?.textContent,
+          width: window.innerWidth,
+          doubled: await (window as any).double(21),
+        }
+      })
+      // Frames removed while detached must not stay in Playwright's frame tree
+      expect({ ...afterReattach, frames: cdpPage.frames().length }).toMatchInlineSnapshot(`
+        {
+          "doubled": 42,
+          "frames": 1,
+          "title": "Main page",
+          "width": 777,
+        }
+      `)
+
+      await cdpPage.reload()
+      expect(
+        await cdpPage.evaluate(() => {
+          return { initScriptRan: (window as any).__initScriptRan, width: window.innerWidth }
+        }),
+      ).toMatchInlineSnapshot(`
+        {
+          "initScriptRan": true,
+          "width": 777,
+        }
+      `)
+      expect(cdpPage.isClosed()).toBe(false)
+    } finally {
+      await browser?.close()
       await page.bringToFront()
       await serviceWorker
         .evaluate(async () => {

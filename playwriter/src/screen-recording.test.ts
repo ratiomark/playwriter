@@ -1,9 +1,109 @@
 /**
- * Unit tests for fitToAspectRatio — verifies viewport shrink-to-fit
- * for common screen sizes and aspect ratios.
+ * Tests viewport sizing, capture size and ffmpeg argument builders.
  */
 import { describe, test, expect } from 'vitest'
-import { fitToAspectRatio } from './screen-recording.js'
+import { spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+import crypto from 'node:crypto'
+import { once } from 'node:events'
+import { chromium } from '@xmorse/playwright-core'
+import WebSocket, { WebSocketServer } from 'ws'
+import {
+  buildTranscodeFfmpegArgs,
+  buildStreamFfmpegArgs,
+  computeCaptureSize,
+  escapeTeeUrl,
+  fitToAspectRatio,
+  parseFfmpegProgressLine,
+  PageCapture,
+  redactStreamUrl,
+  type StreamFfmpegOptions,
+} from './screen-recording.js'
+
+test('starts capturing a static page without waiting for a seed screenshot', async () => {
+  const server = await chromium.launchServer({ headless: true, channel: 'chromium', executablePath: process.env.PLAYWRITER_TEST_BROWSER })
+  const proxy = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+  const commands: string[] = []
+  const pendingScreenshots: Array<() => void> = []
+  const pendingFrames: Array<() => void> = []
+  const peers = new Set<WebSocket>()
+  proxy.on('connection', (socket) => {
+    const upstream = new WebSocket(server.wsEndpoint())
+    peers.add(socket)
+    peers.add(upstream)
+    const connected = once(upstream, 'open')
+    socket.on('message', async (data) => {
+      await connected
+      const message = JSON.parse(data.toString()) as { method: string; params?: { method?: string } }
+      const command = message.method === 'send' ? message.params?.method : undefined
+      if (command) commands.push(command)
+      // Delay only the seed command. All frames and other commands use real Chrome.
+      if (command === 'Page.captureScreenshot' && commands.includes('Page.startScreencast')) {
+        pendingScreenshots.push(() => upstream.send(data.toString()))
+        pendingFrames.splice(0).forEach((send) => send())
+        return
+      }
+      upstream.send(data.toString())
+    })
+    upstream.on('message', (data) => {
+      const message = JSON.parse(data.toString()) as { method?: string; params?: { method?: string } }
+      if (message.method === 'event' && message.params?.method === 'Page.screencastFrame' && !commands.includes('Page.captureScreenshot')) {
+        pendingFrames.push(() => socket.send(data.toString()))
+        return
+      }
+      socket.send(data.toString())
+    })
+  })
+  await once(proxy, 'listening')
+  const address = proxy.address()
+  if (!address || typeof address === 'string') throw new Error('Proxy did not listen')
+  const outputPath = path.join(process.cwd(), 'tmp', `capture-${crypto.randomUUID()}.flv`)
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true })
+  let capture: PageCapture | undefined
+  try {
+    const browser = await chromium.connect(`ws://127.0.0.1:${address.port}`)
+    const context = await browser.newContext()
+    const page = await context.newPage()
+    await page.setContent('<body style="background: red">Static page</body>')
+    capture = await PageCapture.start({
+      page,
+      fps: 30,
+      audio: false,
+      size: { width: 640, height: 360 },
+      buildArgs: (input) => buildStreamFfmpegArgs({
+        ...input,
+        rtmpUrls: [outputPath],
+        videoBitrateKbps: 1000,
+        audioBitrateKbps: 128,
+        preset: 'veryfast',
+        codec: 'libx264',
+        keyframeSeconds: 2,
+      }),
+    })
+    const screenshotIndex = commands.indexOf('Page.captureScreenshot')
+    if (screenshotIndex !== -1) {
+      expect(commands.indexOf('Page.startScreencast')).toBeLessThan(screenshotIndex)
+    }
+    expect(pendingScreenshots).toHaveLength(1)
+    pendingScreenshots.splice(0).forEach((send) => send())
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const result = await capture.stop()
+    expect(result.error).toBeUndefined()
+    expect(capture.stats.capturedFrames).toBeGreaterThan(0)
+    const probe = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-count_frames', '-show_entries', 'stream=nb_read_frames', '-of', 'json', outputPath])
+    expect(probe.status, probe.stderr.toString()).toBe(0)
+    expect(Number(JSON.parse(probe.stdout.toString()).streams[0].nb_read_frames)).toBeGreaterThan(0)
+    await context.close()
+  } finally {
+    pendingScreenshots.splice(0).forEach((send) => send())
+    await capture?.abort()
+    for (const peer of peers) peer.terminate()
+    await new Promise<void>((resolve) => proxy.close(() => resolve()))
+    await server.close()
+    fs.rmSync(outputPath, { force: true })
+  }
+}, 10_000)
 
 describe('fitToAspectRatio', () => {
   test('common sizes → 16:9', () => {
@@ -107,5 +207,126 @@ describe('fitToAspectRatio', () => {
       expect(result.width).toBeLessThanOrEqual(size.width)
       expect(result.height).toBeLessThanOrEqual(size.height)
     }
+  })
+})
+
+describe('computeCaptureSize', () => {
+  test('retina viewport is capped at maxSize, sizes stay even', () => {
+    expect([
+      computeCaptureSize({ cssWidth: 1280, cssHeight: 720, devicePixelRatio: 2, maxSize: 1920 }),
+      computeCaptureSize({ cssWidth: 1280, cssHeight: 720, devicePixelRatio: 1, maxSize: 1920 }),
+      computeCaptureSize({ cssWidth: 1437, cssHeight: 809, devicePixelRatio: 1, maxSize: 1920 }),
+      computeCaptureSize({ cssWidth: 390, cssHeight: 844, devicePixelRatio: 3, maxSize: 1920 }),
+    ]).toMatchInlineSnapshot(`
+      [
+        {
+          "height": 1080,
+          "width": 1920,
+        },
+        {
+          "height": 720,
+          "width": 1280,
+        },
+        {
+          "height": 810,
+          "width": 1438,
+        },
+        {
+          "height": 1920,
+          "width": 888,
+        },
+      ]
+    `)
+  })
+})
+
+describe('buildTranscodeFfmpegArgs', () => {
+  test('native AV1 from stdin to H.264 at a fixed size', () => {
+    expect([
+      buildTranscodeFfmpegArgs({ width: 3840, height: 2160, fps: 60, audio: true, codec: 'h264_videotoolbox', outputPath: '/out/a.mp4' }).join(' '),
+      buildTranscodeFfmpegArgs({ width: 1920, height: 1080, fps: 60, audio: false, codec: 'libx264', outputPath: '/out/a.mkv' }).join(' '),
+    ]).toMatchInlineSnapshot(`
+      [
+        "-hide_banner -loglevel error -nostdin -f mp4 -i pipe:0 -map 0:v:0 -map 0:a:0? -vf scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2,format=yuv420p,setsar=1 -fps_mode passthrough -c:v h264_videotoolbox -b:v 20000k -realtime true -c:a aac -b:a 160k -video_track_timescale 90000 -movflags +faststart -y /out/a.mp4",
+        "-hide_banner -loglevel error -nostdin -f mp4 -i pipe:0 -map 0:v:0 -vf scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p,setsar=1 -fps_mode passthrough -c:v libx264 -preset veryfast -crf 20 -y /out/a.mkv",
+      ]
+    `)
+  })
+})
+
+describe('buildStreamFfmpegArgs', () => {
+  const base: StreamFfmpegOptions = {
+    rtmpUrls: ['rtmp://va.pscp.tv:80/x/streamkey'],
+    width: 1280,
+    height: 720,
+    fps: 30,
+    videoBitrateKbps: 4500,
+    audioBitrateKbps: 128,
+    audio: true,
+    preset: 'veryfast',
+    codec: 'libx264',
+    keyframeSeconds: 3,
+  }
+
+  test('page audio, silent audio, hardware encoder', () => {
+    expect([
+      buildStreamFfmpegArgs(base).join(' '),
+      buildStreamFfmpegArgs({ ...base, audio: false }).join(' '),
+      buildStreamFfmpegArgs({ ...base, codec: 'h264_videotoolbox' }).join(' '),
+    ]).toMatchInlineSnapshot(`
+      [
+        "-hide_banner -nostdin -f image2pipe -c:v mjpeg -framerate 30 -thread_queue_size 512 -i pipe:0 -f s16le -ar 48000 -ac 2 -thread_queue_size 512 -i pipe:3 -map 0:v:0 -map 1:a:0 -vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p,setsar=1 -r 30 -c:v libx264 -b:v 4500k -maxrate 4500k -bufsize 9000k -g 90 -keyint_min 90 -preset veryfast -tune zerolatency -sc_threshold 0 -c:a aac -b:a 128k -ar 44100 -ac 2 -f flv rtmp://va.pscp.tv:80/x/streamkey",
+        "-hide_banner -nostdin -f image2pipe -c:v mjpeg -framerate 30 -thread_queue_size 512 -i pipe:0 -f lavfi -i anullsrc=r=44100:cl=stereo -map 0:v:0 -map 1:a:0 -shortest -vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p,setsar=1 -r 30 -c:v libx264 -b:v 4500k -maxrate 4500k -bufsize 9000k -g 90 -keyint_min 90 -preset veryfast -tune zerolatency -sc_threshold 0 -c:a aac -b:a 128k -ar 44100 -ac 2 -f flv rtmp://va.pscp.tv:80/x/streamkey",
+        "-hide_banner -nostdin -f image2pipe -c:v mjpeg -framerate 30 -thread_queue_size 512 -i pipe:0 -f s16le -ar 48000 -ac 2 -thread_queue_size 512 -i pipe:3 -map 0:v:0 -map 1:a:0 -vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p,setsar=1 -r 30 -c:v h264_videotoolbox -b:v 4500k -maxrate 4500k -bufsize 9000k -g 90 -keyint_min 90 -realtime true -c:a aac -b:a 128k -ar 44100 -ac 2 -f flv rtmp://va.pscp.tv:80/x/streamkey",
+      ]
+    `)
+  })
+
+  test('multi destination uses tee muxer with onfail=ignore', () => {
+    const args = buildStreamFfmpegArgs({
+      ...base,
+      rtmpUrls: ['rtmp://live.twitch.tv/app/key1', 'rtmp://va.pscp.tv:80/x/key2'],
+    })
+    expect(args.slice(-7).join(' ')).toMatchInlineSnapshot(`"-f tee -use_fifo 1 -fifo_options attempt_recovery=1:recover_any_error=1 [f=flv:onfail=ignore]rtmp://live.twitch.tv/app/key1|[f=flv:onfail=ignore]rtmp://va.pscp.tv:80/x/key2"`)
+  })
+
+  test('throws without destinations', () => {
+    expect(() => {
+      buildStreamFfmpegArgs({ ...base, rtmpUrls: [] })
+    }).toThrowErrorMatchingInlineSnapshot(`[Error: At least one RTMP destination is required]`)
+  })
+})
+
+describe('stream url helpers', () => {
+  test('escapeTeeUrl and redactStreamUrl', () => {
+    expect([
+      escapeTeeUrl('rtmp://host/app/key|with[brackets]'),
+      redactStreamUrl('rtmp://live.twitch.tv/app/live_123456_SECRET'),
+      redactStreamUrl('rtmps://va.pscp.tv:443/x/SECRETKEY'),
+      redactStreamUrl('/tmp/out.flv'),
+    ]).toMatchInlineSnapshot(`
+      [
+        "rtmp://host/app/key\\|with\\[brackets\\]",
+        "rtmp://live.twitch.tv/…",
+        "rtmps://va.pscp.tv:443/…",
+        "/tmp/out.flv",
+      ]
+    `)
+  })
+
+  test('parseFfmpegProgressLine', () => {
+    expect([
+      parseFfmpegProgressLine('frame=  123 fps= 30 q=28.0 size=    1024KiB time=00:00:04.10 bitrate=2045.6kbits/s drop=2 speed=1.01x'),
+      parseFfmpegProgressLine('[flv @ 0x7f8] Failed to update header'),
+    ]).toMatchInlineSnapshot(`
+      [
+        {
+          "bitrateKbps": 2045.6,
+          "droppedFrames": 2,
+          "fps": 30,
+        },
+        null,
+      ]
+    `)
   })
 })

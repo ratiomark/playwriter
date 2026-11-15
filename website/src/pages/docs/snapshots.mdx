@@ -14,6 +14,8 @@ Accessibility snapshots are the **primary way** agents read pages. They return e
 await snapshot({ page: state.page })
 
 // Output:
+// URL: https://example.com/
+//
 // - banner:
 //     - link "Home" [id="nav-home"]
 //     - navigation:
@@ -66,7 +68,7 @@ await snapshot({ page: state.page })
 // + status "Sending..."
 ```
 
-The diff is only returned when it's **shorter than the full content**. If nothing changed, you get: `"No changes since last snapshot"`.
+The diff is only returned when it's **shorter than the full content**. If nothing changed, you get the URL line plus `"No changes since last snapshot"`.
 
 **Control diffing explicitly:**
 
@@ -87,11 +89,11 @@ Scope a snapshot to a specific part of the page to **dramatically reduce output 
 await snapshot({ page: state.page })
 
 // Scoped to main: ~20 lines (just the content area)
-await snapshot({ locator: state.page.locator('main') })
+await snapshot({ page: state.page, locator: state.page.locator('main') })
 
 // Scope to a dialog, form, or section
-await snapshot({ locator: state.page.locator('[role="dialog"]') })
-await snapshot({ locator: state.page.locator('form#checkout') })
+await snapshot({ page: state.page, locator: state.page.locator('[role="dialog"]') })
+await snapshot({ page: state.page, locator: state.page.locator('form#checkout') })
 ```
 
 ## Iframe snapshots
@@ -100,7 +102,7 @@ Snapshot iframe content using `contentFrame()`:
 
 ```js
 const frame = await state.page.locator('iframe').contentFrame()
-await snapshot({ frame })
+await snapshot({ page: state.page, frame })
 ```
 
 ## Using locators from snapshots

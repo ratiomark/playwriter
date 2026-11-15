@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { createAdaptorServer } from '@hono/node-server'
+import { createAdaptorServer, type HttpBindings } from '@hono/node-server'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import { createNodeWebSocket } from '@hono/node-ws'
 import type { WSContext } from 'hono/ws'
@@ -9,14 +9,15 @@ import type { CDPCommand, CDPResponseBase, CDPEventBase, CDPEventFor, RelayServe
 import type {
   ExtensionMessage,
   ExtensionEventMessage,
-  RecordingDataMessage,
-  RecordingCancelledMessage,
-  StartRecordingBody,
-  StopRecordingParams,
-  CancelRecordingParams,
-  IsRecordingParams,
-  StartStreamParams,
-  StopStreamParams,
+  UpdateTabGroupResult,
+  CloseTabsForKeyResult,
+} from './protocol.js'
+import {
+  DEFAULT_TAB_GROUP_TITLE,
+  REMOTE_TAB_GROUP_TITLE,
+  normalizeTabGroupColor,
+  normalizeTabGroupTitle,
+  type TabGroupColor,
 } from './protocol.js'
 import pc from 'picocolors'
 import util from 'node:util'
@@ -27,15 +28,78 @@ Buffer.prototype[util.inspect.custom] = function () {
 }
 
 import fs from 'node:fs'
+import crypto from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
-import { VERSION, EXTENSION_IDS, shouldAutoEnablePlaywriter } from './utils.js'
+import { VERSION, EXTENSION_IDS } from './utils.js'
 import { createCdpLogger, type CdpLogEntry, type CdpLogger } from './cdp-log.js'
-import { RecordingRelay } from './recording-relay.js'
-import { StreamRelay } from './stream-relay.js'
 import { appendSessionToWsUrl } from './chrome-discovery.js'
 import * as relayState from './relay-state.js'
+import { createHumanInput, isPacedInput, shouldHumanizeInput } from './human-input.js'
+import { WebSocket as NodeWebSocket } from 'ws'
+import { getRemoteDialRetryMs, parseRemoteControlUrl, REMOTE_DIAL_GIVE_UP_MS, type RemoteHelloMessage } from './remote-control.js'
+import type { CloudAuth } from './cloud-client.js'
+import { recordExecute, trackEvent, type SessionKind } from './telemetry.js'
+import type { ExecutorManager } from './executor.js'
+
+/** Session id counter of the relay daemon. One file per port, so relays on other ports never share it. */
+export function defaultSessionCounterPath(port: number): string {
+  const name = port === 19988 ? 'session-counter.json' : `session-counter-${port}.json`
+  return path.join(os.homedir(), '.playwriter', name)
+}
+
+function readSessionCounter(filePath: string | undefined): number {
+  if (!filePath) {
+    return 1
+  }
+  try {
+    const next = JSON.parse(fs.readFileSync(filePath, 'utf-8'))?.nextSessionNumber
+    return Number.isInteger(next) && next > 0 ? next : 1
+  } catch {
+    return 1
+  }
+}
+
+/** Atomic write, so a crash mid-write never resets the counter. Never throws. */
+function writeSessionCounter({
+  filePath,
+  next,
+  logger,
+}: {
+  filePath: string | undefined
+  next: number
+  logger?: { error(...args: any[]): void }
+}): void {
+  if (!filePath) {
+    return
+  }
+  const tmpFile = `${filePath}.${process.pid}.tmp`
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(tmpFile, JSON.stringify({ nextSessionNumber: next }) + '\n')
+    fs.renameSync(tmpFile, filePath)
+  } catch (error) {
+    logger?.error(`Could not write session counter ${filePath}:`, error)
+  }
+}
+import { PLAYWRITER_WORLD_NAME } from './cdp-session.js'
+
+const SCREENSHOT_CSS = [
+  '[data-playwriter-toolbar], [data-playwriter-overlay], #__playwriter_ghost_cursor__ { display: none !important; }',
+  '::-webkit-scrollbar { display: none !important; }',
+  '* { scrollbar-width: none !important; caret-color: transparent !important; }',
+].join('\n')
+// Run in the isolated world, where the sheet global is private. The adopted sheet leaves no node or attribute.
+const HIDE_UI_FOR_SCREENSHOT = `(() => {
+  const sheet = globalThis.__playwriterScreenshotSheet ??= new CSSStyleSheet()
+  sheet.replaceSync(${JSON.stringify(SCREENSHOT_CSS)})
+  if (!document.adoptedStyleSheets.includes(sheet)) document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet]
+})()`
+const SHOW_UI_AFTER_SCREENSHOT = `(() => {
+  const sheet = globalThis.__playwriterScreenshotSheet
+  if (sheet) document.adoptedStyleSheets = document.adoptedStyleSheets.filter((s) => s !== sheet)
+})()`
 
 /**
  * Checks if a target should be filtered out (not exposed to Playwright).
@@ -73,6 +137,12 @@ function isRestrictedTarget(targetInfo: Protocol.Target.TargetInfo): boolean {
 // Only events that no Playwright API depends on. See: https://github.com/remorses/playwriter/issues/96
 // NOTE: *ExtraInfo events feed Playwright's ResponseExtraInfoTracker for request/response.allHeaders().
 // webSocketFrame* events feed page.on('websocket') frame events. Both must be forwarded.
+const DEFAULT_EXTENSION_TIMEOUTS = {
+  command: 60_000,
+  // page.evaluate() and waitForFunction() await a page promise that can take minutes
+  awaitPromise: 5 * 60_000,
+}
+
 const DROPPED_CDP_EVENTS = new Set([
   'Network.dataReceived',
   'Network.resourceChangedPriority',
@@ -82,6 +152,7 @@ const DROPPED_CDP_EVENTS = new Set([
 // These are still forwarded to Playwright but excluded from disk logs to reduce I/O.
 const NOISY_LOG_EVENTS = new Set([
   ...DROPPED_CDP_EVENTS,
+  'Page.screencastFrame',
   'Network.requestWillBeSentExtraInfo',
   'Network.responseReceivedExtraInfo',
   'Network.requestServedFromCache',
@@ -105,24 +176,33 @@ export async function startPlayWriterCDPRelayServer({
   token,
   logger,
   cdpLogger,
+  sessionCounterFile,
+  onDrained,
+  extensionTimeouts,
 }: {
   port?: number
   host?: string
   token?: string
   logger?: { log(...args: any[]): void; error(...args: any[]): void }
   cdpLogger?: CdpLogger
+  /** Where the next session id is saved, so ids are never reused across relay restarts. Omit to start at 1 */
+  sessionCounterFile?: string
+  /** Called when a `/cli/drain` request finished waiting for running executes. Daemons exit the process here. Default: close the server */
+  onDrained?: () => void
+  /** Timeouts for commands forwarded to the extension, in ms. Tests pass short values */
+  extensionTimeouts?: Partial<typeof DEFAULT_EXTENSION_TIMEOUTS>
 } = {}): Promise<RelayServer> {
+  const timeouts = { ...DEFAULT_EXTENSION_TIMEOUTS, ...extensionTimeouts }
+  const humanInput = createHumanInput({ log: (message) => logger?.log(message) })
   const emitter = new EventEmitter()
+  // Lets a client tell this relay apart from one that replaced it on the same port. Also part of tab ownership keys.
+  const relayInstanceId = crypto.randomUUID()
   const store = relayState.createRelayStore()
   const extensionDownloadBehavior = new Map<string, Protocol.Browser.SetDownloadBehaviorRequest>()
 
   const resolvedCdpLogger = cdpLogger || createCdpLogger()
   const logCdpJson = (entry: CdpLogEntry) => {
     resolvedCdpLogger.log(entry)
-  }
-
-  const getDefaultExtensionId = (): string | null => {
-    return store.getState().extensions.keys().next().value || null
   }
 
   /**
@@ -135,6 +215,7 @@ export async function startPlayWriterCDPRelayServer({
   ): relayState.ExtensionEntry | null => {
     const currentRelayState = store.getState()
     const { extensions } = currentRelayState
+    const localExtensions = relayState.getLocalExtensions(currentRelayState)
 
     if (extensionId) {
       const direct = extensions.get(extensionId)
@@ -161,21 +242,18 @@ export async function startPlayWriterCDPRelayServer({
     }
 
     // Single extension — use it directly
-    if (extensions.size === 1) {
-      const fallbackId = getDefaultExtensionId()
-      if (fallbackId) {
-        const ext = extensions.get(fallbackId)
-        if (ext?.ws) {
-          return ext
-        }
+    if (localExtensions.length === 1) {
+      const [extension] = localExtensions
+      if (extension.ws) {
+        return extension
       }
     }
 
     // Multiple extensions — auto-select if exactly one has active targets.
     // This handles the common case of multiple Chrome profiles with the extension
     // installed, where only one profile has playwriter-enabled tabs. (#52)
-    if (extensions.size > 1) {
-      const activeExtensions = Array.from(extensions.values()).filter((ext) => {
+    if (localExtensions.length > 1) {
+      const activeExtensions = localExtensions.filter((ext) => {
         return ext.connectedTargets.size > 0
       })
       if (activeExtensions.length === 1 && activeExtensions[0].ws) {
@@ -216,8 +294,18 @@ export async function startPlayWriterCDPRelayServer({
     }
 
     const pingInterval = setInterval(() => {
-      const latestExt = store.getState().extensions.get(extensionId)
-      latestExt?.ws?.send(JSON.stringify({ method: 'ping' }))
+      const ws = store.getState().extensions.get(extensionId)?.ws
+      if (!ws) {
+        return
+      }
+      // Remote tunnels: Cloudflare answers protocol pings without waking the
+      // Durable Object. A JSON ping every 5s kept every tunnel DO awake 24/7.
+      if (ws.ping) {
+        ws.ping()
+        return
+      }
+      // Local: the extension service worker needs a real message to stay alive.
+      ws.send(JSON.stringify({ method: 'ping' }))
     }, 5000)
 
     store.setState((s) => relayState.updateExtensionIO(s, { extensionId, pingInterval }))
@@ -345,15 +433,79 @@ export async function startPlayWriterCDPRelayServer({
         safeSend(client)
       }
     } else {
-      const { playwrightClients } = store.getState()
+      const { playwrightClients, extensions } = store.getState()
       for (const client of playwrightClients.values()) {
         if (extensionId && client.extensionId !== extensionId) {
+          continue
+        }
+        const connectedTargets = client.extensionId ? extensions.get(client.extensionId)?.connectedTargets : undefined
+        const target = 'method' in message && connectedTargets ? findEventTarget({ message, connectedTargets }) : undefined
+        if (target && !canClientSeeTarget({ client, target })) {
           continue
         }
         safeSend(client)
       }
     }
   }
+
+  // chrome.debugger has no browser-level Target discovery, so emit what Chrome sends on navigation.
+  // CDP clients like browser-use track page URLs only from this event.
+  function sendTargetInfoChanged({ extensionId, sessionId }: { extensionId: string; sessionId: string }) {
+    const target = store.getState().extensions.get(extensionId)?.connectedTargets.get(sessionId)
+    if (!target) {
+      return
+    }
+    sendToPlaywright({
+      message: { method: 'Target.targetInfoChanged', params: { targetInfo: target.targetInfo } },
+      source: 'server',
+      extensionId,
+    })
+  }
+
+  // The tab an event belongs to: its session, or for root Target.* events the target in params.
+  // Undefined for workers, detached targets and browser events, which go to every client.
+  function findEventTarget({
+    message,
+    connectedTargets,
+  }: {
+    message: CDPEventBase
+    connectedTargets: Map<string, relayState.ConnectedTarget>
+  }): relayState.ConnectedTarget | undefined {
+    const params = message.params as { sessionId?: string; targetId?: string; targetInfo?: { targetId?: string } } | undefined
+    const sessionId = message.sessionId ?? params?.sessionId
+    if (sessionId) {
+      return connectedTargets.get(sessionId)
+    }
+    const targetId = params?.targetInfo?.targetId ?? params?.targetId
+    if (!targetId) {
+      return undefined
+    }
+    return Array.from(connectedTargets.values()).find((target) => {
+      return target.targetId === targetId
+    })
+  }
+
+  // A tab a live session created is visible only to that session's clients (plans/decisions/session-owned-tabs.md).
+  // Toggled tabs, SDK tabs, tabs of deleted sessions or an older relay, and clients without a session (MCP) see everything.
+  function canClientSeeTarget({
+    client,
+    target,
+  }: {
+    client: relayState.PlaywrightClient
+    target: relayState.ConnectedTarget
+  }): boolean {
+    if (!target.ownerKey || !client.sessionId || target.ownerKey === ownershipKey(client.sessionId)) {
+      return true
+    }
+    const prefix = `${relayInstanceId}:`
+    if (!target.ownerKey.startsWith(prefix)) {
+      return true
+    }
+    const ownerSessionId = target.ownerKey.slice(prefix.length)
+    return sharedTabSessionIds.has(ownerSessionId) || !executorManager?.getSession(ownerSessionId)
+  }
+  // SDK sessions: scripts in several processes may share one tab (skill.md), so their tabs are never private
+  const sharedTabSessionIds = new Set<string>()
 
   type ForwardCdpParams = {
     method: string
@@ -377,7 +529,7 @@ export async function startPlayWriterCDPRelayServer({
     extensionId,
     method,
     params,
-    timeout = 30000,
+    timeout = timeouts.command,
   }: {
     extensionId?: string | null
     method: string
@@ -480,118 +632,6 @@ export async function startPlayWriterCDPRelayServer({
     })
   }
 
-  const recordingRelays = new Map<string, RecordingRelay>()
-
-  // Find which extension connection owns a CDP tab session ID (pw-tab-*).
-  // Used by recording routes where sessionId identifies the target tab.
-  // Delegates to the pure derivation function from relay-state.ts.
-  const findExtensionIdByCdpSession = (cdpSessionId: string): string | null => {
-    return relayState.findExtensionIdByCdpSession(store.getState(), cdpSessionId)
-  }
-
-  // Resolve recording route session ID (CDP tab session) to extension connection.
-  const resolveRecordingRoute = async ({
-    sessionId,
-  }: {
-    sessionId: string | null
-  }): Promise<{
-    extensionId: string | null
-    sessionId: string | null
-  }> => {
-    if (!sessionId) {
-      return { extensionId: null, sessionId: null }
-    }
-
-    const extensionId = findExtensionIdByCdpSession(sessionId)
-    return { extensionId, sessionId }
-  }
-
-  const getRecordingRelay = (extensionId?: string | null): RecordingRelay | null => {
-    const allowDefault = !extensionId && store.getState().extensions.size === 1
-    const conn = getExtensionConnection(extensionId, { allowFallback: allowDefault })
-    if (!conn) {
-      return null
-    }
-    const connId = conn.id
-    if (!recordingRelays.has(connId)) {
-      recordingRelays.set(
-        connId,
-        new RecordingRelay(
-          (params) => sendToExtension({ extensionId: connId, ...params }),
-          () => store.getState().extensions.has(connId),
-          logger,
-        ),
-      )
-    }
-    return recordingRelays.get(connId) || null
-  }
-
-  // Stream relays pipe capture chunks to ffmpeg for live RTMP streaming
-  // instead of accumulating them like RecordingRelay. Keyed per extension
-  // connection exactly like recordingRelays.
-  const streamRelays = new Map<string, StreamRelay>()
-
-  const getStreamRelay = (extensionId?: string | null): StreamRelay | null => {
-    const allowDefault = !extensionId && store.getState().extensions.size === 1
-    const conn = getExtensionConnection(extensionId, { allowFallback: allowDefault })
-    if (!conn) {
-      return null
-    }
-    const connId = conn.id
-    if (!streamRelays.has(connId)) {
-      streamRelays.set(
-        connId,
-        new StreamRelay(
-          (params) => sendToExtension({ extensionId: connId, ...params }),
-          () => store.getState().extensions.has(connId),
-          logger,
-        ),
-      )
-    }
-    return streamRelays.get(connId) || null
-  }
-
-  // Auto-create an initial blank tab when no targets exist. Set
-  // PLAYWRITER_AUTO_ENABLE=false to require manually enabled tabs instead.
-  async function maybeAutoCreateInitialTab(extensionId: string): Promise<void> {
-    if (!shouldAutoEnablePlaywriter()) {
-      return
-    }
-    const conn = getExtensionConnection(extensionId)
-    if (!conn) {
-      return
-    }
-    if (conn.connectedTargets.size > 0) {
-      return
-    }
-
-    try {
-      logger?.log(pc.blue('Auto-creating initial tab for Playwright client'))
-      const result = (await sendToExtension({ extensionId, method: 'createInitialTab', timeout: 10000 })) as {
-        success: boolean
-        tabId: number
-        sessionId: string
-        targetInfo: Protocol.Target.TargetInfo
-      }
-      if (result.success && result.sessionId && result.targetInfo) {
-        store.setState((s) =>
-          relayState.addTarget(s, {
-            extensionId,
-            sessionId: result.sessionId,
-            targetId: result.targetInfo.targetId,
-            targetInfo: result.targetInfo,
-          }),
-        )
-        const updatedTargets = store.getState().extensions.get(extensionId)?.connectedTargets.size || 0
-        logger?.log(
-          pc.blue(`Auto-created tab, now have ${updatedTargets} targets, url: ${result.targetInfo.url}`),
-        )
-      }
-    } catch (e) {
-      logger?.error('Failed to auto-create initial tab:', e)
-    }
-  }
-
   function getPageTargetSessionIds({ extensionId }: { extensionId: string }): string[] {
     const extensionState = store.getState().extensions.get(extensionId)
     if (!extensionState) {
@@ -678,22 +718,145 @@ export async function startPlayWriterCDPRelayServer({
     )
   }
 
+  // Page.startScreencast is per tab, not per CDP client. Without merging, one
+  // client's stopScreencast (video recording, skill recorder) silently stops
+  // the others' frames. Each client keeps its params; Chrome gets the merged set,
+  // and stop is forwarded only when no client is left.
+  // Remote-control viewers talk to the extension directly and are not merged.
+  const screencasts = new Map<
+    string,
+    { extensionId: string; sessionId: string; clients: Map<string, Protocol.Page.StartScreencastRequest> }
+  >()
+
+  async function applyScreencast({
+    extensionId,
+    sessionId,
+    source,
+  }: {
+    extensionId: string
+    sessionId: string
+    source?: CDPCommand['source']
+  }): Promise<void> {
+    const key = `${extensionId}\0${sessionId}`
+    const clients = screencasts.get(key)?.clients
+    if (!clients || clients.size === 0) {
+      screencasts.delete(key)
+      await sendToExtension({
+        extensionId,
+        method: 'forwardCDPCommand',
+        params: { sessionId, method: 'Page.stopScreencast', params: {}, source },
+      })
+      return
+    }
+    await sendToExtension({
+      extensionId,
+      method: 'forwardCDPCommand',
+      params: {
+        sessionId,
+        method: 'Page.startScreencast',
+        params: relayState.mergeScreencastParams([...clients.values()]),
+        source,
+      },
+    })
+  }
+
+  // Native Page.startScreenRecording outlives the client that started it, and
+  // blocks every screencast on that tab. Stop the ones a disconnected client
+  // left running (executor reset or crash).
+  const nativeRecordings = new Map<string, { extensionId: string; sessionId: string; clientId: string; stream: string }>()
+
+  function releaseClientRecordings(clientId: string): void {
+    Array.from(nativeRecordings.entries())
+      .filter(([, entry]) => {
+        return entry.clientId === clientId
+      })
+      .forEach(([key, { extensionId, sessionId, stream }]) => {
+        nativeRecordings.delete(key)
+        const send = (method: string, params: object) => {
+          return sendToExtension({ extensionId, method: 'forwardCDPCommand', params: { sessionId, method, params } })
+        }
+        send('Page.stopScreenRecording', {})
+          .then(() => send('IO.close', { handle: stream }))
+          .catch((error) => {
+            logger?.log(pc.yellow(`[Server] Failed to stop native recording for ${sessionId}: ${String(error)}`))
+          })
+      })
+  }
+
+  function releaseClientScreencasts(clientId: string): void {
+    Array.from(screencasts.values())
+      .filter((entry) => {
+        return entry.clients.delete(clientId)
+      })
+      .forEach(({ extensionId, sessionId }) => {
+        applyScreencast({ extensionId, sessionId }).catch((error) => {
+          logger?.log(pc.yellow(`[Server] Failed to update screencast for ${sessionId}: ${String(error)}`))
+        })
+      })
+  }
+
   async function routeCdpCommand({
     extensionId,
     method,
     params,
     sessionId,
     source,
+    clientId,
   }: {
     extensionId: string | null
     method: CDPCommand['method'] | (string & {})
     params: CDPCommand['params']
     sessionId?: CDPCommand['sessionId']
     source?: CDPCommand['source']
+    /** Playwright client that sent this command — used to resolve its session's tab group */
+    clientId?: string
   }) {
     const conn = getExtensionConnection(extensionId)
     const connectedTargets = conn?.connectedTargets || new Map<string, relayState.ConnectedTarget>()
     const resolvedExtensionId = conn?.id || extensionId
+    const client = clientId ? store.getState().playwrightClients.get(clientId) : undefined
+    const clientTabGroup = client?.tabGroup
+    const clientSessionKey = client?.sessionId ? ownershipKey(client.sessionId) : undefined
+    const clientTabGroupColor = client?.tabGroupColor
+    const canSee = (target: relayState.ConnectedTarget) => {
+      return !client || canClientSeeTarget({ client, target })
+    }
+    const visibleTargets = () => {
+      return Array.from(connectedTargets.values()).filter(canSee)
+    }
+    const targetParams = params as { targetId?: string; sessionId?: string } | undefined
+    const commandTargetId = targetParams?.targetId
+    const commandSessionId = targetParams?.sessionId ?? sessionId
+    const commandTarget = commandSessionId
+      ? connectedTargets.get(commandSessionId)
+      : typeof commandTargetId === 'string'
+        ? Array.from(connectedTargets.values()).find((target) => {
+            return target.targetId === commandTargetId
+          })
+        : undefined
+    if (commandTarget && !canSee(commandTarget)) {
+      throw new Error(`Tab ${commandTarget.targetId} belongs to another Playwriter session`)
+    }
+    // CLI sessions: the relay owns focus emulation, so drop Playwright's own setting
+    const focusSessionId = client?.sessionId && !sharedTabSessionIds.has(client.sessionId) ? client.sessionId : undefined
+    if (!focusSessionId && clientId && resolvedExtensionId && commandTarget && method === 'Emulation.setFocusEmulationEnabled') {
+      const key = `${resolvedExtensionId}\0${commandTarget.sessionId}`
+      const holders = persistentFocus.get(key) ?? new Set<string>()
+      if ((params as { enabled?: boolean } | undefined)?.enabled) {
+        persistentFocus.set(key, holders.add(clientId))
+      } else {
+        holders.delete(clientId)
+        if (holders.size === 0) persistentFocus.delete(key)
+      }
+    }
+    if (focusSessionId && resolvedExtensionId && commandTarget?.targetInfo.type === 'page') {
+      if (method === 'Emulation.setFocusEmulationEnabled') {
+        return {}
+      }
+      if (executingSessions.has(focusSessionId)) {
+        await focusTab({ extensionId: resolvedExtensionId, tabSessionId: commandTarget.sessionId, cliSessionId: focusSessionId })
+      }
+    }
     switch (method) {
       case 'Browser.getVersion': {
         return {
@@ -722,14 +885,11 @@ export async function startPlayWriterCDPRelayServer({
       }
 
       // Target.setAutoAttach is a CDP command Playwright sends on first connection.
-      // We use it as the hook to auto-create an initial tab. If Playwright changes
-      // its initialization sequence in the future, this could be moved to a different command.
+      // The relay never auto-creates a tab here: clients with zero tabs get an
+      // empty default context and open tabs themselves via Target.createTarget.
       case 'Target.setAutoAttach': {
         if (sessionId) {
           break
-        }
-        if (conn) {
-          await maybeAutoCreateInitialTab(conn.id)
         }
         // Forward auto-attach so Chrome emits iframe Target.attachedToTarget events.
         // Playwright relies on these (with parentFrameId) when reconnecting over CDP.
@@ -751,7 +911,7 @@ export async function startPlayWriterCDPRelayServer({
           throw new Error('targetId is required for Target.attachToTarget')
         }
 
-        for (const target of connectedTargets.values()) {
+        for (const target of visibleTargets()) {
           if (target.targetId === attachParams.targetId) {
             return { sessionId: target.sessionId } satisfies Protocol.Target.AttachToTargetResponse
           }
@@ -765,11 +925,12 @@ export async function startPlayWriterCDPRelayServer({
         const targetId = infoReqParams?.targetId
 
         if (targetId) {
-          for (const target of connectedTargets.values()) {
+          for (const target of visibleTargets()) {
             if (target.targetId === targetId) {
               return { targetInfo: target.targetInfo }
             }
           }
+          throw new Error(`Target not found: ${targetId}`)
         }
 
         if (sessionId) {
@@ -777,15 +938,18 @@ export async function startPlayWriterCDPRelayServer({
           if (target) {
             return { targetInfo: target.targetInfo }
           }
+          throw new Error(`Target session not found: ${sessionId}`)
         }
 
-        const firstTarget = Array.from(connectedTargets.values())[0]
+        // Playwright uses an identity-free request as a synchronization barrier
+        // after Target.setAutoAttach, so it still needs any current root target.
+        const firstTarget = visibleTargets()[0]
         return { targetInfo: firstTarget?.targetInfo }
       }
 
       case 'Target.getTargets': {
         return {
-          targetInfos: Array.from(connectedTargets.values())
+          targetInfos: visibleTargets()
             .filter((t) => !isRestrictedTarget(t.targetInfo))
             .map((t) => ({
               ...t.targetInfo,
@@ -798,7 +962,14 @@ export async function startPlayWriterCDPRelayServer({
         return await sendToExtension({
           extensionId: resolvedExtensionId,
           method: 'forwardCDPCommand',
-          params: { method, params, source },
+          params: {
+            method,
+            params,
+            source,
+            tabGroup: clientTabGroup,
+            tabGroupKey: clientSessionKey,
+            tabGroupColor: clientTabGroupColor,
+          },
         })
       }
 
@@ -810,6 +981,42 @@ export async function startPlayWriterCDPRelayServer({
         })
       }
 
+      // Playwright reads and writes context cookies on the browser target (context.cookies(),
+      // context.addCookies(), route.fetch()). chrome.debugger cannot reach the browser target,
+      // so run the Network equivalent on any tab: one cookie store is shared by the whole profile.
+      // Works with every extension version, it only forwards Network commands (issue #66).
+      case 'Storage.getCookies':
+      case 'Storage.setCookies': {
+        // Remote control keeps the original method, so the extension rejects it
+        if (sessionId || (conn && relayState.isRemoteExtension(conn))) {
+          break
+        }
+        const tab = Array.from(connectedTargets.values()).find((target) => {
+          return target.targetInfo.type === 'page' && !isRestrictedTarget(target.targetInfo)
+        })
+        if (!tab) {
+          throw new Error(`${method} needs an open page in this browser. Create one with context.newPage() first.`)
+        }
+        const cookieParams = params as Protocol.Storage.SetCookiesRequest | undefined
+        return await sendToExtension({
+          extensionId: resolvedExtensionId,
+          method: 'forwardCDPCommand',
+          params:
+            method === 'Storage.getCookies'
+              ? { sessionId: tab.sessionId, method: 'Network.getAllCookies', params: {}, source }
+              : { sessionId: tab.sessionId, method: 'Network.setCookies', params: { cookies: cookieParams?.cookies || [] }, source },
+        })
+      }
+
+      case 'Storage.clearCookies': {
+        if (sessionId) {
+          break
+        }
+        throw new Error(
+          'context.clearCookies() is not supported: in the user browser it deletes cookies for every site in the profile. Delete cookies by name with Network.deleteCookies on a page CDP session.',
+        )
+      }
+
       // Ghost Browser API - forward to extension for chrome.ghostPublicAPI/ghostProxies/projects
       case 'ghost-browser': {
         return await sendToExtension({
@@ -819,51 +1026,362 @@ export async function startPlayWriterCDPRelayServer({
         })
       }
 
-      case 'Runtime.enable': {
-        if (!sessionId) {
+      case 'Page.captureScreenshot': {
+        // Hide playwriter UI, scrollbars and caret during the capture (4 blocking round trips). An adopted
+        // stylesheet set from a playwriter isolated world: page scripts see no calls, nodes or attribute changes.
+        const sendCommand = (cdpMethod: string, cdpParams?: object) => {
+          return sendToExtension({
+            extensionId: resolvedExtensionId,
+            method: 'forwardCDPCommand',
+            params: { sessionId, method: cdpMethod, params: cdpParams, source },
+          })
+        }
+        const frameId = sessionId ? connectedTargets.get(sessionId)?.targetInfo.targetId : undefined
+        const world = frameId
+          ? ((await sendCommand('Page.createIsolatedWorld', { frameId, worldName: PLAYWRITER_WORLD_NAME }).catch(
+              () => undefined,
+            )) as Protocol.Page.CreateIsolatedWorldResponse | undefined)
+          : undefined
+        const evaluateInWorld = async (expression: string) => {
+          if (world?.executionContextId === undefined) {
+            return
+          }
+          await sendCommand('Runtime.evaluate', { expression, contextId: world.executionContextId })
+        }
+        try {
+          await evaluateInWorld(HIDE_UI_FOR_SCREENSHOT).catch(() => {})
+          return await sendCommand(method, params)
+        } finally {
+          // Also after a failed capture, so the page UI is not left hidden. A cleanup error must not replace the result.
+          await evaluateInWorld(SHOW_UI_AFTER_SCREENSHOT).catch(() => {})
+        }
+      }
+
+      case 'Page.startScreencast':
+      case 'Page.stopScreencast': {
+        if (!sessionId || !clientId || !resolvedExtensionId) {
           break
         }
-
-        const contextCreatedPromise = new Promise<void>((resolve) => {
-          const handler = ({ event }: { event: CDPEventBase }) => {
-            if (event.method === 'Runtime.executionContextCreated' && event.sessionId === sessionId) {
-              const params = event.params as Protocol.Runtime.ExecutionContextCreatedEvent | undefined
-              if (params?.context?.auxData?.isDefault === true) {
-                clearTimeout(timeout)
-                emitter.off('cdp:event', handler)
-                resolve()
-              }
-            }
+        const key = `${resolvedExtensionId}\0${sessionId}`
+        const entry = screencasts.get(key) || { extensionId: resolvedExtensionId, sessionId, clients: new Map() }
+        screencasts.set(key, entry)
+        if (method === 'Page.startScreencast') {
+          entry.clients.set(clientId, (params || {}) as Protocol.Page.StartScreencastRequest)
+        } else {
+          entry.clients.delete(clientId)
+        }
+        try {
+          await applyScreencast({ extensionId: resolvedExtensionId, sessionId, source })
+        } catch (error) {
+          if (method === 'Page.startScreencast') {
+            entry.clients.delete(clientId)
           }
-          const timeout = setTimeout(() => {
-            emitter.off('cdp:event', handler)
-            logger?.log(
-              pc.yellow(
-                `IMPORTANT: Runtime.enable timed out waiting for main frame executionContextCreated (sessionId: ${sessionId}). This may cause pages to not be visible immediately.`,
-              ),
+          if (method === 'Page.startScreencast' && nativeRecordings.has(key)) {
+            throw new Error(
+              'This tab is being recorded with recording.start. Screencast (live view, skill recorder frames, stream) works again after the recording stops.',
+              { cause: error },
             )
-            resolve()
-          }, 3000)
-          emitter.on('cdp:event', handler)
-        })
+          }
+          throw error
+        }
+        return {}
+      }
 
-        const result = await sendToExtension({
-          extensionId: resolvedExtensionId,
-          method: 'forwardCDPCommand',
-          params: { sessionId, method, params, source },
-        })
-
-        await contextCreatedPromise
-
+      case 'Page.startScreenRecording':
+      case 'Page.stopScreenRecording': {
+        if (!sessionId || !clientId || !resolvedExtensionId) {
+          break
+        }
+        const key = `${resolvedExtensionId}\0${sessionId}`
+        const forward = () => {
+          return sendToExtension({
+            extensionId: resolvedExtensionId,
+            method: 'forwardCDPCommand',
+            params: { sessionId, method, params, source },
+          }) as Promise<{ stream?: string }>
+        }
+        if (method === 'Page.stopScreenRecording') {
+          // Also on error: "No active screen recording" means nothing is left to release
+          return await forward().finally(() => {
+            nativeRecordings.delete(key)
+          })
+        }
+        const result = await forward()
+        if (result?.stream) {
+          nativeRecordings.set(key, { extensionId: resolvedExtensionId, sessionId, clientId, stream: result.stream })
+          // The client disconnected while Chrome was starting: release now, no later onClose comes
+          if (!store.getState().playwrightClients.has(clientId)) {
+            releaseClientRecordings(clientId)
+          }
+        }
         return result
+      }
+
+      case 'Runtime.enable': {
+        if (!sessionId || !resolvedExtensionId) {
+          break
+        }
+        const key = `${resolvedExtensionId}\0${sessionId}`
+        const runtime = runtimes.get(key)
+        if (runtime && clientId) {
+          runtime.holders.add(clientId)
+          await runtime.enabled
+          // Round trip on the same session first: Chrome answers in order, so this client's
+          // earlier commands (Page.getFrameTree) are answered before the contexts arrive.
+          // Playwright drops contexts of frames it does not know yet.
+          await sendToExtension({
+            extensionId: resolvedExtensionId,
+            method: 'forwardCDPCommand',
+            params: { sessionId, method: 'Runtime.getIsolateId', params: {}, source },
+          }).catch(() => {})
+          // Replay to this client only. Re-enabling would re-emit contexts to every client.
+          for (const context of runtime.contexts.values()) {
+            sendToPlaywright({
+              message: { sessionId, method: 'Runtime.executionContextCreated', params: { context } },
+              clientId,
+              source: 'server',
+            })
+          }
+          return {}
+        }
+        // Set before any event arrives, so the contexts of this enable are tracked
+        const enabled = enableRuntime({ extensionId: resolvedExtensionId, sessionId, method, params, source })
+        runtimes.set(key, { enabled, contexts: new Map(), holders: new Set(clientId ? [clientId] : []) })
+        try {
+          return await enabled
+        } catch (error) {
+          if (runtimes.get(key)?.enabled === enabled) {
+            runtimes.delete(key)
+          }
+          throw error
+        }
+      }
+
+      case 'Runtime.disable': {
+        if (!sessionId || !resolvedExtensionId) {
+          break
+        }
+        const key = `${resolvedExtensionId}\0${sessionId}`
+        const runtime = runtimes.get(key)
+        if (!runtime) {
+          break
+        }
+        if (clientId) {
+          runtime.holders.delete(clientId)
+        }
+        // Another client still needs Runtime (its contexts and console events). Keep it on.
+        if (runtime.holders.size > 0) {
+          return {}
+        }
+        runtimes.delete(key)
+        break
       }
     }
 
-    return await sendToExtension({
+    const input = { method, params }
+    if (
+      sessionId &&
+      resolvedExtensionId &&
+      isPacedInput(input) &&
+      shouldHumanizeInput({ patchright: client?.patchright ?? false, url: connectedTargets.get(sessionId)?.targetInfo.url })
+    ) {
+      await humanInput
+        .beforeInput({
+          extensionId: resolvedExtensionId,
+          sessionId,
+          input,
+          root: connectedTargets.get(sessionId)?.targetInfo.type === 'page',
+          send: (extraMethod, extraParams) => {
+            return sendToExtension({
+              extensionId: resolvedExtensionId,
+              method: 'forwardCDPCommand',
+              params: { sessionId, method: extraMethod, params: extraParams, source },
+            })
+          },
+        })
+        .catch((error) => {
+          logger?.log(pc.yellow(`[HumanInput] ${method} pacing failed: ${String(error)}`))
+        })
+    }
+
+    const awaitsPromise =
+      (method === 'Runtime.evaluate' || method === 'Runtime.callFunctionOn') &&
+      !!params &&
+      typeof params === 'object' &&
+      'awaitPromise' in params &&
+      params.awaitPromise === true
+    const result = await sendToExtension({
       extensionId: resolvedExtensionId,
       method: 'forwardCDPCommand',
       params: { sessionId, method, params, source },
+      timeout: awaitsPromise ? timeouts.awaitPromise : timeouts.command,
     })
+    if (method === 'DOM.getContentQuads' && sessionId && resolvedExtensionId) {
+      const { quads } = result as Partial<Protocol.DOM.GetContentQuadsResponse>
+      if (quads) {
+        humanInput.rememberQuads({ extensionId: resolvedExtensionId, sessionId, quads })
+      }
+    }
+    return result
+  }
+
+  // Runtime.enable is per tab, not per CDP client. The extension answers each one with
+  // Runtime.disable + enable, which re-emits every context to all clients, and Playwright
+  // then destroys the old ones: in-flight evaluates and handles of other clients fail.
+  // So only the first enable per target session is forwarded. Later clients get the
+  // contexts tracked from events, replayed to them only.
+  // holders: clients that enabled Runtime and did not disable it. Runtime.disable reaches
+  // Chrome only from the last holder (Patchright turns Runtime on only to read logs).
+  // Disconnected clients stop holding it, but Runtime stays on until someone disables it.
+  const runtimes = new Map<
+    string,
+    {
+      enabled: Promise<unknown>
+      contexts: Map<number, Protocol.Runtime.ExecutionContextDescription>
+      holders: Set<string>
+    }
+  >()
+
+  // Focus emulation makes document.hasFocus() true in a background tab. Like a person switching tabs, a tab
+  // reports focus only while an execute of a CLI session sends it commands, then has its real focus again.
+  // Ported from anomalyco/browse cdp/tab-activity.ts. MCP and SDK clients keep Playwright's always-on emulation.
+  const executingSessions = new Map<string, number>()
+  // `${extensionId}\0${tabSessionId}` -> CLI sessions whose running execute uses the tab
+  const focusedTabs = new Map<string, Set<string>>()
+  // MCP/SDK clients request persistent emulation. CLI cleanup must not undo their setting.
+  const persistentFocus = new Map<string, Set<string>>()
+  const focusUpdates = new Map<string, Promise<unknown>>()
+
+  async function setFocusEmulation({ extensionId, tabSessionId, enabled }: { extensionId: string; tabSessionId: string; enabled: boolean }) {
+    const key = `${extensionId}\0${tabSessionId}`
+    const update = (focusUpdates.get(key) ?? Promise.resolve()).then(() => sendToExtension({
+      extensionId,
+      method: 'forwardCDPCommand',
+      params: { sessionId: tabSessionId, method: 'Emulation.setFocusEmulationEnabled', params: { enabled: enabled || (persistentFocus.get(key)?.size ?? 0) > 0 } },
+    })).catch((error) => {
+      logger?.log(pc.yellow(`[Focus] setFocusEmulationEnabled ${enabled} failed: ${String(error)}`))
+    })
+    focusUpdates.set(key, update)
+    await update
+    if (focusUpdates.get(key) === update) focusUpdates.delete(key)
+  }
+
+  async function focusTab({ extensionId, tabSessionId, cliSessionId }: { extensionId: string; tabSessionId: string; cliSessionId: string }) {
+    const key = `${extensionId}\0${tabSessionId}`
+    const sessions = focusedTabs.get(key) ?? new Set<string>()
+    if (sessions.has(cliSessionId)) {
+      return
+    }
+    focusedTabs.set(key, sessions.add(cliSessionId))
+    if (sessions.size === 1) {
+      await setFocusEmulation({ extensionId, tabSessionId, enabled: true })
+    }
+  }
+
+  function startSessionExecute(cliSessionId: string): void {
+    executingSessions.set(cliSessionId, (executingSessions.get(cliSessionId) ?? 0) + 1)
+  }
+
+  function endSessionExecute(cliSessionId: string): void {
+    const running = (executingSessions.get(cliSessionId) ?? 1) - 1
+    if (running > 0) {
+      executingSessions.set(cliSessionId, running)
+      return
+    }
+    executingSessions.delete(cliSessionId)
+    for (const [key, sessions] of focusedTabs) {
+      if (!sessions.delete(cliSessionId) || sessions.size > 0) {
+        continue
+      }
+      focusedTabs.delete(key)
+      const [extensionId, tabSessionId] = key.split('\0')
+      void setFocusEmulation({ extensionId, tabSessionId, enabled: false })
+    }
+  }
+
+  function releaseClientRuntimes(clientId: string): void {
+    for (const runtime of runtimes.values()) {
+      runtime.holders.delete(clientId)
+    }
+  }
+
+  function trackRuntimeEvent({ extensionId, event }: { extensionId: string; event: CDPEventBase }): void {
+    if (event.method === 'Target.detachedFromTarget') {
+      const params = event.params as Protocol.Target.DetachedFromTargetEvent
+      runtimes.delete(`${extensionId}\0${params.sessionId}`)
+      return
+    }
+    const contexts = runtimes.get(`${extensionId}\0${event.sessionId}`)?.contexts
+    if (!contexts) {
+      return
+    }
+    if (event.method === 'Runtime.executionContextCreated') {
+      const { context } = event.params as Protocol.Runtime.ExecutionContextCreatedEvent
+      contexts.set(context.id, context)
+    } else if (event.method === 'Runtime.executionContextDestroyed') {
+      const params = event.params as Protocol.Runtime.ExecutionContextDestroyedEvent
+      contexts.delete(params.executionContextId)
+    } else if (event.method === 'Runtime.executionContextsCleared') {
+      contexts.clear()
+    }
+  }
+
+  function forgetExtensionRuntimes(extensionId: string): void {
+    Array.from(runtimes.keys())
+      .filter((key) => {
+        return key.startsWith(`${extensionId}\0`)
+      })
+      .forEach((key) => {
+        runtimes.delete(key)
+      })
+  }
+
+  async function enableRuntime({
+    extensionId,
+    sessionId,
+    method,
+    params,
+    source,
+  }: {
+    extensionId: string
+    sessionId: string
+    method: string
+    params: CDPCommand['params']
+    source?: CDPCommand['source']
+  }): Promise<unknown> {
+    // Wait for the main frame context, so the page is usable when the enable returns
+    const contextCreatedPromise = new Promise<void>((resolve) => {
+      const handler = ({ event }: { event: CDPEventBase }) => {
+        if (event.method === 'Runtime.executionContextCreated' && event.sessionId === sessionId) {
+          const params = event.params as Protocol.Runtime.ExecutionContextCreatedEvent | undefined
+          if (params?.context?.auxData?.isDefault === true) {
+            clearTimeout(timeout)
+            emitter.off('cdp:event', handler)
+            resolve()
+          }
+        }
+      }
+      const timeout = setTimeout(() => {
+        emitter.off('cdp:event', handler)
+        logger?.log(
+          pc.yellow(
+            `IMPORTANT: Runtime.enable timed out waiting for main frame executionContextCreated (sessionId: ${sessionId}). This may cause pages to not be visible immediately.`,
+          ),
+        )
+        resolve()
+      }, 3000)
+      emitter.on('cdp:event', handler)
+    })
+
+    const result = await sendToExtension({
+      extensionId,
+      method: 'forwardCDPCommand',
+      params: { sessionId, method, params, source },
+    })
+
+    await contextCreatedPromise
+
+    return result
   }
 
   const app = new Hono()
@@ -874,8 +1392,9 @@ export async function startPlayWriterCDPRelayServer({
     return c.json({ error: err.message }, 500)
   })
 
-  // CORS middleware for HTTP endpoints - only allows our specific extension IDs.
-  // This prevents other extensions from reading responses via fetch/XHR.
+  // CORS middleware for HTTP endpoints.
+  // Only our extension IDs may read responses via fetch/XHR. The toolbar
+  // Record button does not fetch from the page; the service worker does.
   // WebSocket connections have their own separate origin validation.
   app.use(
     '*',
@@ -956,6 +1475,17 @@ export async function startPlayWriterCDPRelayServer({
     return bearerToken === token || queryToken === token
   }
 
+  const requireTokenWhenConfigured = async (
+    c: Parameters<Parameters<typeof app.use>[1]>[0],
+    next: () => Promise<void>,
+  ) => {
+    if (!token || hasValidToken(c)) {
+      return next()
+    }
+    logger?.log(pc.red(`Rejecting ${c.req.path}: invalid or missing token`))
+    return c.text('Unauthorized', 401)
+  }
+
   app.use('*', async (c, next) => {
     const hostname = parseHostname(c.req.header('host'))
     if (hostname && ALLOWED_HOSTS.has(hostname)) {
@@ -985,13 +1515,19 @@ export async function startPlayWriterCDPRelayServer({
     return c.text('OK')
   })
 
+  // pid, instanceId and activeExecutes were added later. Old clients only read version.
   app.get('/version', (c) => {
-    return c.json({ version: VERSION })
+    return c.json({ version: VERSION, pid: process.pid, instanceId: relayInstanceId, activeExecutes })
   })
+
+  app.use('/extension/status', requireTokenWhenConfigured)
+  app.use('/extensions/status', requireTokenWhenConfigured)
+  app.use('/json', requireTokenWhenConfigured)
+  app.use('/json/*', requireTokenWhenConfigured)
 
   app.get('/extension/status', (c) => {
     const defaultExtension = getExtensionConnection(null, { allowFallback: true })
-    const connected = store.getState().extensions.size > 0
+    const connected = relayState.getLocalExtensions(store.getState()).length > 0
     const activeTargets = defaultExtension?.connectedTargets.size || 0
     const info = defaultExtension?.info
 
@@ -1001,6 +1537,7 @@ export async function startPlayWriterCDPRelayServer({
       browser: info?.browser || null,
       profile: info ? { email: info.email || '', id: info.id || '' } : null,
       playwriterVersion: info?.version || null,
+      inventoryReady: defaultExtension?.inventoryReady ?? false,
     })
   })
 
@@ -1013,6 +1550,7 @@ export async function startPlayWriterCDPRelayServer({
         profile: ext.info ? { email: ext.info.email || '', id: ext.info.id || '' } : null,
         activeTargets: ext.connectedTargets.size,
         playwriterVersion: ext.info?.version || null,
+        inventoryReady: ext.inventoryReady,
       }
     })
     return c.json({ extensions })
@@ -1098,18 +1636,6 @@ export async function startPlayWriterCDPRelayServer({
       )
     })
 
-  app.post('/mcp-log', async (c) => {
-    try {
-      const { level, args } = await c.req.json()
-      const logFn = (logger as any)?.[level] || logger?.log
-      const prefix = pc.red(`[MCP] [${level.toUpperCase()}]`)
-      logFn?.(prefix, ...args)
-      return c.json({ ok: true })
-    } catch {
-      return c.json({ ok: false }, 400)
-    }
-  })
-
   // Validate Origin header for WebSocket connections to prevent cross-origin attacks.
   // Browsers always send Origin header for WebSocket connections, but Node.js clients don't.
   // We only allow our specific extension IDs to prevent malicious websites or extensions
@@ -1146,6 +1672,11 @@ export async function startPlayWriterCDPRelayServer({
       const clientId = c.req.param('clientId') || 'default'
       const url = new URL(c.req.url, 'http://localhost')
       const requestedExtensionId = url.searchParams.get('extensionId')
+      const clientSessionId = url.searchParams.get('session') || undefined
+      const clientTabGroup = normalizeTabGroupTitle(url.searchParams.get('tabGroup')) || undefined
+      const clientTabGroupColor = normalizeTabGroupColor(url.searchParams.get('tabGroupColor')) || undefined
+      const clientKind = url.searchParams.get('client')
+      const clientPatchright = url.searchParams.get('patchright') === '1'
       // When extensionId is explicit, resolve directly. Otherwise use fallback which
       // handles single-extension and uniquely-active-extension cases (#52).
       const resolvedExtension = requestedExtensionId
@@ -1177,7 +1708,15 @@ export async function startPlayWriterCDPRelayServer({
 
           // Add client first so it can receive Target.attachedToTarget events
           store.setState((s) => {
-            return relayState.addPlaywrightClient(s, { id: clientId, extensionId: clientExtensionId, ws })
+            return relayState.addPlaywrightClient(s, {
+              id: clientId,
+              extensionId: clientExtensionId,
+              ws,
+              sessionId: clientSessionId,
+              tabGroup: clientTabGroup,
+              tabGroupColor: clientTabGroupColor,
+              patchright: clientPatchright,
+            })
           })
           const extensionConnection = getExtensionConnection(clientExtensionId)
           const targetCount = extensionConnection?.connectedTargets.size || 0
@@ -1186,6 +1725,9 @@ export async function startPlayWriterCDPRelayServer({
               `Playwright client connected: ${clientId} (${store.getState().playwrightClients.size} total) (extension? ${!!extensionConnection}) (${targetCount} pages)`,
             ),
           )
+          if (clientKind === 'mcp') {
+            trackEvent('mcp_connected', {})
+          }
         },
 
         async onMessage(event, ws) {
@@ -1237,15 +1779,43 @@ export async function startPlayWriterCDPRelayServer({
               params,
               sessionId,
               source,
+              clientId,
             })
+            if (method === 'Runtime.runIfWaitingForDebugger' && sessionId) {
+              const target = store.getState().extensions.get(extensionConn.id)?.connectedTargets.get(sessionId)
+              if (target?.workerScriptLoaded) {
+                sendToPlaywright({ clientId, source: 'server', message: { sessionId, method: 'Inspector.workerScriptLoaded', params: {} } })
+              }
+            }
+
+            // Replay existing workers when a page session reattaches, before the command response.
+            if (method === 'Target.setAutoAttach' && sessionId && params?.autoAttach) {
+              const extension = store.getState().extensions.get(extensionConn.id)
+              const client = store.getState().playwrightClients.get(clientId)
+              for (const target of extension?.connectedTargets.values() ?? []) {
+                if (target.parentSessionId !== sessionId || !client || !canClientSeeTarget({ client, target })) {
+                  continue
+                }
+                sendToPlaywright({
+                  clientId,
+                  source: 'server',
+                  message: {
+                    sessionId,
+                    method: 'Target.attachedToTarget',
+                    params: { sessionId: target.sessionId, targetInfo: target.targetInfo, waitingForDebugger: false },
+                  },
+                })
+              }
+            }
 
             if (method === 'Target.setAutoAttach' && !sessionId) {
               // Re-read state after async routeCdpCommand — targets may have changed
               const freshExt = store.getState().extensions.get(extensionConn.id)
               const freshTargets = freshExt?.connectedTargets || new Map()
+              const client = store.getState().playwrightClients.get(clientId)
               for (const target of freshTargets.values()) {
-                // Skip restricted targets (extensions, chrome:// URLs, non-page types)
-                if (isRestrictedTarget(target.targetInfo)) {
+                // Skip restricted targets (extensions, chrome:// URLs, non-page types) and other sessions' tabs
+                if (isRestrictedTarget(target.targetInfo) || (client && !canClientSeeTarget({ client, target }))) {
                   continue
                 }
                 const attachedPayload = {
@@ -1277,12 +1847,13 @@ export async function startPlayWriterCDPRelayServer({
               }
             }
 
-            if (method === 'Target.setDiscoverTargets' && (params as Protocol.Target.SetDiscoverTargetsRequest)?.discover) {
+            if (method === 'Target.setDiscoverTargets' && params?.discover) {
               const freshExt2 = store.getState().extensions.get(extensionConn.id)
               const freshTargets2 = freshExt2?.connectedTargets || new Map()
+              const client = store.getState().playwrightClients.get(clientId)
               for (const target of freshTargets2.values()) {
-                // Skip restricted targets (extensions, chrome:// URLs, non-page types)
-                if (isRestrictedTarget(target.targetInfo)) {
+                // Skip restricted targets (extensions, chrome:// URLs, non-page types) and other sessions' tabs
+                if (isRestrictedTarget(target.targetInfo) || (client && !canClientSeeTarget({ client, target }))) {
                   continue
                 }
                 const targetCreatedPayload = {
@@ -1314,7 +1885,7 @@ export async function startPlayWriterCDPRelayServer({
 
             if (method === 'Target.attachToTarget') {
               const attachResponse = result as Protocol.Target.AttachToTargetResponse | undefined
-              const attachRequestParams = params as Protocol.Target.AttachToTargetRequest | undefined
+              const attachRequestParams = params
               if (attachResponse?.sessionId) {
                 const freshExt3 = store.getState().extensions.get(extensionConn.id)
                 const freshTargets3 = freshExt3?.connectedTargets || new Map()
@@ -1368,6 +1939,13 @@ export async function startPlayWriterCDPRelayServer({
         },
 
         onClose() {
+          releaseClientScreencasts(clientId)
+          releaseClientRecordings(clientId)
+          releaseClientRuntimes(clientId)
+          for (const [key, holders] of persistentFocus) {
+            holders.delete(clientId)
+            if (holders.size === 0) persistentFocus.delete(key)
+          }
           store.setState((s) => relayState.removePlaywrightClient(s, { clientId }))
           logger?.log(pc.yellow(`Playwright client disconnected: ${clientId} (${store.getState().playwrightClients.size} remaining)`))
         },
@@ -1394,6 +1972,16 @@ export async function startPlayWriterCDPRelayServer({
       installId: installId || undefined,
       version: version || undefined,
     }
+  }
+
+  const getExtensionCapabilitiesFromRequest = (c: {
+    req: { query: (name: string) => string | undefined }
+  }): string[] => {
+    return (c.req.query('capabilities') || '')
+      .split(',')
+      .filter((capability) => {
+        return Boolean(capability)
+      })
   }
 
   app.get(
@@ -1432,10 +2020,55 @@ export async function startPlayWriterCDPRelayServer({
     },
     upgradeWebSocket((c) => {
       const incomingExtensionInfo = getExtensionInfoFromRequest(c)
+      const incomingCapabilities = getExtensionCapabilitiesFromRequest(c)
       const connectionId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+      const handlers = createExtensionSocketHandlers({
+        connectionId,
+        initialInfo: incomingExtensionInfo,
+        initialCapabilities: incomingCapabilities,
+      })
       return {
         onOpen(_event, ws) {
-          const stableKey = relayState.buildStableExtensionKey(incomingExtensionInfo, connectionId)
+          handlers.onOpen(ws)
+        },
+        async onMessage(event, ws) {
+          await handlers.onMessage(event.data as string | ArrayBuffer | Buffer, ws)
+        },
+        onClose(event) {
+          handlers.onClose(event)
+        },
+        onError(event) {
+          logger?.error('Extension WebSocket error:', event)
+        },
+      }
+    }),
+  )
+
+  // Shared handlers for extension connections. Used by the inbound /extension
+  // WebSocket route and by outbound dials to remote-control tunnels: the relay
+  // dials wss://playwriter.dev/tunnel/{id}/extension and the extension answers with
+  // the exact same protocol — only the dial direction inverts.
+  type ExtensionSocketHandlers = {
+    onOpen(ws: relayState.ExtensionSocket): void
+    onMessage(data: string | ArrayBuffer | Buffer, ws: relayState.ExtensionSocket): Promise<void> | void
+    onClose(event: { code?: number; reason?: string }): void
+  }
+
+  function createExtensionSocketHandlers({
+    connectionId,
+    initialInfo,
+    initialCapabilities = [],
+    stableKeyOverride,
+  }: {
+    connectionId: string
+    initialInfo: relayState.ExtensionInfo
+    initialCapabilities?: string[]
+    /** Remote dials pass a hashed `remote:` key so sessions survive reconnects without storing the secret. */
+    stableKeyOverride?: string
+  }): ExtensionSocketHandlers {
+    return {
+        onOpen(ws) {
+          const stableKey = stableKeyOverride || relayState.buildStableExtensionKey(initialInfo, connectionId)
 
           // Check for existing connection with same stableKey and close it
           const existingExt = relayState.findExtensionByStableKey(store.getState(), stableKey)
@@ -1449,42 +2082,71 @@ export async function startPlayWriterCDPRelayServer({
           // State transition: add extension with ws handle included.
           // Existing same-stableKey entry stays until old socket onClose.
           store.setState((s) => {
-            return relayState.addExtension(s, { id: connectionId, info: incomingExtensionInfo, stableKey, ws })
+            return relayState.addExtension(s, {
+              id: connectionId,
+              info: initialInfo,
+              stableKey,
+              ws,
+              capabilities: initialCapabilities,
+            })
           })
 
           startExtensionPing(connectionId)
           logger?.log(`Extension connected (${connectionId})`)
+          trackEvent('extension_connected', {
+            browser: initialInfo.browser || 'unknown',
+            extension_version: initialInfo.version || 'unknown',
+          })
         },
 
-        async onMessage(event, ws) {
+        async onMessage(data, ws) {
           const ext = store.getState().extensions.get(connectionId)
           if (!ext) {
             ws.close(1000, 'Extension not registered')
             return
           }
-          // Handle binary data (capture chunks). Streams and recordings share
-          // the same WS messages; StreamRelay gets first pick and returns true
-          // when the chunk belongs to an active stream (tabId sets are disjoint
-          // because the extension refuses a second capture of the same tab).
-          if (event.data instanceof ArrayBuffer || Buffer.isBuffer(event.data)) {
-            const buffer = Buffer.isBuffer(event.data) ? event.data : Buffer.from(event.data)
-            const streamRelay = streamRelays.get(connectionId)
-            if (streamRelay?.handleBinaryData(buffer)) {
-              return
-            }
-            const relay = getRecordingRelay(connectionId)
-            if (relay) {
-              relay.handleBinaryData(buffer)
-            }
+          // Old extensions sent tab-capture chunks as binary frames. Recording now
+          // uses CDP screencast, so binary frames are ignored.
+          if (data instanceof ArrayBuffer || Buffer.isBuffer(data)) {
             return
           }
 
-          let message: ExtensionMessage
+          let message: ExtensionMessage | RemoteHelloMessage
 
           try {
-            message = JSON.parse(event.data.toString())
+            message = JSON.parse(data.toString())
           } catch {
             ws.close(1000, 'Invalid JSON')
+            return
+          }
+
+          // Identity sent by the extension on tunneled connections. On the inbound
+          // /extension route identity travels as query params instead, so the
+          // extension cannot control it when the relay dials out through traforo.
+          if (message.method === 'hello') {
+            const helloInfo = message.params || {}
+            store.setState((s) =>
+              relayState.updateExtensionInfo(s, {
+                extensionId: connectionId,
+                info: {
+                  browser: helloInfo.browser,
+                  email: helloInfo.email,
+                  id: helloInfo.id,
+                  installId: helloInfo.installId,
+                  version: helloInfo.version,
+                },
+              }),
+            )
+            logger?.log(
+              pc.green(
+                `Extension hello (${connectionId}): ${helloInfo.browser || 'unknown'} v${helloInfo.version || '?'}${helloInfo.remote ? ' (remote tunnel)' : ''}`,
+              ),
+            )
+            return
+          }
+
+          if (message.method === 'ready') {
+            store.setState((s) => relayState.markExtensionInventoryReady(s, { extensionId: connectionId }))
             return
           }
 
@@ -1531,30 +2193,14 @@ export async function startPlayWriterCDPRelayServer({
             const logFunc = logFn || logger?.log
             const prefix = pc.yellow(`[Extension] [${level.toUpperCase()}]`)
             logFunc?.(prefix, ...args)
-          } else if (message.method === 'recordingData') {
-            const streamRelay = streamRelays.get(connectionId)
-            if (!streamRelay?.handleRecordingData(message as RecordingDataMessage)) {
-              const relay = getRecordingRelay(connectionId)
-              if (relay) {
-                relay.handleRecordingData(message as RecordingDataMessage)
-              }
-            }
-          } else if (message.method === 'recordingCancelled') {
-            const streamRelay = streamRelays.get(connectionId)
-            if (!streamRelay?.handleRecordingCancelled(message as RecordingCancelledMessage)) {
-              const relay = getRecordingRelay(connectionId)
-              if (relay) {
-                relay.handleRecordingCancelled(message as RecordingCancelledMessage)
-              }
-            }
           } else {
-            const extensionEvent = message as ExtensionEventMessage
+            const extensionEvent = message
 
             if (extensionEvent.method !== 'forwardCDPEvent') {
               return
             }
 
-            const { method, params, sessionId } = extensionEvent.params
+            const { method, params, sessionId, ownerKey } = extensionEvent.params
 
             // Drop high-frequency noise events before logging or forwarding.
             // Old extensions may still send these; the relay filters them here.
@@ -1578,12 +2224,25 @@ export async function startPlayWriterCDPRelayServer({
             })
 
             const cdpEvent: CDPEventBase = { method, sessionId, params }
+            if (method === 'Inspector.workerScriptLoaded' && sessionId) {
+              store.setState((s) => {
+                const ext = s.extensions.get(connectionId)
+                const target = ext?.connectedTargets.get(sessionId)
+                if (!ext || !target) return s
+                const targets = new Map(ext.connectedTargets)
+                targets.set(sessionId, { ...target, workerScriptLoaded: true })
+                const extensions = new Map(s.extensions)
+                extensions.set(connectionId, { ...ext, connectedTargets: targets })
+                return { ...s, extensions }
+              })
+            }
+            trackRuntimeEvent({ extensionId: connectionId, event: cdpEvent })
             emitter.emit('cdp:event', { event: cdpEvent, sessionId })
 
             maybeEmitBrowserDownloadCompatEvent({ method, params, extensionId: connectionId })
 
             if (method === 'Target.attachedToTarget') {
-              const targetParams = params as Protocol.Target.AttachedToTargetEvent
+              const targetParams = params!
               const incomingSessionId = sessionId
               const iframeParentFrameId = targetParams.targetInfo.parentFrameId
               // Read current extension state for iframe parent lookup
@@ -1592,6 +2251,37 @@ export async function startPlayWriterCDPRelayServer({
                 targetParams.targetInfo.type === 'iframe' && iframeParentFrameId && currentExtState
                   ? getPageTargetForFrameId({ extensionState: currentExtState, frameId: iframeParentFrameId })?.sessionId
                   : undefined
+
+              // Workers inherit their parent's ownership and replay only under that parent, never as roots.
+              // Patchright attaches them without Runtime.enable (globalThis objectId trick).
+              if (targetParams.targetInfo.type === 'worker' && incomingSessionId) {
+                store.setState((s) => relayState.addTarget(s, {
+                  extensionId: connectionId,
+                  sessionId: targetParams.sessionId,
+                  targetId: targetParams.targetInfo.targetId,
+                  targetInfo: targetParams.targetInfo,
+                  ownerKey: currentExtState?.connectedTargets.get(incomingSessionId)?.ownerKey,
+                  parentSessionId: incomingSessionId,
+                }))
+                sendToPlaywright({
+                  message: { sessionId: incomingSessionId, method, params: targetParams } as CDPEventBase,
+                  source: 'extension',
+                  extensionId: connectionId,
+                })
+                // A connected client resumes the worker after attaching. Without clients, nobody would.
+                const hasClients = Array.from(store.getState().playwrightClients.values()).some((client) => {
+                  const parent = currentExtState?.connectedTargets.get(incomingSessionId)
+                  return client.extensionId === connectionId && parent !== undefined && canClientSeeTarget({ client, target: parent })
+                })
+                if (targetParams.waitingForDebugger && !hasClients) {
+                  void sendToExtension({
+                    extensionId: connectionId,
+                    method: 'forwardCDPCommand',
+                    params: { sessionId: targetParams.sessionId, method: 'Runtime.runIfWaitingForDebugger', params: {}, source: 'server' },
+                  }).catch(() => {})
+                }
+                return
+              }
 
               // Filter out restricted targets (unsupported types, extension pages, chrome:// URLs, etc.)
               if (isRestrictedTarget(targetParams.targetInfo)) {
@@ -1632,6 +2322,13 @@ export async function startPlayWriterCDPRelayServer({
               // Check if we already sent this target to clients (e.g., from Target.setAutoAttach response)
               const alreadyConnected = currentExtState?.connectedTargets.has(targetParams.sessionId) ?? false
 
+              // Tabs carry their creator's key from the extension. Iframes belong to their parent tab.
+              const parentSessionId = iframeOwnerSessionId ?? incomingSessionId
+              const targetOwnerKey =
+                targetParams.targetInfo.type === 'iframe' && parentSessionId
+                  ? currentExtState?.connectedTargets.get(parentSessionId)?.ownerKey
+                  : ownerKey
+
               // State transition: add/update target
               store.setState((s) =>
                 relayState.addTarget(s, {
@@ -1639,6 +2336,7 @@ export async function startPlayWriterCDPRelayServer({
                   sessionId: targetParams.sessionId,
                   targetId: targetParams.targetInfo.targetId,
                   targetInfo: targetParams.targetInfo,
+                  ownerKey: targetOwnerKey,
                 }),
               )
 
@@ -1670,24 +2368,25 @@ export async function startPlayWriterCDPRelayServer({
                 })
               }
             } else if (method === 'Target.detachedFromTarget') {
-              const detachParams = params as Protocol.Target.DetachedFromTargetEvent
-              store.setState((s) =>
-                relayState.removeTarget(s, { extensionId: connectionId, sessionId: detachParams.sessionId }),
-              )
-
+              const detachParams = params!
+              screencasts.delete(`${connectionId}\0${detachParams.sessionId}`)
+              focusedTabs.delete(`${connectionId}\0${detachParams.sessionId}`)
+              nativeRecordings.delete(`${connectionId}\0${detachParams.sessionId}`)
+              humanInput.forget({ extensionId: connectionId, sessionId: detachParams.sessionId })
               sendToPlaywright({
                 message: {
+                  sessionId,
                   method: 'Target.detachedFromTarget',
                   params: detachParams,
                 } as CDPEventBase,
                 source: 'extension',
                 extensionId: connectionId,
               })
-            } else if (method === 'Target.targetCrashed') {
-              const crashParams = params as Protocol.Target.TargetCrashedEvent
               store.setState((s) =>
-                relayState.removeTargetByCrash(s, { extensionId: connectionId, targetId: crashParams.targetId }),
+                relayState.removeTarget(s, { extensionId: connectionId, sessionId: detachParams.sessionId }),
               )
+            } else if (method === 'Target.targetCrashed') {
+              const crashParams = params!
               logger?.log(pc.red('[Server] Target crashed, removing:'), crashParams.targetId)
 
               sendToPlaywright({
@@ -1698,8 +2397,11 @@ export async function startPlayWriterCDPRelayServer({
                 source: 'extension',
                 extensionId: connectionId,
               })
+              store.setState((s) =>
+                relayState.removeTargetByCrash(s, { extensionId: connectionId, targetId: crashParams.targetId }),
+              )
             } else if (method === 'Target.targetInfoChanged') {
-              const infoParams = params as Protocol.Target.TargetInfoChangedEvent
+              const infoParams = params!
               store.setState((s) =>
                 relayState.updateTargetInfo(s, { extensionId: connectionId, targetInfo: infoParams.targetInfo }),
               )
@@ -1713,7 +2415,7 @@ export async function startPlayWriterCDPRelayServer({
                 extensionId: connectionId,
               })
             } else if (method === 'Page.frameAttached') {
-              const frameParams = params as Protocol.Page.FrameAttachedEvent
+              const frameParams = params!
               if (sessionId) {
                 store.setState((s) =>
                   relayState.addFrameId(s, { extensionId: connectionId, sessionId, frameId: frameParams.frameId }),
@@ -1730,7 +2432,7 @@ export async function startPlayWriterCDPRelayServer({
                 extensionId: connectionId,
               })
             } else if (method === 'Page.frameDetached') {
-              const frameParams = params as Protocol.Page.FrameDetachedEvent
+              const frameParams = params!
               store.setState((s) =>
                 relayState.removeFrameId(s, { extensionId: connectionId, frameId: frameParams.frameId }),
               )
@@ -1745,7 +2447,7 @@ export async function startPlayWriterCDPRelayServer({
                 extensionId: connectionId,
               })
             } else if (method === 'Page.frameNavigated') {
-              const frameParams = params as Protocol.Page.FrameNavigatedEvent
+              const frameParams = params!
               if (sessionId) {
                 store.setState((s) =>
                   relayState.addFrameId(s, { extensionId: connectionId, sessionId, frameId: frameParams.frame.id }),
@@ -1775,9 +2477,16 @@ export async function startPlayWriterCDPRelayServer({
                 source: 'extension',
                 extensionId: connectionId,
               })
+              if (!frameParams.frame.parentId && sessionId) {
+                sendTargetInfoChanged({ extensionId: connectionId, sessionId })
+              }
             } else if (method === 'Page.navigatedWithinDocument') {
-              const navParams = params as Protocol.Page.NavigatedWithinDocumentEvent
-              if (sessionId) {
+              const navParams = params!
+              // A page's main frame id is its targetId. Iframe hash changes must not overwrite the tab URL.
+              const isMainFrame =
+                !!sessionId &&
+                navParams.frameId === store.getState().extensions.get(connectionId)?.connectedTargets.get(sessionId)?.targetId
+              if (sessionId && isMainFrame) {
                 store.setState((s) =>
                   relayState.updateTargetUrl(s, { extensionId: connectionId, sessionId, url: navParams.url }),
                 )
@@ -1796,6 +2505,9 @@ export async function startPlayWriterCDPRelayServer({
                 source: 'extension',
                 extensionId: connectionId,
               })
+              if (sessionId && isMainFrame) {
+                sendTargetInfoChanged({ extensionId: connectionId, sessionId })
+              }
             } else {
               sendToPlaywright({
                 message: {
@@ -1812,22 +2524,6 @@ export async function startPlayWriterCDPRelayServer({
 
         onClose(event) {
           logger?.log(`Extension disconnected: code=${event.code} reason=${event.reason || 'none'} (${connectionId})`)
-
-          // Cancel recordings BEFORE removing extension state (cancelRecording checks isExtensionConnected)
-          const recordingRelay = recordingRelays.get(connectionId)
-          if (recordingRelay) {
-            recordingRelay.cancelRecording({}).catch(() => {
-              // Ignore errors during cleanup
-            })
-          }
-          recordingRelays.delete(connectionId)
-
-          // Kill any active ffmpeg streams for this extension connection
-          const streamRelay = streamRelays.get(connectionId)
-          if (streamRelay) {
-            streamRelay.destroyAll('Extension disconnected')
-          }
-          streamRelays.delete(connectionId)
 
           // Reject all pending I/O requests (state cleanup happens in removeExtension below)
           const closingExt = store.getState().extensions.get(connectionId)
@@ -1850,6 +2546,25 @@ export async function startPlayWriterCDPRelayServer({
           const successorExtension = closingExtension
             ? successorCandidates[0]
             : undefined
+
+          forgetExtensionRuntimes(connectionId)
+          humanInput.forget({ extensionId: connectionId })
+
+          // Chrome-side screencasts end with this connection's debugger sessions
+          Array.from(screencasts.entries())
+            .filter(([, entry]) => {
+              return entry.extensionId === connectionId
+            })
+            .forEach(([key]) => {
+              screencasts.delete(key)
+            })
+          Array.from(nativeRecordings.entries())
+            .filter(([, entry]) => {
+              return entry.extensionId === connectionId
+            })
+            .forEach(([key]) => {
+              nativeRecordings.delete(key)
+            })
 
           if (successorExtension) {
             logger?.log(
@@ -1878,23 +2593,246 @@ export async function startPlayWriterCDPRelayServer({
           // State transition: remove extension + its bound clients atomically
           store.setState((s) => relayState.removeExtension(s, { extensionId: connectionId }))
         },
+    }
+  }
 
-        onError(event) {
-          logger?.error('Extension WebSocket error:', event)
-        },
+  // ============================================================================
+  // Remote control dials — outbound extension connections through traforo.
+  //
+  // The user's extension exposes its /extension protocol behind a unique tunnel
+  // URL (icon menu Share browser…). The relay dials that URL and registers
+  // the socket as a normal extension connection. Sessions reference it via
+  // Hashed `remote:` stable keys let sessions survive tunnel reconnects (extension
+  // service worker restarts, network blips). See remote-control.ts.
+  // ============================================================================
+
+  type RemoteDial = {
+    urlKey: string
+    wsUrl: string
+    stableKey: string
+    ws: NodeWebSocket | null
+    closed: boolean
+    retryTimer: ReturnType<typeof setTimeout> | null
+    sessionIds: Set<string>
+    /** Consecutive dials that closed before any message. Drives the backoff. */
+    failedAttempts: number
+    /** When the current streak of failed dials started. */
+    offlineSince: number | null
+  }
+  const remoteDials = new Map<string, RemoteDial>()
+  const sessionRemoteUrlKeys = new Map<string, string>()
+
+  // A dial with no socket and no retry timer gave up. Every failed dial wakes
+  // the tunnel's Durable Object, so offline ids back off and then stop.
+  function startRemoteDial(dial: RemoteDial): void {
+    if (dial.closed) {
+      return
+    }
+    const connectionId = `remote_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+    const handlers = createExtensionSocketHandlers({
+      connectionId,
+      initialInfo: { browser: 'Remote browser' },
+      stableKeyOverride: dial.stableKey,
+    })
+    logger?.log(pc.blue('Dialing remote extension'))
+    const socket = new NodeWebSocket(dial.wsUrl)
+    dial.ws = socket
+    const adapter: relayState.ExtensionSocket = {
+      send(payload) {
+        socket.send(payload)
+      },
+      close(code, reason) {
+        socket.close(code ?? 1000, reason)
+      },
+      ping() {
+        if (socket.readyState === NodeWebSocket.OPEN) {
+          socket.ping()
+        }
+      },
+    }
+    let opened = false
+    // `open` fires even for 4008 (HTTP 101, then close), so only a message proves the tunnel works.
+    let receivedMessage = false
+
+    socket.on('open', () => {
+      opened = true
+      handlers.onOpen(adapter)
+    })
+    socket.on('message', (raw, isBinary) => {
+      if (!receivedMessage) {
+        receivedMessage = true
+        dial.failedAttempts = 0
+        dial.offlineSince = null
       }
-    }),
-  )
+      const payload = isBinary ? (raw as Buffer) : raw.toString()
+      void handlers.onMessage(payload, adapter)
+    })
+    socket.on('error', () => {
+      logger?.error('Remote extension dial error')
+    })
+    socket.on('close', (code, reason) => {
+      dial.ws = null
+      if (opened) {
+        handlers.onClose({ code, reason: reason.toString() })
+      }
+      if (dial.closed) {
+        return
+      }
+      if (!receivedMessage) {
+        dial.failedAttempts++
+        dial.offlineSince ??= Date.now()
+      }
+      if (dial.offlineSince !== null && Date.now() - dial.offlineSince >= REMOTE_DIAL_GIVE_UP_MS) {
+        logger?.log(pc.yellow(`Remote extension unreachable since ${new Date(dial.offlineSince).toISOString()}, stopped dialing until a session uses it`))
+        return
+      }
+      const retryMs = getRemoteDialRetryMs({ closeCode: code, failedAttempts: dial.failedAttempts })
+      logger?.log(pc.yellow(`Remote extension dial closed (code=${code}), retrying in ${retryMs}ms`))
+      dial.retryTimer = setTimeout(() => {
+        dial.retryTimer = null
+        startRemoteDial(dial)
+      }, retryMs)
+    })
+  }
+
+  async function connectRemoteExtension({ url, sessionId }: { url: string; sessionId: string }): Promise<relayState.ExtensionEntry> {
+    const { wsUrl } = parseRemoteControlUrl(url)
+    // Key by the dialed wsUrl: it is unique per tunnel id in every accepted input
+    // form, so two shared browsers on one host never collapse into one dial.
+    const urlKey = wsUrl
+    const stableKey = `remote:${crypto.createHash('sha256').update(urlKey).digest('hex')}`
+
+    let dial = remoteDials.get(urlKey)
+    if (dial) {
+      wakeRemoteDial(dial)
+    } else {
+      dial = {
+        urlKey,
+        wsUrl,
+        stableKey,
+        ws: null,
+        closed: false,
+        retryTimer: null,
+        sessionIds: new Set(),
+        failedAttempts: 0,
+        offlineSince: null,
+      }
+      remoteDials.set(urlKey, dial)
+      startRemoteDial(dial)
+    }
+    // Own the dial while waiting, so an overlapping failed request cannot close it.
+    dial.sessionIds.add(sessionId)
+    sessionRemoteUrlKeys.set(sessionId, urlKey)
+
+    // Wait for the tunnel roundtrip: dial → traforo → extension hello + Target.attachedToTarget.
+    const deadline = Date.now() + 15000
+    while (Date.now() < deadline) {
+      const entry = relayState.findExtensionByStableKey(store.getState(), stableKey)
+      if (entry?.ws && entry.connectedTargets.size > 0) {
+        return entry
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+    // A failed `session new` must not leave the dial redialing forever.
+    releaseRemoteDialForSession(sessionId)
+    const entry = relayState.findExtensionByStableKey(store.getState(), stableKey)
+    if (entry?.ws) {
+      // Connected but no tab announced yet — surface a clear error.
+      throw new Error(
+        'Connected to the remote browser but no tab was announced. The user may have revoked remote control. Ask them to click the Remote control button again and share a fresh id.',
+      )
+    }
+    throw new Error(
+      'Could not reach the remote browser. Check that the Remote control button is still active and that the id is correct. Sharing dies when the user clicks Stop sharing or closes the browser.',
+    )
+  }
+
+  function releaseRemoteDialForSession(sessionId: string): void {
+    const urlKey = sessionRemoteUrlKeys.get(sessionId)
+    if (!urlKey) {
+      return
+    }
+    sessionRemoteUrlKeys.delete(sessionId)
+    const dial = remoteDials.get(urlKey)
+    if (!dial) {
+      return
+    }
+    dial.sessionIds.delete(sessionId)
+    if (dial.sessionIds.size > 0) {
+      return
+    }
+    logger?.log(pc.yellow('Closing remote extension dial because no sessions remain'))
+    closeRemoteDial(dial, 'No sessions left')
+  }
+
+  /** Using a session dials now, with a fresh backoff, even if the dial gave up. */
+  function wakeRemoteDialForSession(sessionId: string): void {
+    const urlKey = sessionRemoteUrlKeys.get(sessionId)
+    const dial = urlKey ? remoteDials.get(urlKey) : undefined
+    if (dial) {
+      wakeRemoteDial(dial)
+    }
+  }
+
+  function wakeRemoteDial(dial: RemoteDial): void {
+    if (dial.closed || dial.ws) {
+      return
+    }
+    if (dial.retryTimer) {
+      clearTimeout(dial.retryTimer)
+      dial.retryTimer = null
+    }
+    dial.failedAttempts = 0
+    dial.offlineSince = null
+    startRemoteDial(dial)
+  }
+
+  function closeRemoteDial(dial: RemoteDial, reason: string): void {
+    dial.closed = true
+    if (dial.retryTimer) {
+      clearTimeout(dial.retryTimer)
+      dial.retryTimer = null
+    }
+    dial.ws?.close(1000, reason)
+    if (remoteDials.get(dial.urlKey) === dial) {
+      remoteDials.delete(dial.urlKey)
+    }
+  }
+
+  function closeAllRemoteDials(): void {
+    for (const dial of [...remoteDials.values()]) {
+      closeRemoteDial(dial, 'Relay shutting down')
+    }
+    sessionRemoteUrlKeys.clear()
+  }
 
   // ============================================================================
   // CLI Execute Endpoints - For stateful code execution via CLI
   // ============================================================================
 
-  // Session counter for suggesting next session number
-  let nextSessionNumber = 1
+  // Sessions live in memory and end with the relay. Only the id counter is saved, so ids are never
+  // reused: an agent holding a stale `-s N` gets "not found" instead of running in another agent's session.
+  let nextSessionNumber = readSessionCounter(sessionCounterFile)
+
+  function allocateSessionId(): string {
+    const sessionId = String(nextSessionNumber++)
+    writeSessionCounter({ filePath: sessionCounterFile, next: nextSessionNumber, logger })
+    return sessionId
+  }
+
+  function sessionNotFoundMessage(sessionId: string): string {
+    if (Number(sessionId) < nextSessionNumber) {
+      return `Session ${sessionId} ended or was lost when the relay restarted. Run 'playwriter session new' to get a new one.`
+    }
+    return `Session ${sessionId} not found. Run 'playwriter session new' first.`
+  }
+
+  /** Tab ownership key the extension stores as groupKey. Includes the relay start, so it never matches tabs of an older relay. */
+  const ownershipKey = (sessionId: string) => `${relayInstanceId}:${sessionId}`
+
 
   // Lazy-load ExecutorManager to avoid circular imports and only when needed
-  let executorManager: import('./executor.js').ExecutorManager | null = null
+  let executorManager: ExecutorManager | null = null
 
   const getExecutorManager = async () => {
     if (!executorManager) {
@@ -1909,7 +2847,7 @@ export async function startPlayWriterCDPRelayServer({
   }
 
   // ============================================================================
-  // Security middleware for privileged HTTP routes (/cli/*, /recording/*, /mcp-log)
+  // Security middleware for privileged HTTP routes (/cli/*, /recorder/*, /mcp-log)
   //
   // CORS alone does NOT prevent cross-origin POST attacks. Browsers skip the
   // preflight for "simple" requests (POST + Content-Type: text/plain), so a
@@ -1935,8 +2873,13 @@ export async function startPlayWriterCDPRelayServer({
     // Block cross-origin browser requests via Sec-Fetch-Site header.
     // Browsers always set this forbidden header; it cannot be spoofed.
     // Non-browser clients (Node.js, curl, MCP) don't send it.
+    // Exception: /recorder/start and /recorder/stop. The toolbar service worker
+    // fetch is chrome-extension:// → 127.0.0.1, so Sec-Fetch-Site is cross-site.
+    // Websites still cannot call these: CORS only allows our extension origin,
+    // so a page preflight fails and the POST is never sent.
     const secFetchSite = c.req.header('sec-fetch-site')
-    if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
+    const isRecorderToggle = c.req.path === '/recorder/start' || c.req.path === '/recorder/stop'
+    if (!isRecorderToggle && secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
       logger?.log(pc.red(`Rejecting ${c.req.path}: cross-origin browser request (Sec-Fetch-Site: ${secFetchSite})`))
       return c.text('Forbidden - Cross-origin requests not allowed', 403)
     }
@@ -1959,30 +2902,128 @@ export async function startPlayWriterCDPRelayServer({
     // from 127.0.0.1 and would skip auth. In-process callers must instead
     // attach the token themselves — they read PLAYWRITER_TOKEN from env, which
     // the `serve` command sets at startup.
-    if (token) {
-      const authHeader = c.req.header('authorization') || ''
-      const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
-      const url = new URL(c.req.url, 'http://localhost')
-      const queryToken = url.searchParams.get('token')
-      if (bearerToken !== token && queryToken !== token) {
-        logger?.log(pc.red(`Rejecting ${c.req.path}: invalid or missing token`))
-        return c.text('Unauthorized', 401)
-      }
+    if (token && !hasValidToken(c)) {
+      logger?.log(pc.red(`Rejecting ${c.req.path}: invalid or missing token`))
+      return c.text('Unauthorized', 401)
     }
 
     return next()
   }
 
   app.use('/cli/*', privilegedRouteMiddleware)
-  app.use('/recording/*', privilegedRouteMiddleware)
-  app.use('/stream/*', privilegedRouteMiddleware)
+  app.use('/recorder/*', privilegedRouteMiddleware)
   app.use('/mcp-log', privilegedRouteMiddleware)
 
+  // Track only sessions that were actually created. Hono caches the parsed
+  // body, so the route handler below can read c.req.json() again.
+  app.use('/cli/session/new', async (c, next) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      client?: string
+      headless?: boolean
+      cloud?: object
+      cdpEndpoint?: string
+      remoteControlUrl?: string
+    }
+    await next()
+    if (!c.res.ok) {
+      return
+    }
+    const kind: SessionKind = (() => {
+      if (body.headless) return 'headless'
+      if (body.cloud) return 'cloud'
+      if (body.cdpEndpoint) return 'cdp'
+      if (body.remoteControlUrl) return 'remote'
+      return 'extension'
+    })()
+    // Only the SDK's createRelaySession() sends client; every CLI path omits it.
+    trackEvent('session_created', { client: body.client === 'sdk' ? 'sdk' : 'cli', kind })
+  })
+
+  app.post('/mcp-log', async (c) => {
+    try {
+      const body = await c.req.json()
+      const level = typeof body?.level === 'string' ? body.level : 'log'
+      const args = Array.isArray(body?.args) ? body.args : []
+      const logFn = level === 'error' ? logger?.error : logger?.log
+      const prefix = pc.red(`[MCP] [${level.toUpperCase()}]`)
+      logFn?.(prefix, ...args)
+      return c.json({ ok: true })
+    } catch {
+      return c.json({ ok: false }, 400)
+    }
+  })
+
   const DEFAULT_EXEC_TIMEOUT = Number(process.env.PLAYWRITER_EXEC_TIMEOUT) || 10000
+  const DEFAULT_DRAIN_TIMEOUT_MS = 30_000
+  const MAX_DRAIN_TIMEOUT_MS = 120_000
+
+  // A newer CLI drains the relay before replacing it, so upgrades do not kill other agents' running scripts.
+  let activeExecutes = 0
+  let draining: Promise<void> | null = null
+  let onExecutesIdle: (() => void) | null = null
+
+  function finishExecute(): void {
+    activeExecutes--
+    if (activeExecutes === 0) {
+      onExecutesIdle?.()
+    }
+  }
+
+  async function drain(timeoutMs: number): Promise<void> {
+    if (activeExecutes > 0) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, timeoutMs)
+        onExecutesIdle = () => {
+          clearTimeout(timer)
+          resolve()
+        }
+      })
+    }
+    if (activeExecutes > 0) {
+      logger?.log(pc.yellow(`[Drain] ${activeExecutes} execute(s) still running after ${timeoutMs}ms, stopping anyway`))
+    }
+    logger?.log('[Drain] Relay drained, stopping')
+    if (onDrained) {
+      onDrained()
+    } else {
+      relayServer.close()
+    }
+  }
+
+  app.post('/cli/drain', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { instanceId?: string; timeoutMs?: number }
+    if (body.instanceId && body.instanceId !== relayInstanceId) {
+      return c.json({ error: 'Relay instance changed' }, 409)
+    }
+    if (!draining) {
+      const timeoutMs = Math.min(Math.max(Number(body.timeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS) || 0, 0), MAX_DRAIN_TIMEOUT_MS)
+      logger?.log(pc.yellow(`[Drain] Refusing new executes, waiting up to ${timeoutMs}ms for ${activeExecutes} running`))
+      draining = drain(timeoutMs)
+    }
+    // 202: the relay stops after the drain. Clients wait for the port to be released.
+    // Connection: close so the client does not reuse this socket to probe a relay that is exiting.
+    c.header('Connection', 'close')
+    return c.json({ activeExecutes }, 202)
+  })
 
   app.post('/cli/execute', async (c) => {
+    if (draining) {
+      return c.json(
+        {
+          text: "The Playwriter relay is restarting to upgrade, and its sessions end. In a few seconds run 'playwriter session new' and try again. Tabs stay open.",
+          images: [],
+          screenshots: [],
+          isError: true,
+        },
+        503,
+      )
+    }
+    // Counted until the response is written, so a drain never exits before the caller has its result.
+    activeExecutes++
+    const outgoing = (c.env as Partial<HttpBindings> | undefined)?.outgoing
+    outgoing?.once('close', finishExecute)
     try {
-      const body = (await c.req.json()) as { sessionId: string | number; code: string; timeout?: number }
+      const body: { sessionId: string | number; code: string; timeout?: number } = await c.req.json()
       const sessionId = normalizeSessionId(body.sessionId)
       const { code, timeout = DEFAULT_EXEC_TIMEOUT } = body
 
@@ -1993,11 +3034,10 @@ export async function startPlayWriterCDPRelayServer({
       const manager = await getExecutorManager()
       const existingExecutor = manager.getSession(sessionId)
       if (!existingExecutor) {
-        return c.json(
-          { text: `Session ${sessionId} not found. Run 'playwriter session new' first.`, images: [], screenshots: [], isError: true },
-          404,
-        )
+        return c.json({ text: sessionNotFoundMessage(sessionId), images: [], screenshots: [], isError: true }, 404)
       }
+      recordExecute()
+      wakeRemoteDialForSession(sessionId)
       // Touch cloud session activity tracking if this session is cloud-backed
       const cloudTracking = cloudSessionTracking.get(sessionId)
       if (cloudTracking) {
@@ -2006,9 +3046,12 @@ export async function startPlayWriterCDPRelayServer({
       }
 
       let result: Awaited<ReturnType<typeof existingExecutor.execute>>
+      startSessionExecute(sessionId)
       try {
-        result = await existingExecutor.execute(code, timeout)
+        // Aborted when the CLI caller disconnects (Ctrl-C, agent bash timeout), so the session lock is released.
+        result = await existingExecutor.execute(code, { timeout, signal: c.req.raw.signal })
       } finally {
+        endSessionExecute(sessionId)
         if (cloudTracking) {
           cloudTracking.activeExecutions--
           cloudTracking.lastActivityAt = Date.now()
@@ -2022,12 +3065,16 @@ export async function startPlayWriterCDPRelayServer({
     } catch (error: any) {
       logger?.error('Execute endpoint error:', error)
       return c.json({ text: `Server error: ${error.message}`, images: [], screenshots: [], isError: true }, 500)
+    } finally {
+      if (!outgoing) {
+        finishExecute()
+      }
     }
   })
 
   app.post('/cli/reset', async (c) => {
     try {
-      const body = (await c.req.json()) as { sessionId: string | number }
+      const body: { sessionId: string | number } = await c.req.json()
       const sessionId = normalizeSessionId(body.sessionId)
 
       if (!sessionId) {
@@ -2037,13 +3084,13 @@ export async function startPlayWriterCDPRelayServer({
       const manager = await getExecutorManager()
       const existingExecutor = manager.getSession(sessionId)
       if (!existingExecutor) {
-        return c.json({ error: `Session ${sessionId} not found. Run 'playwriter session new' first.` }, 404)
+        return c.json({ error: sessionNotFoundMessage(sessionId) }, 404)
       }
-      const { page, context } = await existingExecutor.reset()
+      wakeRemoteDialForSession(sessionId)
+      const { context } = await existingExecutor.reset()
 
       return c.json({
         success: true,
-        pageUrl: page.url(),
         pagesCount: context.pages().length,
       })
     } catch (error: any) {
@@ -2063,16 +3110,28 @@ export async function startPlayWriterCDPRelayServer({
 
   app.post('/cli/session/new', async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as {
+      /** 'sdk' from createRelaySession(): scripts share tabs between processes, so their tabs stay visible */
+      client?: string
       extensionId?: string | null
       cwd?: string
       /** Direct CDP WebSocket URL — bypasses extension, connects straight to Chrome */
       cdpEndpoint?: string
+      /** Remote-control tunnel id (or leftover URL) shared by another user's extension */
+      remoteControlUrl?: string
       /** Launch a headless Chrome via chromium.launch() — no extension or relay CDP routing */
       headless?: boolean
       /** Browser name from discovery (e.g. "Chrome", "Brave") */
       browser?: string
       /** Profile info from discovery */
       profiles?: Array<{ name: string; email: string }>
+      /** Tab group title for extension or remote-control sessions */
+      tabGroup?: string
+      /** Explicit tab group color for extension or remote-control sessions */
+      tabGroupColor?: string
+      /** Connect with Patchright and humanize input on every page (extension or remote-control sessions) */
+      patchright?: boolean
+      /** Cloud API credentials for local-to-cloud execution helpers */
+      cloudAuth?: CloudAuth
       /** Cloud session tracking metadata (set by CLI when connecting to a cloud browser) */
       cloud?: {
         cloudSessionId: string
@@ -2084,8 +3143,19 @@ export async function startPlayWriterCDPRelayServer({
         blockProxyResources?: boolean
       }
     }
-    const sessionId = String(nextSessionNumber++)
-    const cwd = body.cwd
+    const patchright = body.patchright === true
+    const sessionId = allocateSessionId()
+    if (body.client === 'sdk') {
+      sharedTabSessionIds.add(sessionId)
+    }
+    // Resolve cwd with cross-OS awareness: if CLI runs on Windows and relay on
+    // Linux (WSL), translate the Windows path to /mnt/<drive>/... so the sandbox
+    // can actually reach it. See issue #107.
+    const { resolveSessionCwd } = await import('./executor.js')
+    const { cwd, warning: cwdWarning } = resolveSessionCwd(body.cwd)
+    if (cwdWarning) {
+      logger?.log(`[session ${sessionId}] ${cwdWarning}`)
+    }
 
     // Headless mode: launch Chrome via chromium.launch(), no extension needed.
     // Force connection immediately so missing Chrome errors surface at creation time,
@@ -2094,18 +3164,20 @@ export async function startPlayWriterCDPRelayServer({
       const manager = await getExecutorManager()
       const executor = manager.getExecutor({
         sessionId,
-        cwd,
+        cwd: cwd || undefined,
         cdpConfig: { headless: true },
         sessionMetadata: {
           extensionId: null,
           browser: 'Chrome (Headless)',
           profile: null,
         },
+        enableCloudScope: true,
+        cloudAuth: body.cloudAuth,
       })
       try {
         await executor.reset()
       } catch (error) {
-        manager.deleteExecutor(sessionId)
+        await manager.deleteExecutor(sessionId)
         return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
       }
       const metadata = executor.getSessionMetadata()
@@ -2115,6 +3187,7 @@ export async function startPlayWriterCDPRelayServer({
         extensionId: metadata.extensionId,
         browser: metadata.browser,
         profile: metadata.profile,
+        warning: cwdWarning,
       })
     }
 
@@ -2131,7 +3204,7 @@ export async function startPlayWriterCDPRelayServer({
       const manager = await getExecutorManager()
       const executor = manager.getExecutor({
         sessionId,
-        cwd,
+        cwd: cwd || undefined,
         cdpConfig: { directCdpUrl: appendSessionToWsUrl(body.cdpEndpoint, sessionId) },
         sessionMetadata: {
           extensionId: null,
@@ -2139,6 +3212,8 @@ export async function startPlayWriterCDPRelayServer({
           profile: firstProfile ? { email: firstProfile.email, id: firstProfile.name } : null,
         },
         cloudSession: body.cloud ? { timeoutAt: cloudTimeoutAt, blockProxyResources: body.cloud.blockProxyResources } : undefined,
+        enableCloudScope: !body.cloud,
+        cloudAuth: body.cloudAuth,
       })
       const metadata = executor.getSessionMetadata()
 
@@ -2161,37 +3236,240 @@ export async function startPlayWriterCDPRelayServer({
         extensionId: metadata.extensionId,
         browser: metadata.browser,
         profile: metadata.profile,
+        warning: cwdWarning,
+      })
+    }
+
+    // Remote control mode: dial the tunnel for an id shared by another user's extension
+    // and bind the session to that remote extension connection.
+    if (body.remoteControlUrl) {
+      const tabGroup = body.tabGroup !== undefined ? normalizeTabGroupTitle(body.tabGroup) : REMOTE_TAB_GROUP_TITLE
+      if (!tabGroup) {
+        return c.json({ error: 'tabGroup must be a non-empty string' }, 400)
+      }
+      const tabGroupColor = body.tabGroupColor !== undefined ? normalizeTabGroupColor(body.tabGroupColor) : null
+      if (body.tabGroupColor !== undefined && !tabGroupColor) {
+        return c.json({ error: 'tabGroupColor must be one of: grey, blue, red, yellow, green, pink, purple, cyan, orange' }, 400)
+      }
+      let remoteEntry: relayState.ExtensionEntry
+      try {
+        remoteEntry = await connectRemoteExtension({ url: body.remoteControlUrl, sessionId })
+      } catch (error) {
+        return c.json({ error: error instanceof Error ? error.message : String(error) }, 502)
+      }
+
+      const manager = await getExecutorManager()
+      const executor = manager.getExecutor({
+        sessionId,
+        cwd: cwd || undefined,
+        tabGroup,
+        tabGroupColor: tabGroupColor || undefined,
+        patchright,
+        sessionMetadata: {
+          extensionId: remoteEntry.stableKey,
+          browser: remoteEntry.info.browser || 'Remote browser',
+          profile: remoteEntry.info.email ? { email: remoteEntry.info.email, id: remoteEntry.info.id || '' } : null,
+        },
+      })
+      const metadata = executor.getSessionMetadata()
+      const tabGroupWarning: string | undefined = await (async () => {
+        try {
+          const result = (await sendToExtension({
+            extensionId: remoteEntry.stableKey,
+            method: 'updateTabGroup',
+            params: {
+              from: DEFAULT_TAB_GROUP_TITLE,
+              to: tabGroup,
+              key: ownershipKey(sessionId),
+              color: tabGroupColor || undefined,
+            },
+            timeout: 10000,
+          })) as UpdateTabGroupResult | undefined
+          if (result?.success !== true) {
+            return 'The remote Playwriter extension is too old to update the remote tab group.'
+          }
+          return undefined
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          return `The remote extension could not update the remote tab group: ${message}`
+        }
+      })()
+      const warning = [cwdWarning, tabGroupWarning].filter(Boolean).join(' ') || undefined
+      return c.json({
+        id: sessionId,
+        mode: 'remote' as const,
+        extensionId: metadata.extensionId,
+        browser: metadata.browser,
+        profile: metadata.profile,
+        warning,
+        tabGroup,
+        tabGroupColor,
+        patchright,
       })
     }
 
     // Extension mode (existing behavior)
     const extensionId = body.extensionId || null
-    const allowDefault = !extensionId && store.getState().extensions.size === 1
+    const allowDefault = !extensionId && relayState.getLocalExtensions(store.getState()).length === 1
     const conn = getExtensionConnection(extensionId, { allowFallback: allowDefault })
     if (!conn) {
       const error = extensionId
         ? `Extension not connected: ${extensionId}`
         : 'Multiple extensions connected. Specify extensionId.'
-      return c.json({ error }, 404)
+      return c.json(
+        extensionId ? { code: 'extension_connection_lost', error } : { error },
+        404,
+      )
+    }
+    const tabGroup = body.tabGroup !== undefined ? normalizeTabGroupTitle(body.tabGroup) : null
+    if (body.tabGroup !== undefined && !tabGroup) {
+      return c.json({ error: 'tabGroup must be a non-empty string' }, 400)
+    }
+    const tabGroupColor = body.tabGroupColor !== undefined ? normalizeTabGroupColor(body.tabGroupColor) : null
+    if (body.tabGroupColor !== undefined && !tabGroupColor) {
+      return c.json({ error: 'tabGroupColor must be one of: grey, blue, red, yellow, green, pink, purple, cyan, orange' }, 400)
     }
     const manager = await getExecutorManager()
     const executor = manager.getExecutor({
       sessionId,
-      cwd,
+      cwd: cwd || undefined,
+      tabGroup: tabGroup || undefined,
+      tabGroupColor: tabGroupColor || undefined,
       sessionMetadata: {
         extensionId: conn.stableKey,
         browser: conn.info.browser || null,
         profile: conn.info ? { email: conn.info.email || '', id: conn.info.id || '' } : null,
       },
+      enableCloudScope: true,
+      cloudAuth: body.cloudAuth,
+      patchright,
     })
     const metadata = executor.getSessionMetadata()
     return c.json({
       id: sessionId,
       mode: 'extension' as const,
+      // SDK connections send this back on delete, so a stale close cannot delete another session
+      ownershipKey: ownershipKey(sessionId),
       extensionId: metadata.extensionId,
       browser: metadata.browser,
       profile: metadata.profile,
+      warning: cwdWarning,
+      // Echoed so the CLI can detect relays that don't support tab groups
+      tabGroup: executor.getTabGroup(),
+      tabGroupColor: executor.getTabGroupColor(),
+      patchright,
     })
+  })
+
+  // Update a session's driver and/or tab group. patchright switches the executor
+  // between Playwright and Patchright mid-session.
+  // Tab group renames move the session's existing tabs to the new name; color
+  // changes recolor the group (including the default 'playwriter' group).
+  app.post('/cli/session/update', async (c) => {
+    try {
+      const body: { sessionId: string | number; tabGroup?: string; tabGroupColor?: string; patchright?: boolean } =
+        await c.req.json()
+      const sessionId = normalizeSessionId(body.sessionId)
+      if (!sessionId) {
+        return c.json({ error: 'sessionId is required' }, 400)
+      }
+      const tabGroup = body.tabGroup !== undefined ? normalizeTabGroupTitle(body.tabGroup) : null
+      if (body.tabGroup !== undefined && !tabGroup) {
+        return c.json({ error: 'tabGroup must be a non-empty string' }, 400)
+      }
+      const tabGroupColor = body.tabGroupColor !== undefined ? normalizeTabGroupColor(body.tabGroupColor) : null
+      if (body.tabGroupColor !== undefined && !tabGroupColor) {
+        return c.json({ error: 'tabGroupColor must be one of: grey, blue, red, yellow, green, pink, purple, cyan, orange' }, 400)
+      }
+      if (body.patchright !== undefined && typeof body.patchright !== 'boolean') {
+        return c.json({ error: 'patchright must be a boolean' }, 400)
+      }
+      const patchright = body.patchright
+      if (!tabGroup && !tabGroupColor && patchright === undefined) {
+        return c.json({ error: 'Pass patchright, tabGroup and/or tabGroupColor' }, 400)
+      }
+
+      const manager = await getExecutorManager()
+      const executor = manager.getSession(sessionId)
+      if (!executor) {
+        return c.json({ error: sessionNotFoundMessage(sessionId) }, 404)
+      }
+      const extensionId = executor.getSessionMetadata().extensionId
+      if (!extensionId) {
+        return c.json({ error: 'Patchright and tab groups only apply to extension and remote control sessions.' }, 400)
+      }
+
+      // The new connection carries ?patchright=1, so the relay humanizes its input from then on
+      const patchrightResult =
+        patchright === undefined ? {} : { patchright, ...(await executor.setPatchright(patchright)) }
+      if (!tabGroup && !tabGroupColor) {
+        return c.json({ success: true, ...patchrightResult })
+      }
+
+      const previousTabGroup = executor.getTabGroup() || DEFAULT_TAB_GROUP_TITLE
+      const nextTabGroup = tabGroup || previousTabGroup
+      executor.setTabGroupConfig({
+        tabGroup: tabGroup || undefined,
+        tabGroupColor: tabGroupColor || undefined,
+      })
+      // Update live /cdp clients of this session so tabs created without a
+      // reconnect already use the new group name/color.
+      store.setState((s) =>
+        relayState.updateClientsTabGroup(s, {
+          sessionId,
+          tabGroup: tabGroup || undefined,
+          tabGroupColor: tabGroupColor || undefined,
+        }),
+      )
+
+      if (previousTabGroup === nextTabGroup && !tabGroupColor) {
+        return c.json({ success: true, ...patchrightResult, tabGroup: nextTabGroup, movedTabs: 0 })
+      }
+
+      // Ask the extension to move/recolor the session's existing tabs. The
+      // session id is the ownership key: a default-group rename must only move
+      // tabs this session created, never manually toggled tabs or other
+      // sessions' tabs. Old extensions don't know the method and reply `{id}`
+      // with no result — treat anything but an explicit success as "too old"
+      // and warn (future tabs still get the new name/color once the extension
+      // updates).
+      let movedTabs = 0
+      let warning: string | undefined
+      try {
+        const result = (await sendToExtension({
+          extensionId,
+          method: 'updateTabGroup',
+          params: {
+            from: previousTabGroup,
+            to: nextTabGroup,
+            key: ownershipKey(sessionId),
+            color: tabGroupColor || undefined,
+          },
+          timeout: 10000,
+        })) as UpdateTabGroupResult | undefined
+        if (result?.success === true) {
+          movedTabs = result.movedTabs || 0
+        } else {
+          warning = `Your Playwriter extension is too old to update existing tabs. New tabs will still use the new group settings.`
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        warning = `Extension could not update the tab group (update the Playwriter extension?): ${message}. New tabs will still use the new group settings.`
+        logger?.log(pc.yellow(`[session ${sessionId}] ${warning}`))
+      }
+
+      return c.json({
+        success: true,
+        ...patchrightResult,
+        tabGroup: nextTabGroup,
+        tabGroupColor: tabGroupColor || undefined,
+        movedTabs,
+        warning,
+      })
+    } catch (error: any) {
+      logger?.error('Update session endpoint error:', error)
+      return c.json({ error: error.message }, 500)
+    }
   })
 
   app.get('/cli/session/:id', async (c) => {
@@ -2206,7 +3484,8 @@ export async function startPlayWriterCDPRelayServer({
 
   app.post('/cli/session/delete', async (c) => {
     try {
-      const body = (await c.req.json()) as { sessionId: string | number }
+      const body: { sessionId: string | number; closeCreatedTabs?: boolean; ownershipKey?: string } =
+        await c.req.json()
       const sessionId = normalizeSessionId(body.sessionId)
 
       if (!sessionId) {
@@ -2215,18 +3494,37 @@ export async function startPlayWriterCDPRelayServer({
 
       const manager = await getExecutorManager()
       const executor = manager.getSession(sessionId)
-
-      // Close headless context before deleting to prevent context/page leaks
-      // on the shared headless browser. Only affects headless sessions.
-      if (executor) {
-        await executor.closeHeadlessContext()
-      }
-
-      const deleted = manager.deleteExecutor(sessionId)
-
-      if (!deleted) {
+      if (!executor) {
         return c.json({ error: `Session ${sessionId} not found` }, 404)
       }
+      if (body.ownershipKey !== undefined && body.ownershipKey !== ownershipKey(sessionId)) {
+        return c.json({ error: `Session ${sessionId} belongs to another relay start; nothing deleted` }, 409)
+      }
+
+      const extensionId = executor.getSessionMetadata().extensionId
+      // The extension tracks tab ownership: tabs a session creates (and their popups) carry its
+      // ownership key. Old extensions reply `{id}` with no result, so tabs stay open.
+      let closeTabsWarning: string | undefined
+      if (body.closeCreatedTabs && extensionId) {
+        try {
+          const result = (await sendToExtension({
+            extensionId,
+            method: 'closeTabsForKey',
+            params: { key: ownershipKey(sessionId) },
+            timeout: 10000,
+          })) as CloseTabsForKeyResult | undefined
+          if (result?.success !== true) {
+            closeTabsWarning = 'Your Playwriter extension is too old to close session tabs. Update the extension.'
+          }
+        } catch (error) {
+          closeTabsWarning = `Could not close session tabs: ${error instanceof Error ? error.message : String(error)}`
+        }
+      }
+
+      await manager.deleteExecutor(sessionId)
+
+      // Close the remote-control tunnel dial when its last session goes away
+      releaseRemoteDialForSession(sessionId)
 
       // If this was a cloud-backed session, stop the VM only if no other
       // relay session is still using the same cloud VM (reference counting).
@@ -2240,124 +3538,156 @@ export async function startPlayWriterCDPRelayServer({
         }
       }
 
-      return c.json({ success: true })
+      return c.json({ success: true, warning: closeTabsWarning })
     } catch (error: any) {
       logger?.error('Delete session endpoint error:', error)
       return c.json({ error: error.message }, 500)
     }
   })
 
-  // ============================================================================
-  // Recording Endpoints - For screen recording via chrome.tabCapture
-  // ============================================================================
-
-  app.post('/recording/start', async (c) => {
-    const body = (await c.req.json()) as {
-      outputPath?: string
-      sessionId?: string | number
-      frameRate?: number
-      audio?: boolean
-      videoBitsPerSecond?: number
-      audioBitsPerSecond?: number
+  // Push a fire-and-forget notification to all connected extensions.
+  // No `id` field = no response expected; the extension handles it as a one-way event.
+  function notifyExtensionRecorderState(recording: boolean): void {
+    const message = JSON.stringify({ method: 'setRecorderState', params: { recording } })
+    for (const ext of store.getState().extensions.values()) {
+      ext.ws?.send(message)
     }
-    const sessionId = normalizeSessionId(body.sessionId)
-    const { sessionId: _sessionId, ...recordingOptions } = body
-    const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
-    const relay = getRecordingRelay(extensionId)
-    if (!relay) {
-      return c.json({ success: false, error: 'Extension not connected' }, 500)
-    }
-    const recordingParams = (resolvedSessionId
-      ? { ...recordingOptions, sessionId: resolvedSessionId }
-      : recordingOptions) as StartRecordingBody
-    const result = await relay.startRecording(recordingParams)
-    const status = result.success ? 200 : result.error?.includes('required') ? 400 : 500
-    return c.json(result, status)
-  })
-
-  app.post('/recording/stop', async (c) => {
-    const body = (await c.req.json()) as { sessionId?: string | number }
-    const sessionId = normalizeSessionId(body.sessionId)
-    const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
-    const relay = getRecordingRelay(extensionId)
-    if (!relay) {
-      return c.json({ success: false, error: 'Extension not connected' }, 500)
-    }
-    const stopParams: StopRecordingParams = resolvedSessionId ? { sessionId: resolvedSessionId } : {}
-    const result = await relay.stopRecording(stopParams)
-    const status = result.success ? 200 : result.error?.includes('not found') ? 404 : 500
-    return c.json(result, status)
-  })
-
-  app.get('/recording/status', async (c) => {
-    const sessionId = normalizeSessionId(c.req.query('sessionId'))
-    const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
-    const relay = getRecordingRelay(extensionId)
-    if (!relay) {
-      return c.json({ isRecording: false })
-    }
-    const isRecordingParams: IsRecordingParams = resolvedSessionId ? { sessionId: resolvedSessionId } : {}
-    const result = await relay.isRecording(isRecordingParams)
-    return c.json(result)
-  })
-
-  app.post('/recording/cancel', async (c) => {
-    const body = (await c.req.json()) as { sessionId?: string | number }
-    const sessionId = normalizeSessionId(body.sessionId)
-    const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
-    const relay = getRecordingRelay(extensionId)
-    if (!relay) {
-      return c.json({ success: false, error: 'Extension not connected' }, 500)
-    }
-    const cancelParams: CancelRecordingParams = resolvedSessionId ? { sessionId: resolvedSessionId } : {}
-    const result = await relay.cancelRecording(cancelParams)
-    return c.json(result)
-  })
+  }
 
   // ============================================================================
-  // Streaming Endpoints - Live RTMP streaming of a tab via ffmpeg
+  // Action Record Endpoints - Record user interactions as a JSON array for skill
+  // generation (playwriter recorder start/stop). Runs inside the relay daemon so
+  // recording survives CLI exits. Events persist in ~/.playwriter/recordings/.
   // ============================================================================
 
-  app.post('/stream/start', async (c) => {
-    const body = (await c.req.json()) as StartStreamParams & { sessionId?: string | number }
-    const sessionId = normalizeSessionId(body.sessionId)
-    const { sessionId: _sessionId, ...streamOptions } = body
-    const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
-    const relay = getStreamRelay(extensionId)
-    if (!relay) {
-      return c.json({ success: false, error: 'Extension not connected' }, 500)
+  // Memoized as a promise so concurrent first calls share one manager instance
+  let actionRecordingManagerPromise: Promise<import('./action-recorder.js').ActionRecordingManager> | null = null
+  const getActionRecordingManager = () => {
+    if (!actionRecordingManagerPromise) {
+      actionRecordingManagerPromise = import('./action-recorder.js').then(({ ActionRecordingManager }) => {
+        return new ActionRecordingManager({
+          logger: logger || { log: console.error, error: console.error },
+          onActiveChanged: (active) => {
+            notifyExtensionRecorderState(active)
+          },
+        })
+      })
+      // Don't cache a rejected import forever; allow the next call to retry
+      actionRecordingManagerPromise.catch(() => {
+        actionRecordingManagerPromise = null
+      })
     }
-    const streamParams: StartStreamParams = resolvedSessionId
-      ? { ...streamOptions, sessionId: resolvedSessionId }
-      : streamOptions
-    const result = await relay.startStream(streamParams)
-    const status = result.success ? 200 : result.error?.includes('required') ? 400 : 500
-    return c.json(result, status)
+    return actionRecordingManagerPromise
+  }
+
+  // RecordingError carries an HTTP status code hint (409 duplicate, 404 missing, 400 ambiguous)
+  const recordingErrorStatus = (error: unknown): 400 | 404 | 409 | 500 => {
+    const statusCode = (error as { statusCode?: number }).statusCode
+    if (statusCode === 400 || statusCode === 404 || statusCode === 409) {
+      return statusCode
+    }
+    return 500
+  }
+
+  app.post('/recorder/start', async (c) => {
+    let body: { sessionId?: string | number }
+    try {
+      body = await c.req.json()
+    } catch {
+      body = {}
+    }
+    try {
+      const manager = await getExecutorManager()
+      const recordingManager = await getActionRecordingManager()
+      const { pickRecorderStartSession } = await import('./action-recorder.js')
+      // Toolbar sends no sessionId. Never fail on many sessions: reuse a free
+      // extension session, or create one. Session pick does not matter for
+      // playback; the agent chooses the recording at stop time by page URL.
+      const pick = pickRecorderStartSession({
+        explicitSessionId: normalizeSessionId(body.sessionId) || undefined,
+        sessions: manager.listSessions(),
+        busySessionIds: recordingManager.list().map((recording) => {
+          return recording.sessionId
+        }),
+      })
+      const sessionId: string = (() => {
+        if (pick.kind === 'use') {
+          return pick.sessionId
+        }
+        const conn = getExtensionConnection(null, {
+          allowFallback: relayState.getLocalExtensions(store.getState()).length === 1,
+        })
+        if (!conn) {
+          throw new Error('Extension is not connected. Enable Playwriter on a tab first.')
+        }
+        const createdId = allocateSessionId()
+        manager.getExecutor({
+          sessionId: createdId,
+          sessionMetadata: {
+            extensionId: conn.stableKey,
+            browser: conn.info.browser || null,
+            profile: conn.info ? { email: conn.info.email || '', id: conn.info.id || '' } : null,
+          },
+        })
+        return createdId
+      })()
+      const executor = manager.getSession(sessionId)
+      if (!executor) {
+        return c.json({ error: sessionNotFoundMessage(sessionId) }, 404)
+      }
+      const recorder = await executor.withBrowserContext({
+        operation: async (context) => {
+          return recordingManager.start({ context, sessionId })
+        },
+      })
+      return c.json({ recordingId: recorder.recordingId, sessionId, file: recorder.filePath })
+    } catch (error: any) {
+      logger?.error('Record start endpoint error:', error)
+      return c.json({ error: error.message }, recordingErrorStatus(error))
+    }
   })
 
-  app.post('/stream/stop', async (c) => {
-    const body = (await c.req.json()) as { sessionId?: string | number }
-    const sessionId = normalizeSessionId(body.sessionId)
-    const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
-    const relay = getStreamRelay(extensionId)
-    if (!relay) {
-      return c.json({ success: false, error: 'Extension not connected' }, 500)
+  app.post('/recorder/stop', async (c) => {
+    try {
+      const body: { recordingId?: string | number } = await c.req.json().catch(() => ({}))
+      const recordingId = normalizeSessionId(body.recordingId)
+      const recordingManager = await getActionRecordingManager()
+      const result = await recordingManager.stop({ recordingId: recordingId || undefined })
+      return c.json(result)
+    } catch (error: any) {
+      const recordings = (error as { recordings?: unknown }).recordings
+      return c.json(
+        recordings ? { error: error.message, recordings } : { error: error.message },
+        recordingErrorStatus(error),
+      )
     }
-    const stopParams: StopStreamParams = resolvedSessionId ? { sessionId: resolvedSessionId } : {}
-    const result = await relay.stopStream(stopParams)
-    const status = result.success ? 200 : result.error?.includes('No active stream') ? 404 : 500
-    return c.json(result, status)
   })
 
-  app.get('/stream/status', async (c) => {
-    const sessionId = normalizeSessionId(c.req.query('sessionId'))
-    const { extensionId, sessionId: resolvedSessionId } = await resolveRecordingRoute({ sessionId })
-    const relay = getStreamRelay(extensionId)
-    if (!relay) {
-      return c.json({ streaming: false })
+  app.get('/recorder/status', async (c) => {
+    const recordingManager = await getActionRecordingManager()
+    return c.json({ recordings: recordingManager.list() })
+  })
+
+  // Serve recorded events so `recorder events` works against a remote relay
+  // (the events file lives on the relay's machine, not the CLI's)
+  app.get('/recorder/events/:id', async (c) => {
+    const { recordingFilePath, latestRecordingId } = await import('./action-recorder.js')
+    // 'latest' resolves to the most recent recording so the CLI can omit the id
+    const param = c.req.param('id')
+    if (param !== 'latest' && !/^\d+$/.test(param)) {
+      return c.json({ error: 'Invalid recording id' }, 400)
     }
-    const result = relay.streamStatus(resolvedSessionId ? { sessionId: resolvedSessionId } : {})
-    return c.json(result)
+    const recordingId = param === 'latest' ? latestRecordingId() : param
+    if (!recordingId) {
+      return c.json({ error: 'No recordings found' }, 404)
+    }
+    const filePath = recordingFilePath(recordingId)
+    try {
+      const content = await fs.promises.readFile(filePath, 'utf-8')
+      return c.text(content)
+    } catch {
+      return c.json({ error: `Recording ${recordingId} not found` }, 404)
+    }
   })
 
   // ============================================================================
@@ -2518,6 +3848,15 @@ export async function startPlayWriterCDPRelayServer({
 
     if (idleSessions.length > 0) {
       for (const [sessionId, tracking] of idleSessions) {
+        const currentTracking = cloudSessionTracking.get(sessionId)
+        const expired = Boolean(currentTracking?.timeoutAt && currentTracking.timeoutAt <= Date.now())
+        if (
+          currentTracking !== tracking ||
+          currentTracking.activeExecutions > 0 ||
+          (!expired && Date.now() - currentTracking.lastActivityAt <= CLOUD_IDLE_TIMEOUT_MS)
+        ) {
+          continue
+        }
         logger?.log(
           pc.yellow(`[Cloud] Stopping idle relay session ${sessionId} (idle > 10 min)`),
         )
@@ -2525,7 +3864,7 @@ export async function startPlayWriterCDPRelayServer({
         // Only stop the VM when this is the last relay session for it.
         const shouldStopVm = !hasOtherCloudReferences(sessionId, tracking.cloudSessionId)
         cloudSessionTracking.delete(sessionId)
-        executorManager?.deleteExecutor(sessionId)
+        await executorManager?.deleteExecutor(sessionId)
         if (shouldStopVm) {
           disconnectCloudVm(tracking)
         }
@@ -2533,6 +3872,58 @@ export async function startPlayWriterCDPRelayServer({
       persistCloudSessions()
     }
   }, 60_000)
+
+  // Headless sessions each hold a context in one shared local Chrome. Agents often never
+  // run `session delete`, so delete idle ones; Chrome exits with the last headless session.
+  const HEADLESS_IDLE_TIMEOUT_MS = 30 * 60 * 1000
+  const headlessIdleInterval = setInterval(async () => {
+    try {
+      const deleted = (await executorManager?.deleteIdleHeadlessSessions({ idleTimeoutMs: HEADLESS_IDLE_TIMEOUT_MS })) ?? []
+      for (const sessionId of deleted) {
+        logger?.log(pc.yellow(`[Headless] Deleted idle session ${sessionId} (idle > 30 min)`))
+      }
+    } catch (error) {
+      logger?.error('[Headless] Idle cleanup failed:', error)
+    }
+  }, 60_000)
+
+  const relayServer: RelayServer = {
+    close() {
+      const { extensions, playwrightClients } = store.getState()
+
+      closeAllRemoteDials()
+      for (const client of playwrightClients.values()) {
+        client.ws.close(1000, 'Server stopped')
+      }
+
+      for (const ext of extensions.values()) {
+        if (ext.pingInterval) {
+          clearInterval(ext.pingInterval)
+        }
+        ext.ws?.close(1000, 'Server stopped')
+      }
+
+      void executorManager?.disposeAll()
+
+      // Reset store state
+      store.setState({
+        extensions: new Map(),
+        playwrightClients: new Map(),
+      })
+      clearInterval(cloudIdleInterval)
+      clearInterval(headlessIdleInterval)
+      cloudSessionTracking.clear()
+      persistCloudSessions() // Remove the file on graceful shutdown
+      server.close()
+      emitter.removeAllListeners()
+    },
+    on<K extends keyof RelayServerEvents>(event: K, listener: RelayServerEvents[K]) {
+      emitter.on(event, listener as (...args: unknown[]) => void)
+    },
+    off<K extends keyof RelayServerEvents>(event: K, listener: RelayServerEvents[K]) {
+      emitter.off(event, listener as (...args: unknown[]) => void)
+    },
+  }
 
   // Use createAdaptorServer instead of serve() so we control the listen()
   // timing. This lets us inject WebSocket upgrade handlers before binding and
@@ -2569,42 +3960,5 @@ export async function startPlayWriterCDPRelayServer({
   logger?.log('Extension endpoint:', extensionEndpoint)
   logger?.log('CDP endpoint:', cdpEndpoint)
 
-  return {
-    close() {
-      const { extensions, playwrightClients } = store.getState()
-
-      for (const client of playwrightClients.values()) {
-        client.ws.close(1000, 'Server stopped')
-      }
-
-      for (const ext of extensions.values()) {
-        if (ext.pingInterval) {
-          clearInterval(ext.pingInterval)
-        }
-        ext.ws?.close(1000, 'Server stopped')
-      }
-
-      // Close shared headless browser if any headless sessions were created (fire-and-forget)
-      void import('./executor.js').then(({ PlaywrightExecutor }) => {
-        return PlaywrightExecutor.closeSharedHeadlessBrowser()
-      })
-
-      // Reset store state
-      store.setState({
-        extensions: new Map(),
-        playwrightClients: new Map(),
-      })
-      clearInterval(cloudIdleInterval)
-      cloudSessionTracking.clear()
-      persistCloudSessions() // Remove the file on graceful shutdown
-      server.close()
-      emitter.removeAllListeners()
-    },
-    on<K extends keyof RelayServerEvents>(event: K, listener: RelayServerEvents[K]) {
-      emitter.on(event, listener as (...args: unknown[]) => void)
-    },
-    off<K extends keyof RelayServerEvents>(event: K, listener: RelayServerEvents[K]) {
-      emitter.off(event, listener as (...args: unknown[]) => void)
-    },
-  }
+  return relayServer
 }

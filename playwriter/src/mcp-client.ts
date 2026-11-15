@@ -10,6 +10,7 @@ const __filename = url.fileURLToPath(import.meta.url)
 export interface CreateTransportOptions {
   clientName?: string
   port?: number
+  args?: string[]
 }
 
 export async function createTransport({ args = [], port }: { args?: string[]; port?: number } = {}): Promise<{
@@ -49,7 +50,7 @@ export async function createMCPClient(options?: CreateTransportOptions): Promise
     version: '1.0.0',
   })
 
-  const { transport, stderr } = await createTransport({ port: options?.port })
+  const { transport, stderr } = await createTransport({ args: options?.args, port: options?.port })
 
   let stderrBuffer = ''
   stderr?.on('data', (data) => {

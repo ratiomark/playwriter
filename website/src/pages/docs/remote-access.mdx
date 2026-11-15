@@ -6,6 +6,49 @@ icon: lucide:globe
 
 Control a Chrome browser on any machine from anywhere over the internet. No VPN, no firewall rules, no port forwarding.
 
+## Remote control: share your browser, zero setup
+
+The simplest way to give a remote agent access to your browser is **Remote control** in the Playwriter toolbar (click the extension icon to enable a tab first). It requires **no playwriter install** on your machine, only the extension. The extension itself opens a secret tunnel. The agent sees every Playwriter tab and can open new ones.
+
+1. Click **Remote control** in the toolbar, then **Share**, and confirm that the agent may read and control your browser. [Read more about security](./remote-control.mdx).
+2. A prompt containing the secret URL is copied to your clipboard. Paste it to the agent.
+3. The agent runs, on its own machine:
+
+```bash
+playwriter session new --remote <id>
+playwriter -s 1 -e "state.page = context.pages()[0]; console.log(await state.page.title())"
+```
+
+4. Click **Remote ON** then **Stop sharing** in the toolbar (or right-click the Playwriter icon and click **Stop sharing**) anytime to **revoke access**. The URL dies instantly and is never reused. Tabs the agent opened are detached and left open.
+
+Remote control is **not a security sandbox**. The agent gets the same access as a local Playwriter agent, so it must be fully trusted. A short denylist blocks only whole-profile cookie APIs and cache clears.
+
+### Watch and click from any browser
+
+The same link is also a page. Open it and you get a **live view of the tab where sharing started**, streamed frame by frame, with a URL bar and a **Take control** button for clicking, scrolling, and typing.
+
+That means you can share with a person, not only an agent, and no install is needed on either side.
+
+The tunnel id starts in the **URL fragment** (`#xxx`), so the initial viewer-page request and Referer omit it. The viewer JavaScript then uses the id to connect to the tunnel hostname, which the tunnel service and Cloudflare necessarily process.
+
+<Aside>
+<Note>
+The stream **keeps running when the sharer switches tabs**. Playwriter holds a debugger attachment on the shared tab, which stops Chrome from backgrounding it, so frames keep arriving at the same rate.
+</Note>
+</Aside>
+
+<Aside>
+<Warning>
+The URL grants **broad browser automation access**. A malicious recipient may use CDP capabilities beyond the visible page. Never share it with anyone you do not fully trust, and never post it in public channels. Revoke it with the button when the agent is done. The link also dies when you close your browser.
+</Warning>
+</Aside>
+
+Remote traffic can include **screenshots, page content, URLs, input events, network data, cookies, authentication data, and browser storage**. Payloads are routed in memory and are not stored by Playwriter. Read the [privacy policy](../privacy.mdx) for the complete disclosure.
+
+Typical use case: you are logged into a website and want an agent (Devin, a cloud bot, a teammate's CLI agent) to do work in your authenticated session without ever sharing a password.
+
+The rest of this page covers the full-relay setup: exposing your **entire relay server** with `playwriter serve` + traforo, which gives a remote machine access to all controlled tabs and requires playwriter installed on the host.
+
 ## How it works
 
 Playwriter's relay server runs on the host machine alongside Chrome. A [traforo](https://traforo.dev) tunnel exposes it to the internet through Cloudflare, giving you a **secure public URL**. The remote machine connects through this URL to control Chrome.
@@ -14,29 +57,29 @@ Playwriter's relay server runs on the host machine alongside Chrome. A [traforo]
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │  HOST MACHINE (has Chrome)                                                             │
 │                                                                                        │
-│  Chrome + Extension ◄────── local WS ──────► Relay Server :19988                       │
-│                                                    ▲                                   │
+│  Chrome + Extension <────── local WS ──────> Relay Server :19988                       │
+│                                                    ^                                   │
 │                                                    │ local                             │
-│                                                    ▼                                   │
+│                                                    v                                   │
 │                                               Traforo Client                           │
 │                                                    │                                   │
 └────────────────────────────────────────────────────┼───────────────────────────────────┘
                                                      │ outbound WS
-                                                     ▼
+                                                     v
                                             ┌─────────────────┐
-                                            │   Cloudflare     │
-                                            │   Durable Object │
-                                            │                  │
-                                            │   https://{id}-  │
-                                            │   tunnel.        │
-                                            │   traforo.dev    │
+                                            │   Cloudflare    │
+                                            │   Durable Object│
+                                            │                 │
+                                            │   https://{id}- │
+                                            │   tunnel.       │
+                                            │   traforo.dev   │
                                             └────────┬────────┘
                                                      │
-                                                     ▼
+                                                     v
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │  REMOTE MACHINE (CLI or MCP)                                                           │
 │                                                                                        │
-│  playwriter -s 1 -e "await page.goto('https://...')"                                  │
+│  playwriter -s 1 -e "await state.page.goto(url)"                                       │
 │                                                                                        │
 │  PLAYWRITER_HOST=https://{id}-tunnel.traforo.dev                                       │
 │  PLAYWRITER_TOKEN=&lt;secret&gt;                                                       │
@@ -84,8 +127,8 @@ The **CLI with the skill** is the recommended approach. The skill file (`playwri
 
 ```bash
 playwriter session new          # outputs: 1
-playwriter -s 1 -e "await page.goto('https://example.com')"
-playwriter -s 1 -e "console.log(await snapshot({ page }))"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
+playwriter -s 1 -e "console.log(await snapshot({ page: state.page }))"
 ```
 
 Alternatively, pass host and token as **flags** instead of env vars:
@@ -123,7 +166,7 @@ import { chromium } from 'playwright-core'
 const browser = await chromium.connectOverCDP(
   'wss://my-machine-tunnel.traforo.dev/cdp/session1?token=MY_SECRET_TOKEN',
 )
-const page = browser.contexts()[0].pages()[0]
+const page = await browser.contexts()[0].newPage()
 await page.goto('https://example.com')
 // Don't call browser.close() - it would close the user's Chrome
 ```
@@ -140,7 +183,7 @@ await page.goto('https://example.com')
 for machine in machine-a machine-b machine-c; do
   PLAYWRITER_HOST="https://${machine}-tunnel.traforo.dev" \
   PLAYWRITER_TOKEN=shared-secret \
-  playwriter -s 1 -e "console.log(await page.title())"
+  playwriter -s 1 -e "console.log(await Promise.all(context.pages().map((p) => p.title())))"
 done
 ```
 
@@ -150,65 +193,66 @@ done
 
 The relay server **must run on the same machine as Chrome**. The Chrome extension connects to the relay via localhost WebSocket, and the `/extension` endpoint only accepts connections from `127.0.0.1`. This means `playwriter serve` always runs on the host, never inside the container.
 
-From Docker, set `PLAYWRITER_HOST` to reach the host relay.
+From Docker, set `PLAYWRITER_HOST` and `PLAYWRITER_TOKEN` to reach the host relay.
 
 ```diagram
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │  HOST MACHINE                                                                          │
 │                                                                                        │
-│  Chrome + Extension ◄────── local WS ──────► playwriter serve :19988                   │
-└───────────────────────────────────────────────────────▲────────────────────────────────┘
-                                                        │
-                                           host.docker.internal:19988
-                                                        │
-┌───────────────────────────────────────────────────────┴────────────────────────────────┐
+│  Chrome + Extension <────── local WS ──────> playwriter serve :19988                   │
+└────────────────────────────────────────────────────────^───────────────────────────────┘
+                                                         │
+                                            host.docker.internal:19988
+                                                         │
+┌────────────────────────────────────────────────────────┴───────────────────────────────┐
 │  DOCKER CONTAINER                                                                      │
 │                                                                                        │
-│  PLAYWRITER_HOST=host.docker.internal                                                  │
+│  PLAYWRITER_HOST=host.docker.internal + PLAYWRITER_TOKEN                               │
 │                                                                                        │
-│  playwriter -s 1 -e "await page.goto('https://...')"                                  │
+│  playwriter -s 1 -e "await state.page.goto(url)"                                       │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Step 1: Host.** Start the relay server on the host machine (where Chrome is running):
 
 ```bash
-playwriter serve --host localhost
+playwriter serve --host 0.0.0.0 --token MY_SECRET_TOKEN
 ```
 
-Using `--host localhost` binds to `127.0.0.1` so no token is needed. Docker containers reach it through `host.docker.internal` which routes to the host's loopback interface. If you use `--host 0.0.0.0` (the default), a `--token` is required since it exposes the server to all network interfaces.
+Docker reaches the host through a non-loopback interface, so the relay must bind to `0.0.0.0`. A token is required because this exposes the relay to the host network.
 
-**Step 2: Docker.** Set `PLAYWRITER_HOST` in your container:
-
-```dockerfile
-ENV PLAYWRITER_HOST=host.docker.internal
-```
-
-Or pass it at runtime:
+**Step 2: Docker.** Pass the host and the same token into your container:
 
 ```bash
-docker run -e PLAYWRITER_HOST=host.docker.internal myimage
+docker run \
+  -e PLAYWRITER_HOST=host.docker.internal \
+  -e PLAYWRITER_TOKEN=MY_SECRET_TOKEN \
+  myimage
 ```
 
 Then use playwriter normally inside the container:
 
 ```bash
 playwriter session new
-playwriter -s 1 -e "await page.goto('https://example.com')"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
 ```
 
 ### Platform support for `host.docker.internal`
 
-| Platform                       | Works out of the box? | Notes                                              |
-| ------------------------------ | --------------------- | -------------------------------------------------- |
-| **macOS** (Docker Desktop)     | Yes                   | Supported since Docker Desktop 18.03               |
-| **Windows** (Docker Desktop)   | Yes                   | Supported since Docker Desktop 18.03               |
-| **Linux** (Docker Engine)      | No                    | Requires `--add-host` or `extra_hosts` (see below) |
+| Platform                     | Works out of the box? | Notes                                              |
+| ---------------------------- | --------------------- | -------------------------------------------------- |
+| **macOS** (Docker Desktop)   | Yes                   | Supported since Docker Desktop 18.03               |
+| **Windows** (Docker Desktop) | Yes                   | Supported since Docker Desktop 18.03               |
+| **Linux** (Docker Engine)    | No                    | Requires `--add-host` or `extra_hosts` (see below) |
 
 On Linux, `host.docker.internal` is **not provided automatically** by Docker Engine. You must add it explicitly:
 
 ```bash
-docker run --add-host=host.docker.internal:host-gateway -e PLAYWRITER_HOST=host.docker.internal myimage
+docker run \
+  --add-host=host.docker.internal:host-gateway \
+  -e PLAYWRITER_HOST=host.docker.internal \
+  -e PLAYWRITER_TOKEN=MY_SECRET_TOKEN \
+  myimage
 ```
 
 Or in Docker Compose:
@@ -219,6 +263,7 @@ services:
     build: .
     environment:
       - PLAYWRITER_HOST=host.docker.internal
+      - PLAYWRITER_TOKEN=MY_SECRET_TOKEN
     extra_hosts:
       - "host.docker.internal:host-gateway"
 ```
@@ -242,7 +287,8 @@ If your AI assistant or MCP client runs inside Docker:
       "command": "npx",
       "args": ["-y", "playwriter@latest"],
       "env": {
-        "PLAYWRITER_HOST": "host.docker.internal"
+        "PLAYWRITER_HOST": "host.docker.internal",
+        "PLAYWRITER_TOKEN": "MY_SECRET_TOKEN"
       }
     }
   }
@@ -271,7 +317,7 @@ On Linux, make sure the container has `--add-host=host.docker.internal:host-gate
 | ------------------ | ---------------------------------------------------------------------------------- |
 | `PLAYWRITER_HOST`  | Remote relay URL (e.g. `https://x-tunnel.traforo.dev`) or IP (e.g. `192.168.1.10`) |
 | `PLAYWRITER_TOKEN` | Authentication token for the relay server                                          |
-| `PLAYWRITER_PORT`  | Override relay port (default: `19988`, not needed with traforo)                     |
+| `PLAYWRITER_PORT`  | Override relay port (default: `19988`, not needed with traforo)                    |
 
 ### Recommendations
 

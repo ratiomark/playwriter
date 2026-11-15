@@ -4,7 +4,8 @@ import type { Debugger } from './debugger.js'
 import type { Editor } from './editor.js'
 import type { StylesResult } from './styles.js'
 
-export declare const page: Page
+/** Examples use state.page: the sandbox has no default `page` global. */
+export declare const state: { page: Page }
 export declare const getCDPSession: (options: { page: Page }) => Promise<ICDPSession>
 export declare const createDebugger: (options: { cdp: ICDPSession }) => Debugger
 export declare const createEditor: (options: { cdp: ICDPSession }) => Editor

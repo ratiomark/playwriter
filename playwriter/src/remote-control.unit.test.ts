@@ -1,0 +1,293 @@
+import { describe, test, expect } from 'vitest'
+import {
+  buildRemoteHelloMessage,
+  buildRemoteControlPrompt,
+  buildRemoteControlUrl,
+  buildRemoteUpstreamWsUrl,
+  buildTunnelOrigin,
+  decodeExtensionCdpMessage,
+  encodeExtensionCdpCommand,
+  extractViewerTunnelId,
+  readAttachedTargetSession,
+  generateTunnelId,
+  getRemoteCdpCommandRejection,
+  getRemoteDialRetryMs,
+  getRemoteExtensionMethodRejection,
+  parseRemoteControlUrl,
+  REMOTE_EXTENSION_NOT_CONNECTED_ERROR,
+  shouldDropRemoteTunnelFrame,
+  TRAFORO_TUNNEL_OFFLINE_CLOSE_CODE,
+} from './remote-control.js'
+
+describe('remote-control', () => {
+  test('drops only screencast frames when the tunnel buffer is full', () => {
+    expect(
+      [
+        shouldDropRemoteTunnelFrame({ bufferedAmount: 2 * 1024 * 1024, isScreencastFrame: true }),
+        shouldDropRemoteTunnelFrame({ bufferedAmount: 2 * 1024 * 1024, isScreencastFrame: false }),
+        shouldDropRemoteTunnelFrame({ bufferedAmount: 0, isScreencastFrame: true }),
+      ],
+    ).toEqual([true, false, false])
+  })
+
+  test('tunnel ids are unguessable and accepted by the Playwriter worker', () => {
+    const id = generateTunnelId()
+    expect(generateTunnelId()).not.toBe(id)
+    // Must match the id charset and length the Playwriter worker accepts.
+    expect(id).toMatch(/^[a-z0-9-]{1,63}$/)
+    expect(id).toMatch(/^[0-9a-f]{32}$/)
+  })
+
+  test('the shared link points at the viewer page and hides the id in the hash', () => {
+    const url = buildRemoteControlUrl({ tunnelId: 'abc123' })
+    expect(url).toMatchInlineSnapshot(`"https://playwriter.dev/remote-control#abc123"`)
+    // The initial viewer request omits the hash; JS later uses it as the tunnel host.
+    expect(new URL(url).pathname).toMatchInlineSnapshot(`"/remote-control"`)
+    expect(extractViewerTunnelId(url)).toMatchInlineSnapshot(`"abc123"`)
+  })
+
+  test('resolves a viewer link to the tunnel websocket', () => {
+    expect(parseRemoteControlUrl('abc123')).toMatchInlineSnapshot(`
+      {
+        "host": "playwriter.dev",
+        "wsUrl": "wss://playwriter.dev/tunnel/abc123/extension",
+      }
+    `)
+    expect(parseRemoteControlUrl(buildRemoteControlUrl({ tunnelId: 'abc123' }))).toMatchInlineSnapshot(`
+      {
+        "host": "playwriter.dev",
+        "wsUrl": "wss://playwriter.dev/tunnel/abc123/extension",
+      }
+    `)
+    expect(buildRemoteUpstreamWsUrl({ tunnelId: 'abc123' })).toMatchInlineSnapshot(
+      `"wss://playwriter.dev/tunnel/abc123/upstream"`,
+    )
+    expect(buildTunnelOrigin({})).toMatchInlineSnapshot(`"https://playwriter.dev"`)
+    // a pasted path-form URL round-trips to the same dial target
+    expect(parseRemoteControlUrl('wss://playwriter.dev/tunnel/abc123/extension')).toMatchInlineSnapshot(`
+      {
+        "host": "playwriter.dev",
+        "wsUrl": "wss://playwriter.dev/tunnel/abc123/extension",
+      }
+    `)
+  })
+
+  // Remote-control hosts moved to playwriter.dev, but links minted by an older
+  // extension must keep working, and self-hosted tunnel domains must stay usable.
+  test('still accepts a tunnel host verbatim, including older and self-hosted domains', () => {
+    expect(parseRemoteControlUrl('https://abc123-tunnel.traforo.dev')).toMatchInlineSnapshot(`
+      {
+        "host": "abc123-tunnel.traforo.dev",
+        "wsUrl": "wss://abc123-tunnel.traforo.dev/extension",
+      }
+    `)
+    // wss:// and trailing paths normalize to the same dial target
+    expect(parseRemoteControlUrl('wss://abc123-tunnel.traforo.dev/whatever').wsUrl).toBe(
+      'wss://abc123-tunnel.traforo.dev/extension',
+    )
+    // a custom domain keeps its host instead of being rebuilt from the id
+    expect(parseRemoteControlUrl('https://abc123-tunnel.mycompany.com').wsUrl).toBe(
+      'wss://abc123-tunnel.mycompany.com/extension',
+    )
+  })
+
+  test('explains the unquoted-shell case when the hash is missing', () => {
+    expect(() =>
+      parseRemoteControlUrl('https://playwriter.dev/remote-control'),
+    ).toThrowErrorMatchingInlineSnapshot(`
+      [Error: Remote control id is missing. Pass the id from the copied prompt, for example:
+        playwriter session new --remote your-id]
+    `)
+    expect(extractViewerTunnelId('https://playwriter.dev/remote-control#BAD_ID')).toBe(null)
+    expect(extractViewerTunnelId('https://playwriter.dev/other#abc123')).toBe(null)
+  })
+
+  test('rejects malformed urls', () => {
+    expect(() => parseRemoteControlUrl('ftp://nope')).toThrowErrorMatchingInlineSnapshot(
+      `[Error: Invalid remote control URL protocol: ftp: (expected https:// or wss://)]`,
+    )
+    expect(() => parseRemoteControlUrl('not a url')).toThrowErrorMatchingInlineSnapshot(`[Error: Invalid remote control id: not a url]`)
+  })
+  test('cdp command guards allow new tabs and block profile-wide clears', () => {
+    expect(getRemoteCdpCommandRejection('Page.navigate')).toBeNull()
+    expect(getRemoteCdpCommandRejection('Runtime.evaluate')).toBeNull()
+    expect(getRemoteCdpCommandRejection('Target.createTarget')).toBeNull()
+    expect(getRemoteCdpCommandRejection('Target.closeTarget')).toBeNull()
+    expect(getRemoteCdpCommandRejection('Network.clearBrowserCookies')).toMatchInlineSnapshot(`"Network.clearBrowserCookies is not allowed over Remote control: it clears cookies for EVERY site in the user profile."`)
+    expect(getRemoteCdpCommandRejection('Network.clearBrowserCache')).toBeTruthy()
+  })
+
+  test('blocks obvious profile-wide cookie operations', () => {
+    const methods = ['Network.getAllCookies', 'Storage.clearCookies', 'Storage.getCookies', 'Storage.setCookies']
+    expect(
+      methods.map((method) => {
+        return { method, rejection: getRemoteCdpCommandRejection(method) }
+      }),
+    ).toMatchInlineSnapshot(`
+      [
+        {
+          "method": "Network.getAllCookies",
+          "rejection": "Network.getAllCookies is not allowed over Remote control: it reads cookies for EVERY site in the user profile.",
+        },
+        {
+          "method": "Storage.clearCookies",
+          "rejection": "Storage.clearCookies is not allowed over Remote control: it clears cookies for EVERY site in the user profile.",
+        },
+        {
+          "method": "Storage.getCookies",
+          "rejection": "Storage.getCookies is not allowed over Remote control: it reads cookies for EVERY site in the user profile.",
+        },
+        {
+          "method": "Storage.setCookies",
+          "rejection": "Storage.setCookies is not allowed over Remote control: it changes cookies for any site in the user profile.",
+        },
+      ]
+    `)
+  })
+
+  test('allows cookie operations targeted by URL or domain', () => {
+    const methods = ['Network.deleteCookies', 'Network.getCookies', 'Network.setCookie', 'Network.setCookies']
+    expect(
+      methods.map((method) => {
+        return getRemoteCdpCommandRejection(method)
+      }),
+    ).toEqual([null, null, null, null])
+  })
+
+  test('extension method guards', () => {
+    expect(getRemoteExtensionMethodRejection('forwardCDPCommand')).toBeNull()
+    expect(getRemoteExtensionMethodRejection('updateTabGroup')).toBeNull()
+    expect(getRemoteExtensionMethodRejection('createInitialTab')).toBeNull()
+    expect(getRemoteExtensionMethodRejection('ghost-browser')).toMatchInlineSnapshot(`"Ghost Browser APIs are not available over Remote control."`)
+  })
+
+  // Every failed dial wakes the tunnel Durable Object. A 500ms retry on 4008
+  // kept offline tunnels awake 24/7, so failed dials back off up to 60s.
+  test('backs off failed public dials, 4008 from 1s and drops from 4s', () => {
+    const delays = (closeCode: number) => {
+      return [0, 1, 2, 3, 4, 6, 7, 10].map((failedAttempts) => {
+        return getRemoteDialRetryMs({ closeCode, failedAttempts })
+      })
+    }
+    expect({
+      offline: delays(TRAFORO_TUNNEL_OFFLINE_CLOSE_CODE),
+      drop: delays(1006),
+    }).toMatchInlineSnapshot(`
+      {
+        "drop": [
+          4000,
+          4000,
+          8000,
+          16000,
+          32000,
+          60000,
+          60000,
+          60000,
+        ],
+        "offline": [
+          1000,
+          1000,
+          2000,
+          4000,
+          8000,
+          32000,
+          60000,
+          60000,
+        ],
+      }
+    `)
+    expect(getRemoteDialRetryMs({ closeCode: 1006, failedAttempts: 0 })).toBeGreaterThan(3000)
+    expect(REMOTE_EXTENSION_NOT_CONNECTED_ERROR).toMatchInlineSnapshot(`"Could not reach the remote-control browser. The tunnel dropped. Ask the user to confirm Remote control is still on, then retry. If they clicked Stop sharing, they need to share a fresh id."`)
+    expect(REMOTE_EXTENSION_NOT_CONNECTED_ERROR).not.toContain('chromewebstore')
+  })
+
+  test('prompt contains the id and the warning', () => {
+    const prompt = buildRemoteControlPrompt({ id: 'abc123' })
+    expect(prompt).toMatchInlineSnapshot(`
+      "Connect to my Chrome browser:
+
+      npx -y playwriter@latest session new --remote abc123
+
+      Then use the printed session id. Read https://playwriter.dev/SKILL.md. NEVER share this id."
+    `)
+  })
+
+  test('wraps cdp commands for the extension protocol', () => {
+    expect(
+      encodeExtensionCdpCommand({ id: 3, method: 'Page.enable', sessionId: 'pw-tab-1-2' }),
+    ).toMatchInlineSnapshot(`"{"id":3,"method":"forwardCDPCommand","params":{"method":"Page.enable","sessionId":"pw-tab-1-2","params":{}}}"`)
+  })
+
+  test('decodes every message shape the tunnel sends', () => {
+    expect(decodeExtensionCdpMessage('{"id":3,"result":{"ok":true}}')).toMatchInlineSnapshot(`
+      {
+        "error": undefined,
+        "id": 3,
+        "kind": "response",
+        "result": {
+          "ok": true,
+        },
+      }
+    `)
+    expect(decodeExtensionCdpMessage('{"id":3,"error":"boom"}')).toMatchInlineSnapshot(`
+      {
+        "error": "boom",
+        "id": 3,
+        "kind": "response",
+        "result": undefined,
+      }
+    `)
+    expect(
+      decodeExtensionCdpMessage(
+        '{"method":"forwardCDPEvent","params":{"method":"Page.screencastFrame","sessionId":"pw-tab-1-2","params":{"data":"x"}}}',
+      ),
+    ).toMatchInlineSnapshot(`
+      {
+        "kind": "event",
+        "method": "Page.screencastFrame",
+        "params": {
+          "data": "x",
+        },
+        "sessionId": "pw-tab-1-2",
+      }
+    `)
+    expect(decodeExtensionCdpMessage('{"method":"hello","params":{"browser":"chrome"}}')).toMatchInlineSnapshot(`
+      {
+        "browser": "chrome",
+        "kind": "hello",
+        "version": undefined,
+      }
+    `)
+    expect(decodeExtensionCdpMessage('not json')).toMatchInlineSnapshot(`
+      {
+        "kind": "ignored",
+      }
+    `)
+  })
+
+  test('finds the announced tab session in the pushed attach event', () => {
+    const attached = decodeExtensionCdpMessage(
+      '{"method":"forwardCDPEvent","params":{"method":"Target.attachedToTarget","params":{"sessionId":"pw-tab-7-1","targetInfo":{"url":"https://example.com","type":"page"}}}}',
+    )
+    expect(readAttachedTargetSession(attached)).toMatchInlineSnapshot(`
+      {
+        "sessionId": "pw-tab-7-1",
+        "url": "https://example.com",
+      }
+    `)
+    expect(readAttachedTargetSession(decodeExtensionCdpMessage('{"method":"hello","params":{}}'))).toBe(null)
+  })
+
+  test('remote hello excludes browser identity', () => {
+    expect(buildRemoteHelloMessage({ browser: 'chrome', version: '1.2.3' })).toMatchInlineSnapshot(`
+      {
+        "method": "hello",
+        "params": {
+          "browser": "chrome",
+          "remote": true,
+          "version": "1.2.3",
+        },
+      }
+    `)
+  })
+})

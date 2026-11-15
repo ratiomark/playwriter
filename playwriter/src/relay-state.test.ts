@@ -109,8 +109,23 @@ describe('addExtension', () => {
     expect(ext.messageId).toBe(0)
     expect(ext.pendingRequests.size).toBe(0)
     expect(ext.pingInterval).toBeNull()
+    expect(ext.inventoryReady).toBe(true)
     // Original unchanged (immutable)
     expect(before.extensions.size).toBe(0)
+  })
+
+  test('starts inventory negotiation from additive connection capabilities', () => {
+    const state = relayState.addExtension(emptyState(), {
+      id: 'ext-1',
+      info: { browser: 'Chrome' },
+      stableKey: 'profile:chrome-1',
+      ws: fakeWs(),
+      capabilities: ['inventory-ready-v1'],
+    })
+
+    expect(state.extensions.get('ext-1')?.inventoryReady).toBe(false)
+    const after = relayState.markExtensionInventoryReady(state, { extensionId: 'ext-1' })
+    expect(after.extensions.get('ext-1')?.inventoryReady).toBe(true)
   })
 
   test('adding extension with same stableKey keeps old entry (removed on socket close)', () => {
@@ -195,6 +210,39 @@ describe('addPlaywrightClient', () => {
   })
 })
 
+describe('updateClientsTabGroup', () => {
+  test('updates tab group only on clients of the given session', () => {
+    let state = emptyState()
+    state = relayState.addPlaywrightClient(state, {
+      id: 'c1',
+      extensionId: 'ext-1',
+      ws: fakeWs(),
+      sessionId: '1',
+      tabGroup: 'old-name',
+    })
+    state = relayState.addPlaywrightClient(state, {
+      id: 'c2',
+      extensionId: 'ext-1',
+      ws: fakeWs(),
+      sessionId: '2',
+      tabGroup: 'other',
+    })
+    state = relayState.addPlaywrightClient(state, { id: 'c3', extensionId: 'ext-1', ws: fakeWs() })
+
+    const after = relayState.updateClientsTabGroup(state, { sessionId: '1', tabGroup: 'new-name' })
+
+    expect(after.playwrightClients.get('c1')?.tabGroup).toBe('new-name')
+    expect(after.playwrightClients.get('c2')?.tabGroup).toBe('other')
+    expect(after.playwrightClients.get('c3')?.tabGroup).toBeUndefined()
+  })
+
+  test('no-op when nothing matches', () => {
+    const before = relayState.addPlaywrightClient(emptyState(), { id: 'c1', extensionId: null, ws: fakeWs() })
+    const after = relayState.updateClientsTabGroup(before, { sessionId: '9', tabGroup: 'x' })
+    expect(after).toBe(before)
+  })
+})
+
 describe('removePlaywrightClient', () => {
   test('removes client', () => {
     const before = relayState.addPlaywrightClient(emptyState(), { id: 'c1', extensionId: null, ws: fakeWs() })
@@ -213,6 +261,30 @@ describe('removePlaywrightClient', () => {
 })
 
 describe('extension I/O fields', () => {
+  test('does not erase query identity with missing hello fields', () => {
+    const before = stateWithExtension('ext-1', {
+      browser: 'Chromium',
+      email: 'person@example.com',
+      id: 'profile-id',
+      installId: 'install-id',
+      version: '1.0.0',
+    })
+    const after = relayState.updateExtensionInfo(before, {
+      extensionId: 'ext-1',
+      info: { version: '1.1.0' },
+    })
+
+    expect(after.extensions.get('ext-1')?.info).toMatchInlineSnapshot(`
+      {
+        "browser": "Chromium",
+        "email": "person@example.com",
+        "id": "profile-id",
+        "installId": "install-id",
+        "version": "1.1.0",
+      }
+    `)
+  })
+
   test('adds and removes pending extension requests', () => {
     let state = stateWithExtension('ext-1')
 
@@ -546,22 +618,53 @@ describe('findExtensionByStableKey', () => {
   })
 })
 
-describe('findExtensionIdByCdpSession', () => {
-  test('finds extension owning a CDP sessionId', () => {
-    let state = stateWithExtension('ext-1')
-    state = relayState.addTarget(state, {
-      extensionId: 'ext-1',
-      sessionId: 'pw-tab-1',
-      targetId: 'target-1',
-      targetInfo: makeTargetInfo(),
+describe('getLocalExtensions', () => {
+  test('excludes remote-control connections from implicit selection', () => {
+    let state = stateWithExtension('local', { browser: 'Chrome' }, 'install:Chrome:local')
+    state = relayState.addExtension(state, {
+      id: 'remote',
+      info: { browser: 'Remote browser' },
+      stableKey: 'remote:hashed-id',
+      ws: fakeWs(),
     })
 
-    expect(relayState.findExtensionIdByCdpSession(state, 'pw-tab-1')).toBe('ext-1')
+    expect(relayState.getLocalExtensions(state).map((extension) => extension.id)).toEqual(['local'])
+    expect(relayState.isRemoteExtension(state.extensions.get('remote')!)).toBe(true)
   })
 
-  test('returns null if session not found', () => {
-    const state = stateWithExtension('ext-1')
-    expect(relayState.findExtensionIdByCdpSession(state, 'pw-tab-nope')).toBeNull()
+  test('returns no default candidates when only remote connections exist', () => {
+    const state = stateWithExtension('remote', { browser: 'Remote browser' }, 'remote:hashed-id')
+    expect(relayState.getLocalExtensions(state)).toEqual([])
+  })
+})
+
+describe('mergeScreencastParams', () => {
+  test('merges recorder, skill recorder and viewer params', () => {
+    const recorder = { format: 'jpeg' as const, quality: 90, maxWidth: 1920, maxHeight: 1080, everyNthFrame: 1 }
+    const skillRecorder = { format: 'jpeg' as const, quality: 50, maxWidth: 1280, maxHeight: 720 }
+    const unlimitedPng = { everyNthFrame: 2 }
+    expect(relayState.mergeScreencastParams([recorder, skillRecorder])).toMatchInlineSnapshot(`
+      {
+        "everyNthFrame": 1,
+        "format": "jpeg",
+        "maxHeight": 1080,
+        "maxWidth": 1920,
+        "quality": 90,
+      }
+    `)
+    expect(relayState.mergeScreencastParams([skillRecorder, unlimitedPng])).toMatchInlineSnapshot(`
+      {
+        "everyNthFrame": 1,
+        "format": "jpeg",
+        "quality": 50,
+      }
+    `)
+    expect(relayState.mergeScreencastParams([unlimitedPng])).toMatchInlineSnapshot(`
+      {
+        "everyNthFrame": 2,
+        "format": "png",
+      }
+    `)
   })
 })
 

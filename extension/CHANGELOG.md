@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.118
+
+1. **Record Skill on the in-page toolbar** — click Record to start a skill recording, then Stop (red square) when you are done. The button creates a session when none exists and works even when many sessions are open. Tooltips and click sounds land on the controls.
+2. **Daemon tutorial on idle icon click** — clicking the extension icon while the local daemon is down opens a short tutorial tab instead of a gray or orange badge. A second click focuses that tab.
+3. **Dark toolbar with a drag handle** — the attached-tab toolbar is redesigned and can be dragged. Pin mode supports shift-click multi-select without selecting page text.
+4. **Ghost cursor on strict CSP pages** — the cursor is an inline SVG, so sites that block `data:` images no longer hide it.
+5. **Hide Playwriter UI during screenshots** — toolbar, overlay, ghost cursor, scrollbars, and caret stay out of `Page.captureScreenshot` frames.
+6. **Drop noisy CDP events** — high-frequency Network extras and WebSocket frames are no longer forwarded, so heavy pages do not flood the relay.
+7. **Toolbar fade-in** — the toolbar fades in when it first appears. Pin-mode hover overlay updates at most once per frame.
+
 ## 0.0.97
 
 ### Changes

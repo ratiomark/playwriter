@@ -151,6 +151,22 @@ export async function getListeningPidsForPort({ port }: { port: number }): Promi
   return os.platform() === 'win32' ? await getPidsForPortWindows(port) : await getPidsForPortUnix(port)
 }
 
+/** Kill one pid. A process that already exited is ignored. */
+export async function killPid({ pid, signal = 'SIGKILL' }: { pid: number; signal?: KillPortSignal }): Promise<void> {
+  if (os.platform() === 'win32') {
+    await terminatePidWindows(pid)
+    return
+  }
+  try {
+    process.kill(pid, signal)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+      return
+    }
+    throw new Error(`Failed to kill pid ${pid}`, { cause: toError(error) })
+  }
+}
+
 function toError(value: unknown): Error {
   if (value instanceof Error) {
     return value
@@ -178,42 +194,14 @@ export async function killPortProcess({
     throw new Error(`Invalid port: ${port}`)
   }
 
-  if (os.platform() === 'win32') {
-    const pids = await getListeningPidsForPort({ port })
-    const currentPid = process.pid
-    const targetPids = pids.filter((pid) => {
-      return pid !== currentPid
-    })
-    await Promise.all(
-      targetPids.map(async (pid) => {
-        await terminatePidWindows(pid)
-      }),
-    )
-    return
-  }
-
   const pids = await getListeningPidsForPort({ port })
-  const currentPid = process.pid
-  const targetPids = pids.filter((pid) => {
-    return pid !== currentPid
-  })
-
-  if (targetPids.length === 0) {
-    return
-  }
-
   await Promise.all(
-    targetPids.map(async (pid) => {
-      try {
-        process.kill(pid, signal)
-      } catch (error) {
-        const err = toError(error)
-        // If the process already exited between discovery and kill, ignore.
-        if ((err as NodeJS.ErrnoException).code === 'ESRCH') {
-          return
-        }
-        throw new Error(`Failed to kill pid ${pid} on port ${port}`, { cause: err })
-      }
-    }),
+    pids
+      .filter((pid) => {
+        return pid !== process.pid
+      })
+      .map((pid) => {
+        return killPid({ pid, signal })
+      }),
   )
 }

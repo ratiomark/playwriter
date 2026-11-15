@@ -177,7 +177,7 @@ function buildPerformanceProfiling() {
 
     \`\`\`bash
     playwriter session new
-    playwriter -s 1 -e 'state.page = context.pages().find((p) => p.url() === "about:blank") ?? (await context.newPage()); await state.page.goto("https://example.com", { waitUntil: "domcontentloaded" })'
+    playwriter -s 1 -e 'state.page = await context.newPage(); await state.page.goto("https://example.com", { waitUntil: "domcontentloaded" })'
     \`\`\`
 
     Collect a concise vitals report:

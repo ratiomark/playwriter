@@ -1,34 +1,38 @@
-import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
+import { defaultSessionCounterPath, startPlayWriterCDPRelayServer, type RelayServer } from './cdp-relay.js'
 import { createFileLogger } from './create-logger.js'
-import { waitForRelayVersion } from './relay-client.js'
+import { installProcessGuard } from './process-guard.js'
+import { RELAY_PORT, waitForRelayVersion } from './relay-client.js'
+import { flushTelemetry, startRelayTelemetry } from './telemetry.js'
 import { LOG_CDP_FILE_PATH } from './utils.js'
 
 process.title = 'playwriter-ws-server'
 
 const logger = createFileLogger()
 
-process.on('uncaughtException', async (err) => {
-  await logger.error('Uncaught Exception:', err)
-  process.exit(1)
-})
-
-process.on('unhandledRejection', async (reason) => {
-  await logger.error('Unhandled Rejection:', reason)
-  process.exit(1)
-})
-
-process.on('exit', async (code) => {
-  await logger.log(`Process exiting with code: ${code}`)
-})
+installProcessGuard({ logger })
 
 export async function startServer({
-  port = 19988,
+  port = RELAY_PORT,
   host = '127.0.0.1',
   token,
 }: { port?: number; host?: string; token?: string } = {}) {
-  let server
+  let server: RelayServer | undefined
+  const shutdown = async () => {
+    console.log('\nShutting down...')
+    server?.close()
+    await flushTelemetry()
+    process.exit(0)
+  }
   try {
-    server = await startPlayWriterCDPRelayServer({ port, host, token, logger })
+    server = await startPlayWriterCDPRelayServer({
+      port,
+      host,
+      token,
+      logger,
+      sessionCounterFile: defaultSessionCounterPath(port),
+      // A newer CLI drained this relay to replace it.
+      onDrained: () => void shutdown(),
+    })
   } catch (err: unknown) {
     // When two relay processes race to start (issue #75), the loser gets
     // EADDRINUSE. Check if the winner is a valid relay and exit cleanly
@@ -52,18 +56,14 @@ export async function startServer({
   console.log('Logs are being written to:', logger.logFilePath)
   console.log('CDP logs are being written to:', LOG_CDP_FILE_PATH)
 
-  process.on('SIGINT', () => {
-    console.log('\nShutting down...')
-    server.close()
-    process.exit(0)
-  })
+  startRelayTelemetry()
 
-  process.on('SIGTERM', () => {
-    console.log('\nShutting down...')
-    server.close()
-    process.exit(0)
-  })
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
 
   return server
 }
-startServer().catch(logger.error)
+startServer({ token: process.env.PLAYWRITER_TOKEN }).catch((error) => {
+  void logger.error('Failed to start relay server:', error)
+  process.exit(1)
+})

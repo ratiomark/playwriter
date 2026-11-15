@@ -1,0 +1,176 @@
+---
+title: Playwriter vs agent-browser
+sidebarTitle: vs agent-browser
+description: One programmable execute tool in your real Chrome versus 50 plus fixed CLI commands in a fresh agent-browser instance.
+icon: lucide:square-terminal
+---
+
+[agent-browser](https://github.com/vercel-labs/agent-browser) is a Rust CLI with **50+ commands**,
+one per action: `open`, `click @e2`, `fill @e3 "text"`, `screenshot`, `close`. By default it drives
+a **new browser** (Chrome for Testing, or a detected system Chrome/Brave) with a fixed command set.
+
+Playwriter has **one tool**: `execute`. It runs any Playwright code in your **already running
+Chrome** with your logins and extensions. The agent writes real JavaScript with loops, conditions,
+and variables. It already knows Playwright, so there is nothing new to learn.
+
+## Comparison
+
+|  | Playwriter | agent-browser |
+|---|---|---|
+| Browser | **Your running Chrome** (extension) | New browser by default |
+| Login state | **Already logged in** | Fresh (or a read-only profile snapshot) |
+| Extensions | **Your existing ones** | None by default (`--extension <path>` for unpacked) |
+| API surface | **1 `execute` tool** + full Playwright | 50+ CLI commands, one per action |
+| Multiple actions per turn | **Real JS: loops, conditions, variables** | `batch` of quoted command strings |
+| Reusable logic | **Import a `.js` module with the live `page`** | Shell scripts or `batch` command lists |
+| LLM knowledge | **Already knows Playwright** | Must learn 50+ custom commands |
+| Bot handling | **Real Chrome; disconnect for manual challenges** | Automated browser by default; stealth via plugin |
+| Video recording | **CDP screencast + ffmpeg, page audio, hardware encoder** | CDP screencast piped to ffmpeg, no audio |
+| Skill recorder | **Record your workflow → reusable skill** | Bundled reference skills only |
+| Cloud browsers | **Built-in stealth + proxy + CAPTCHA** | Provider plugin |
+| Remote tab sharing | **Built-in one-click secret tunnel** | No built-in tab-sharing tunnel |
+| Raw CDP / debugger / live edit | **Full, first-class** | Via `eval` / CDP url |
+
+## One tool vs fifty commands
+
+agent-browser makes the agent learn a large surface: `find role button click`, `get attr`,
+`storage local set`, `network route`, and dozens more. Its optional MCP mode loads tool schemas
+into client context (mitigated with tool profiles and paginated discovery). When you need something
+the command set does not cover, you fall back to `eval` or raw CDP.
+
+Playwriter exposes **one `execute` tool**. The agent writes Playwright, which it already knows from
+training. There is no command vocabulary to memorize and no per-tool schema tax.
+
+```bash
+# agent-browser: separate commands, each a fixed shape
+agent-browser open example.com
+agent-browser snapshot
+agent-browser click @e2
+
+# Playwriter: one call, real Playwright the model already knows
+playwriter -s 1 -e 'state.page = await context.newPage(); await state.page.goto("https://example.com"); await state.page.getByRole("button", { name: "Submit" }).click()'
+```
+
+## Real scripts, not brittle bash
+
+This is the core difference. agent-browser is **one action per command**. To do many things you
+either fire many commands or hand-write a `batch` array of quoted command strings. `batch --bail`
+stops on the first error and returns structured results, but there is still no real control flow,
+no variables, and no branching between steps.
+
+Playwriter runs a **whole JavaScript program** in one call. Loop over rows, branch on page state,
+collect results, retry. It is a language, not a command list.
+
+```bash
+# Playwriter: loop, branch, and collect in a single execute
+playwriter -s 1 -e '
+  const rows = await state.page.locator("table tr").all();
+  state.results = [];
+  for (const row of rows) {
+    const name = await row.locator("td.name").textContent();
+    if (name?.startsWith("A")) {
+      await row.locator("button.expand").click();
+      state.results.push(name.trim());
+    }
+  }
+  console.log(state.results);
+'
+```
+
+agent-browser has an `eval` command, but it runs **in-page JavaScript** (`document`, `window`), not
+the Playwright driver. You cannot mix locator actions, auto-waiting, and Node-side state in one
+program the way you can with Playwriter.
+
+### Save a `.js` file, replay forever
+
+Repeatable work should be a **function you call again**, not a fragile string of shell commands you
+paste each time. Playwriter runs from your session working directory, so the agent writes a helper
+once and replays it with different parameters.
+
+```js
+// submit.js
+export async function submitProduct({ page, name, url }) {
+  await page.goto('https://directory.example.com/submit')
+  await page.getByRole('textbox', { name: 'Product name' }).fill(name)
+  await page.getByRole('textbox', { name: 'Website URL' }).fill(url)
+  await page.getByRole('button', { name: 'Submit' }).click()
+  await page.waitForResponse(r => r.url().includes('/api/products'))
+}
+```
+
+```bash
+# Replay any time, from any session
+playwriter -s 1 -e 'const { submitProduct } = await import("./submit.js"); await submitProduct({ page: state.page, name: "Acme", url: "https://acme.com" })'
+```
+
+You can of course wrap agent-browser calls in your own shell or JS script. The precise advantage of
+Playwriter is different: it imports a module that receives the **live Playwright `page` object** and
+runs driver-side control flow (locators, auto-waiting, `waitForResponse`) in the same program.
+
+## Your Chrome, not a fresh one
+
+By default agent-browser launches a **new browser** (Chrome for Testing, or a detected system Chrome
+or Brave). That instance starts logged out with default fingerprints, so a fresh automated browser
+is what sites see. It can copy your profile as a read-only snapshot with `--profile <name>`, use a
+persistent writable profile path, load unpacked extensions with `--extension`, or attach to a Chrome
+you launched with `--remote-debugging-port` (which shows Chrome's permission dialog an agent cannot
+dismiss).
+
+Playwriter connects to the Chrome you are **already using**, through an extension. Your cookies,
+logins, and extensions are all there with zero setup. The site sees a real user browser because it
+**is** one. No dialog, no flags, no relaunch. See [vs Chrome Direct CDP](/docs/vs-chrome-cdp).
+
+## Video recording with page audio
+
+agent-browser pipes CDP `Page.startScreencast` PNG frames into ffmpeg. Playwriter uses Chrome's
+**native recorder** (`Page.startScreenRecording`, Chrome 153+): Chrome encodes the video out of
+process, so recording costs about 4x less Chrome CPU and 15x less CDP traffic, runs at **60 fps up
+to 4K**, and stops instantly. Neither needs a permission click, and both keep recording across page
+navigations. With `audio: true` Playwriter also records **tab audio**; agent-browser recordings have
+no audio.
+
+```bash
+playwriter -s 1 -e "state.video = await recording.start({ page: state.page, outputPath: './demo.mp4', frameRate: 60 })"
+playwriter -s 1 -e "await state.page.click('a'); await state.page.waitForLoadState('domcontentloaded')"
+playwriter -s 1 -e "await state.video.stop()"
+```
+
+See [Recording](/docs/recording).
+
+## Skill Recorder
+
+agent-browser ships bundled reference skills (`skills get <name>`) that always match the installed
+CLI version. Playwriter has a **Skill Recorder** for your own flows: perform a workflow once by hand
+in your real browser, and the agent turns the recording into a reusable **skill** with verified
+locators, expected network outcomes, and an importable replay script. Show a flow instead of
+describing it. See [Skill Recorder](/docs/skill-recorder).
+
+## Cloud browsers, built in
+
+agent-browser reaches cloud browsers through a third-party provider plugin. Playwriter has
+**cloud browsers built in**: stealth Chromium instances with residential proxies (195+ countries)
+and automatic CAPTCHA solving (Turnstile, reCAPTCHA v2/v3, hCaptcha). They appear right next to your
+local Chrome in `playwriter session new`, so your scripts work unchanged. See
+[Cloud Browsers](/docs/cloud-browsers).
+
+## Remote control for cloud agents
+
+Playwriter lets a remote agent (Devin, a Grok bot, a friend's CLI) drive **your own logged-in
+Chrome** over a secret tunnel. You click the cloud button, paste the URL to the agent, and
+revoke anytime. The agent needs no install, only you have the extension. agent-browser can connect
+to a CDP url or a provider plugin, but has no built-in one-click tunnel for sharing your existing
+Chrome. See [Remote Access](/docs/remote-access).
+
+## And more
+
+Everything below comes free because you get the full Playwright API plus raw CDP, not a fixed command
+list:
+
+- **Persistent session state** across calls (`state`): build up context, reuse pages and handles.
+- **Debugger and breakpoints**: set breakpoints, step, inspect variables via `createDebugger`.
+- **Live code editing**: patch a page's running JavaScript with `createEditor`.
+- **Full network interception**: `page.route`, request/response listeners, mocking, HAR.
+- **Performance profiling**: CPU profiles and metrics over raw CDP.
+- **Accessibility snapshots** with `aria-ref` locators, plus Vimium-style visual labels.
+- **Shared tabs across sessions**: many agents work in the same browser without colliding.
+- **Any MCP client or plain CLI**: Claude, Cursor, OpenCode, Windsurf, scripts, cron.

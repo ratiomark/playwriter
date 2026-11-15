@@ -1,7 +1,7 @@
 ---
-title: Configuration, Environment Variables, and MCP Setup Options
+title: Environment variables and MCP config
 sidebarTitle: Configuration
-description: All Playwriter environment variables, CLI flags, MCP server configuration examples for Claude, Cursor, and OpenCode, and remote connection options.
+description: Playwriter environment variables, CLI flags, and MCP server config examples for Claude, Cursor, OpenCode, and remote connections.
 icon: lucide:settings
 ---
 
@@ -54,7 +54,7 @@ playwriter session new
 | `--host <host>` | Remote relay server host |
 | `--token <token>` | Auth token for remote connections |
 | `--timeout <ms>` | Execution timeout (default: 10000) |
-| `--patchright` | Use @playwriter/patchright-core for stealth |
+| `--patchright` | MCP: connect with Patchright and human-like input. See [sessions](./sessions.mdx#patchright) |
 
 ## Session new flags
 
@@ -66,6 +66,7 @@ playwriter session new
 | `--custom-proxy <url>` | Custom proxy (host:port or user:pass@host:port) |
 | `--timeout <minutes>` | Cloud browser timeout (1-240, default 60) |
 | `--disable-proxy-bandwidth-acceleration` | Load images/video with proxy |
+| `--patchright` | Connect with Patchright and human-like input. Switch later with `session update <id> --patchright`. See [sessions](./sessions.mdx#patchright) |
 
 ## Browser start flags
 

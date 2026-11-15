@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { createCdpLogger, type CdpLogEntry } from './cdp-log.js'
+import { createFileLogger } from './create-logger.js'
 
 function makeTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-log-test-'))
@@ -121,6 +122,60 @@ describe('CDP log rotation', () => {
 
     const ids = readIds(logFile)
     expect(ids[ids.length - 1]).toBe(14)
+
+    fs.rmSync(tmpDir, { recursive: true })
+  })
+})
+
+describe('CDP log privacy', () => {
+  it('drops screencast frames and redacts remote-control secrets', async () => {
+    const tmpDir = makeTmpDir()
+    const logFile = path.join(tmpDir, 'cdp.jsonl')
+    const logger = createCdpLogger({ logFilePath: logFile })
+    const secret = 'abc123'
+
+    logger.log({
+      timestamp: new Date().toISOString(),
+      direction: 'from-extension',
+      message: { method: 'Page.screencastFrame', params: { data: 'base64-frame' } },
+    })
+    logger.log({
+      timestamp: new Date().toISOString(),
+      direction: 'from-playwright',
+      message: {
+        method: 'Page.navigate',
+        params: {
+          url: `https://playwriter.dev/remote-control#${secret}`,
+          tunnel: `wss://${secret}-tunnel.playwriter.dev/extension`,
+          pathTunnel: `wss://playwriter.dev/tunnel/${secret}/extension`,
+        },
+      },
+    })
+    await logger.flush()
+
+    const content = fs.readFileSync(logFile, 'utf-8')
+    expect(content).not.toContain('Page.screencastFrame')
+    expect(content).not.toContain(secret)
+    expect(content).toContain('[redacted]')
+
+    fs.rmSync(tmpDir, { recursive: true })
+  })
+
+  it('redacts remote-control secrets from relay logs', async () => {
+    const tmpDir = makeTmpDir()
+    const logFile = path.join(tmpDir, 'relay.log')
+    const logger = createFileLogger({ logFilePath: logFile })
+    const secret = 'abc123'
+
+    await logger.log({
+      viewer: `https://playwriter.dev/remote-control#${secret}`,
+      tunnel: `wss://${secret}-tunnel.playwriter.dev/extension`,
+    })
+    await logger.flush()
+
+    const content = fs.readFileSync(logFile, 'utf-8')
+    expect(content).not.toContain(secret)
+    expect(content).toContain('[redacted]')
 
     fs.rmSync(tmpDir, { recursive: true })
   })

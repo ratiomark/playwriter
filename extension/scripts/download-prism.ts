@@ -1,4 +1,4 @@
-// Downloads Prism.js assets into <outDir>/src/ for the welcome page.
+// Downloads Prism.js assets into <outDir>/src/ for welcome.html and tutorial.html.
 // Chrome extension CSP blocks external scripts, so we bundle them locally.
 import https from 'node:https'
 import fs from 'node:fs'

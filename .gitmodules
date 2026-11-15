@@ -2,3 +2,6 @@
 	path = playwright
 	url = https://github.com/ratiomark/playwright.git
 	branch = playwriter
+[submodule "patchright-playwriter"]
+	path = patchright-playwriter
+	url = https://github.com/remorses/patchright-playwriter.git

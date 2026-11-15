@@ -1,9 +1,9 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "playwriter-website",
-  "main": "spiceflow/cloudflare-entrypoint",
+  "main": "./src/server.tsx",
   "workers_dev": true,
-  "compatibility_date": "2026-06-14",
+  "compatibility_date": "2026-08-05",
   "compatibility_flags": ["nodejs_compat"],
   "placement": { "mode": "smart" },
 
@@ -18,7 +18,24 @@
     }
   ],
   "routes": [
-    { "pattern": "playwriter.dev/*", "zone_name": "playwriter.dev" }
+    { "pattern": "playwriter.dev/*", "zone_name": "playwriter.dev" },
+    { "pattern": "www.playwriter.dev", "custom_domain": true, "zone_name": "playwriter.dev" },
+    { "pattern": "*-tunnel.playwriter.dev/*", "zone_name": "playwriter.dev" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "REMOTE_CONTROL_TUNNEL", "class_name": "RemoteControlTunnel" }
+    ]
+  },
+  "ratelimits": [
+    {
+      "name": "REMOTE_CONTROL_RATE_LIMITER",
+      "namespace_id": "42305",
+      "simple": { "limit": 1000, "period": 60 }
+    }
+  ],
+  "migrations": [
+    { "tag": "remote-control-v1", "new_classes": ["RemoteControlTunnel"] }
   ],
   "secrets": {
     "required": [
@@ -42,7 +59,23 @@
       "name": "playwriter-website-preview",
       "workers_dev": true,
       "routes": [
-        { "pattern": "preview.playwriter.dev", "custom_domain": true, "zone_name": "playwriter.dev" }
+        { "pattern": "preview.playwriter.dev", "custom_domain": true, "zone_name": "playwriter.dev" },
+        { "pattern": "*-tunnel-preview.playwriter.dev/*", "zone_name": "playwriter.dev" }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "REMOTE_CONTROL_TUNNEL", "class_name": "RemoteControlTunnel" }
+        ]
+      },
+      "ratelimits": [
+        {
+          "name": "REMOTE_CONTROL_RATE_LIMITER",
+          "namespace_id": "42306",
+          "simple": { "limit": 10000, "period": 60 }
+        }
+      ],
+      "migrations": [
+        { "tag": "remote-control-v1", "new_classes": ["RemoteControlTunnel"] }
       ],
       "d1_databases": [
         {

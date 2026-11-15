@@ -27,7 +27,7 @@ export interface EditResult {
  *
  * @example
  * ```ts
- * const cdp = await getCDPSession({ page })
+ * const cdp = await getCDPSession({ page: state.page })
  * const editor = new Editor({ cdp })
  * await editor.enable()
  *

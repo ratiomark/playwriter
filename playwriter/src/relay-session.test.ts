@@ -6,6 +6,10 @@ import { getCDPSessionForPage } from './cdp-session.js'
 import { Debugger } from './debugger.js'
 import { Editor } from './editor.js'
 import { PlaywrightExecutor } from './executor.js'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import dedent from 'string-dedent'
 import {
   setupTestContext,
   cleanupTestContext,
@@ -136,8 +140,9 @@ describe('CDP Session Tests', () => {
     })
 
     const result = await executor.execute(js`
-            const sessionA = await getCDPSession({ page })
-            const sessionB = await getCDPSession({ page })
+            const target = context.pages().findLast((p) => p.url().includes('debugger-step'))
+            const sessionA = await getCDPSession({ page: target })
+            const sessionB = await getCDPSession({ page: target })
             await sessionA.send('Runtime.evaluate', { expression: '1 + 1', returnByValue: true })
             const evalResult = await sessionB.send('Runtime.evaluate', { expression: '2 + 2', returnByValue: true })
             return evalResult.result.value
@@ -149,6 +154,43 @@ describe('CDP Session Tests', () => {
     await page.close()
   }, 60000)
 
+  it('should import local ESM modules from the session cwd', async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'playwriter-local-import-'))
+    fs.writeFileSync(
+      path.join(cwd, 'page-info.mjs'),
+      dedent`
+        import path from 'node:path'
+
+        export async function getPageInfo({ page }) {
+          return { titleType: typeof await page.title(), file: path.basename('/tmp/helper.mjs') }
+        }
+      `,
+    )
+    const executor = new PlaywrightExecutor({
+      cdpConfig: { port: TEST_PORT },
+      cwd,
+      logger: {
+        log: () => {},
+        error: () => {},
+      },
+    })
+
+    const result = await executor.execute(js`
+      const { getPageInfo } = await import('./page-info.mjs')
+      const page = await context.newPage()
+      try {
+        return await getPageInfo({ page })
+      } finally {
+        await page.close()
+      }
+    `)
+
+    expect(result).toMatchObject({
+      isError: false,
+      text: "[return value] { titleType: 'string', file: 'helper.mjs' }",
+    })
+  }, 60000)
+
   it('should list scripts with Debugger class', async () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
@@ -158,6 +200,7 @@ describe('CDP Session Tests', () => {
     await page.setContent(`
       <html>
         <head>
+          <title>script-list-test</title>
           <script src="data:text/javascript,function hello() { return 1; }"></script>
           <script src="data:text/javascript,function world() { return 2; }"></script>
         </head>
@@ -172,10 +215,14 @@ describe('CDP Session Tests', () => {
     await new Promise((r) => setTimeout(r, 100))
 
     const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
-    const cdpPage = browser
-      .contexts()[0]
-      .pages()
-      .find((p) => p.url().startsWith('about:'))
+    const cdpPages = browser.contexts()[0].pages()
+    const cdpPage = (
+      await Promise.all(
+        cdpPages.map(async (candidate) => {
+          return { candidate, title: await candidate.title() }
+        }),
+      )
+    ).find((entry) => entry.title === 'script-list-test')?.candidate
     expect(cdpPage).toBeDefined()
 
     const wsUrl = getCdpUrl({ port: TEST_PORT })
@@ -409,6 +456,50 @@ describe('CDP Session Tests', () => {
     await page.close()
   }, 60000)
 
+  it('should not break a pending evaluate when a second client connects', async () => {
+    const browserContext = getBrowserContext()
+    const serviceWorker = await getExtensionServiceWorker(browserContext)
+
+    await serviceWorker.evaluate(async () => {
+      await globalThis.disconnectEverything()
+    })
+
+    const page = await browserContext.newPage()
+    await page.goto('https://example.com/?test=shared-evaluate')
+    await page.bringToFront()
+
+    await serviceWorker.evaluate(async () => {
+      await globalThis.toggleExtensionForActiveTab()
+    })
+    await new Promise((r) => setTimeout(r, 100))
+
+    const browserA = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const pageA = browserA
+      .contexts()[0]
+      .pages()
+      .find((p) => p.url().includes('shared-evaluate'))
+    expect(pageA).toBeDefined()
+
+    const pending = pageA!.evaluate(async () => {
+      await new Promise((r) => setTimeout(r, 2000))
+      return 'done'
+    })
+    const pendingResult = pending.then(
+      (value) => ({ value }),
+      (error: Error) => ({ error: error.message.split('\n')[0] }),
+    )
+    await new Promise((r) => setTimeout(r, 200))
+
+    const browserB = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+
+    expect(await pendingResult).toEqual({ value: 'done' })
+    expect(await pageA!.evaluate(() => 1 + 1)).toBe(2)
+
+    await safeCloseCDPBrowser(browserB)
+    await safeCloseCDPBrowser(browserA)
+    await page.close()
+  }, 60000)
+
   it('should return correct targets for multiple pages via Target.getTargets', async () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
@@ -470,6 +561,40 @@ describe('CDP Session Tests', () => {
     await browser.close()
     await page1.close()
     await page2.close()
+  }, 60000)
+
+  it('should reject an explicit stale target instead of returning another target', async () => {
+    const browserContext = getBrowserContext()
+    const serviceWorker = await getExtensionServiceWorker(browserContext)
+
+    await serviceWorker.evaluate(async () => {
+      await globalThis.disconnectEverything()
+    })
+
+    const page = await browserContext.newPage()
+    await page.goto('https://example.com/')
+    await page.bringToFront()
+    await serviceWorker.evaluate(async () => {
+      await globalThis.toggleExtensionForActiveTab()
+    })
+
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const connectedPage = browser
+      .contexts()[0]
+      .pages()
+      .find((candidatePage) => {
+        return candidatePage.url() === 'https://example.com/'
+      })
+    expect(connectedPage).toBeDefined()
+
+    const cdpSession = await getCDPSessionForPage({ page: connectedPage! })
+    await expect(cdpSession.send('Target.getTargetInfo', { targetId: 'stale-target-id' })).rejects.toThrow(
+      'Target not found: stale-target-id',
+    )
+
+    await cdpSession.detach()
+    await browser.close()
+    await page.close()
   }, 60000)
 
   it('should create CDP session for page after navigation', async () => {
@@ -734,6 +859,12 @@ describe('CDP Session Tests', () => {
       .find((p) => p.url().includes('example.com'))
     expect(cdpPage).toBeDefined()
 
+    // example.com no longer has an h1, so add our own click target
+    await cdpPage!.evaluate(() => {
+      const heading = document.createElement('h1')
+      heading.textContent = 'Click target'
+      document.body.prepend(heading)
+    })
     const h1Bounds = await cdpPage!.locator('h1').boundingBox()
     expect(h1Bounds).toBeDefined()
     console.log('H1 bounding box:', h1Bounds)
@@ -1227,149 +1358,91 @@ describe('Service Worker Target Tests', () => {
   }, 60000)
 })
 
-// --- Auto-enable Tests ---
+// --- No default page ---
 
-describe('Auto-enable Tests', () => {
+describe('No default page', () => {
   let testCtx: TestContext | null = null
   let client: Awaited<ReturnType<typeof createMCPClient>>['client']
   let cleanup: (() => Promise<void>) | null = null
 
   beforeAll(async () => {
-    process.env.PLAYWRITER_AUTO_ENABLE = '1'
-    testCtx = await setupTestContext({ port: TEST_PORT, tempDirPrefix: 'pw-auto-test-' })
-
+    testCtx = await setupTestContext({ port: TEST_PORT, tempDirPrefix: 'pw-no-default-page-' })
     const result = await createMCPClient({ port: TEST_PORT })
     client = result.client
     cleanup = result.cleanup
-
-    // Disconnect all tabs to start with a clean state
-    const serviceWorker = await getExtensionServiceWorker(testCtx.browserContext)
-    await serviceWorker.evaluate(async () => {
-      await globalThis.disconnectEverything()
-    })
-    await new Promise((r) => setTimeout(r, 100))
   }, 600000)
 
   afterAll(async () => {
-    delete process.env.PLAYWRITER_AUTO_ENABLE
     await cleanupTestContext(testCtx, cleanup)
     cleanup = null
     testCtx = null
   })
 
-  const getBrowserContext = () => {
+  it('never opens a tab when code only uses context and zero tabs exist', async () => {
     if (!testCtx?.browserContext) throw new Error('Browser not initialized')
-    return testCtx.browserContext
-  }
-
-  it('should auto-create a tab when Playwright connects and no tabs exist', async () => {
-    const browserContext = getBrowserContext()
+    const browserContext = testCtx.browserContext
     const serviceWorker = await getExtensionServiceWorker(browserContext)
-
     await serviceWorker.evaluate(async () => {
       await globalThis.disconnectEverything()
     })
-    await new Promise((r) => setTimeout(r, 100))
+    const connectedTabs = async () => {
+      return serviceWorker.evaluate(() => {
+        return globalThis.getExtensionState().tabs.size
+      })
+    }
+    const chromeTabsBefore = browserContext.pages().length
+    expect(await connectedTabs()).toBe(0)
 
-    const tabCountBefore = await serviceWorker.evaluate(() => {
-      const state = globalThis.getExtensionState()
-      return state.tabs.size
+    // reset forces a fresh relay connection with zero tabs (the relay used to auto-create one)
+    const resetResult = await client.callTool({ name: 'reset', arguments: {} })
+    expect((resetResult as any).content[0].text).toMatchInlineSnapshot(`"Connection reset successfully. 0 page(s) available."`)
+
+    // SDK-style code that opens and closes its own page, then a context-only call
+    const sdkResult = await client.callTool({
+      name: 'execute',
+      arguments: {
+        code: js`
+          const p = await context.newPage()
+          try {
+            await p.setContent('<h1>sdk</h1>')
+          } finally {
+            await p.close()
+          }
+          return context.pages().length
+        `,
+      },
     })
-    expect(tabCountBefore).toBe(0)
+    const nextResult = await client.callTool({
+      name: 'execute',
+      arguments: { code: 'context.pages().length' },
+    })
 
-    const previousAutoEnable = process.env.PLAYWRITER_AUTO_ENABLE
-    delete process.env.PLAYWRITER_AUTO_ENABLE
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT })).finally(() => {
-      if (previousAutoEnable === undefined) {
-        delete process.env.PLAYWRITER_AUTO_ENABLE
-        return
+    expect({
+      sdk: (sdkResult as any).content[0].text,
+      next: (nextResult as any).content[0].text,
+    }).toMatchInlineSnapshot(`
+      {
+        "next": "[return value] 0",
+        "sdk": "[return value] 0",
       }
-      process.env.PLAYWRITER_AUTO_ENABLE = previousAutoEnable
-    })
-
-    const pages = browser.contexts()[0].pages()
-    expect(pages.length).toBeGreaterThan(0)
-    expect(pages.length).toBe(1)
-
-    const autoCreatedPage = pages[0]
-    expect(autoCreatedPage.url()).toBe('about:blank')
-
-    const tabCountAfter = await serviceWorker.evaluate(() => {
-      const state = globalThis.getExtensionState()
-      return state.tabs.size
-    })
-    expect(tabCountAfter).toBe(1)
-
-    await autoCreatedPage.setContent('<h1>Auto-created page</h1>')
-    const title = await autoCreatedPage.locator('h1').textContent()
-    expect(title).toBe('Auto-created page')
-
-    await browser.close()
+    `)
+    expect(await connectedTabs()).toBe(0)
+    expect(browserContext.pages().length).toBe(chromeTabsBefore)
   }, 60000)
 
-  it('should auto-create a page when MCP executes with no connected pages', async () => {
-    const browserContext = getBrowserContext()
-    const serviceWorker = await getExtensionServiceWorker(browserContext)
-
-    await serviceWorker.evaluate(async () => {
-      await globalThis.disconnectEverything()
-    })
-    await new Promise((r) => {
-      setTimeout(r, 100)
-    })
-
-    const tabCountBefore = await serviceWorker.evaluate(() => {
-      const state = globalThis.getExtensionState()
-      return state.tabs.size
-    })
-    expect(tabCountBefore).toBe(0)
-
+  it('throws a helpful error when reading the page global', async () => {
     const result = await client.callTool({
       name: 'execute',
       arguments: {
         code: js`
-                    return { pageCount: context.pages().length, url: page.url() };
-                `,
+          try {
+            page.url()
+          } catch (e) {
+            return e.message
+          }
+        `,
       },
     })
-
-    expect((result as any).isError).toBeFalsy()
-    const text = (result as any).content[0].text
-    expect(text).toContain('pageCount')
-    expect(text).toContain('about:blank')
-
-    const tabCountAfter = await serviceWorker.evaluate(() => {
-      const state = globalThis.getExtensionState()
-      return state.tabs.size
-    })
-    expect(tabCountAfter).toBe(1)
-
-    await client.callTool({
-      name: 'execute',
-      arguments: {
-        code: js`
-                    await page.close();
-                    return { remaining: context.pages().length };
-                `,
-      },
-    })
-
-    await new Promise((r) => {
-      setTimeout(r, 100)
-    })
-
-    const afterCloseResult = await client.callTool({
-      name: 'execute',
-      arguments: {
-        code: js`
-                    return { pageCount: context.pages().length, url: page.url() };
-                `,
-      },
-    })
-
-    expect((afterCloseResult as any).isError).toBeFalsy()
-    const afterCloseText = (afterCloseResult as any).content[0].text
-    expect(afterCloseText).toContain('pageCount')
-    expect(afterCloseText).toContain('about:blank')
+    expect((result as any).content[0].text).toMatchInlineSnapshot(`"[return value] The global \`page\` was removed. Get a page from context instead: reuse one with \`context.pages().findLast((p) => p.url().includes('example.com'))\` (last = most recently opened), or create one with \`const page = await context.newPage()\`. Store it in \`state.page\` to reuse it across calls."`)
   }, 60000)
 })

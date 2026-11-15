@@ -1,9 +1,9 @@
-// Typed client for Browser Use Cloud API v3.
-// API reference: https://docs.browser-use.com/openapi/v3.json
+// Typed client for Browser Use Cloud API v4.
+// API reference: https://docs.browser-use.com/openapi/v4.json
 // Only used server-side in the website Worker. The bu_ API key never leaves
 // this process; CLI and relay only ever see the cdpUrl that comes back.
 
-const BU_BASE = 'https://api.browser-use.com/api/v3'
+const BU_BASE = 'https://api.browser-use.com/api/v4'
 
 /** Typed error from Browser Use API with HTTP status code.
  *  Use `error.status` to distinguish transient failures (500, 429)
@@ -73,11 +73,7 @@ export class BrowserUseClient {
     this.apiKey = apiKey
   }
 
-  private async request<T>(
-    method: string,
-    path: string,
-    body?: Record<string, unknown>,
-  ): Promise<T> {
+  private async request<T>(method: string, path: string, body?: Record<string, unknown>): Promise<T> {
     const url = `${BU_BASE}${path}`
     const headers: Record<string, string> = {
       'X-Browser-Use-API-Key': this.apiKey,

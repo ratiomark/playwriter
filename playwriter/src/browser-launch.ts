@@ -2,7 +2,6 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { EXTENSION_IDS } from './utils.js'
 
 export type BrowserLaunchOptions = {
   extensionPath: string
@@ -23,17 +22,11 @@ export function getBrowserLaunchArgs({
   noSandbox = false,
   url = 'about:blank',
 }: BrowserLaunchOptions): string[] {
-  const recordingFlags = EXTENSION_IDS.map((extensionId) => {
-    return `--allowlisted-extension-id=${extensionId}`
-  })
-
   const args = [
     `--user-data-dir=${path.resolve(userDataDir)}`,
     '--profile-directory=Default',
     '--no-first-run',
     '--no-default-browser-check',
-    '--auto-accept-this-tab-capture',
-    ...recordingFlags,
     `--disable-extensions-except=${path.resolve(extensionPath)}`,
     `--load-extension=${path.resolve(extensionPath)}`,
   ]

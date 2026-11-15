@@ -1,61 +1,88 @@
 /**
- * Screen recording utility for playwriter using chrome.tabCapture.
- * Recording happens in the extension context, so it survives page navigation.
+ * Screen recording to a file and live RTMP streaming.
  *
- * This module communicates with the relay server which forwards commands to the extension.
- * sessionId (pw-tab-* format) is used to identify which tab to record.
+ * Recording uses Chrome's native Page.startScreenRecording (Chrome 153+). Chrome
+ * encodes AV1 + Opus fragmented MP4 out of process; we drain the IO stream while
+ * it records, so stop is instant and a crash leaves a playable partial file:
+ *
+ *   Page.startScreenRecording ──> IO.read loop ──> .partial.mp4 (codec: 'av1')
+ *                                       └──> ffmpeg -i pipe:0 ──> H.264 file (codec: 'h264')
+ *
+ * Native recording and Page.startScreencast exclude each other per tab: Chrome
+ * answers "Screencast is already active" to the second one.
+ *
+ * Streaming needs H.264 frames in real time and audio on every platform, so it
+ * keeps the screencast pipeline below (no extension permission, no user click):
+ *
+ *   Page.captureScreenshot (seed) ─┐
+ *   Page.screencastFrame (jpeg) ───┴─> latest frame
+ *                                          │  wall-clock ticker writes the latest
+ *                                          ▼  frame once per output frame slot
+ *   audio-tap-client.ts ── binding ──> PCM queue ── ffmpeg pipe:3 (s16le 48k)
+ *                                          │
+ *                                          ▼
+ *              ffmpeg -f image2pipe -c:v mjpeg -i pipe:0 ──> mp4/webm file or RTMP
+ *
+ * Chrome only sends screencast frames when the compositor paints. The ticker
+ * repeats the last frame, so static pages still get correct video duration.
+ * With chrome.debugger attached, background tabs keep rendering and sending
+ * frames (see screencast-background-tab.test.ts).
+ *
+ * Captures and recordings live in the executor process, tied to the Playwright
+ * Page. The relay stops native recordings of a client that disconnects.
  */
 
-import os from 'node:os'
+import { spawn, type ChildProcess } from 'node:child_process'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
 import path from 'node:path'
-import type { BrowserContext, Page } from '@xmorse/playwright-core'
-import { shouldUseHeadlessByDefault } from './browser-config.js'
-import type {
-  StartRecordingResult,
-  StopRecordingResult,
-  IsRecordingResult,
-  CancelRecordingResult,
-  StartStreamParams,
-  StartStreamResult,
-  StopStreamResult,
-  StreamStatusResult,
-} from './protocol.js'
-import { GhostCursorController } from './ghost-cursor-controller.js'
+import util from 'node:util'
+import type { Writable } from 'node:stream'
+import { once } from 'node:events'
+import { setTimeout as delay } from 'node:timers/promises'
+import { fileURLToPath } from 'node:url'
+import type { Page } from '@xmorse/playwright-core'
+import { evaluateInPlaywriterWorld, getCDPSessionForPage, type PlaywrightCDPSessionAdapter } from './cdp-session.js'
+import { detectEncoder, runCommand } from './ffmpeg.js'
+import { mergeScreencastParams } from './relay-state.js'
+import type { GhostCursorController } from './ghost-cursor-controller.js'
 
-/**
- * Build headers for the relay's privileged /recording/* HTTP endpoints.
- * Reads PLAYWRITER_TOKEN from env so in-process callers (executor running
- * inside `playwriter serve --token …`) authenticate against their own relay.
- * The `serve` command sets the env var at startup.
- */
-function recordingHeaders(): Record<string, string> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  const token = process.env.PLAYWRITER_TOKEN
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`
-  }
-  return headers
-}
-
-/**
- * Generate a CLI command that starts a managed Playwriter browser with the
- * bundled extension preloaded. This enables screen recording without a manual
- * extension click on fresh automation sessions.
- */
-export function getChromeRestartCommand(): string {
-  const headlessFlag = shouldUseHeadlessByDefault({ platform: os.platform() }) ? ' --headless' : ''
-  return `playwriter browser start${headlessFlag}`
-}
-
+const AUDIO_SAMPLE_RATE = 48000
+/** s16le stereo */
+const AUDIO_BYTES_PER_SAMPLE = 4
+/** Audio is written this far behind the wall clock so page chunks (4096
+ *  samples, ~85 ms) arrive before their slot. Smaller values insert gaps. */
+const AUDIO_LATENCY_MS = 150
+/** If more audio than this is queued, the page clock ran ahead: drop the oldest. */
+const AUDIO_MAX_QUEUE_MS = 400
+/** Never buffer unbounded in this process: the encoder is too slow or stalled. */
+const MAX_PIPE_BUFFERED_BYTES = 64 * 1024 * 1024
+const STDERR_TAIL_SIZE = 20
 const DEFAULT_ASPECT_RATIO = { width: 16, height: 9 }
+const DEFAULT_JPEG_QUALITY = 90
+const DEFAULT_RECORDING_MAX_DURATION_MS = 60 * 60 * 1000
+/** Longest output edge: Retina 4K. Chrome never upscales past the viewport's device pixels. */
+const DEFAULT_RECORDING_MAX_SIZE = 3840
+const DEFAULT_RECORDING_FPS = 60
+const MAX_RECORDING_FPS = 120
+/** Chrome writes a fragment about every 2 s; poll faster so stop has little left to read. */
+const DRAIN_INTERVAL_MS = 200
+const IO_READ_CHUNK_BYTES = 4 * 1024 * 1024
+const FFMPEG_FINISH_TIMEOUT_MS = 60_000
+const MS_PER_SECOND = 1000
 
-/** Default max recording duration: 15 minutes in milliseconds */
-const DEFAULT_MAX_DURATION_MS = 15 * 60 * 1000
+interface Logger {
+  log(...args: unknown[]): void
+  error(...args: unknown[]): void
+}
+
+// ============================================================================
+// Pure helpers (snapshot tested)
+// ============================================================================
 
 /**
  * Compute the largest viewport that fits inside `current` at the target aspect ratio.
- * Never increases width or height beyond current values — only shrinks the
- * dimension that's "too large" relative to the target ratio.
+ * Never increases width or height beyond current values.
  */
 export function fitToAspectRatio(
   current: { width: number; height: number },
@@ -64,63 +91,1495 @@ export function fitToAspectRatio(
   const targetRatio = ratio.width / ratio.height
   const currentRatio = current.width / current.height
   if (currentRatio > targetRatio) {
-    // Too wide — keep height, shrink width
     return { width: Math.round(current.height * targetRatio), height: current.height }
   }
-  // Too tall (or already exact) — keep width, shrink height
   return { width: current.width, height: Math.round(current.width / targetRatio) }
 }
 
+/** Output size in device pixels, longest edge capped at maxSize, even for yuv420p. */
+export function computeCaptureSize(options: {
+  cssWidth: number
+  cssHeight: number
+  devicePixelRatio: number
+  maxSize: number
+}): { width: number; height: number } {
+  const { cssWidth, cssHeight, devicePixelRatio, maxSize } = options
+  const scale = Math.min(devicePixelRatio || 1, maxSize / Math.max(cssWidth, cssHeight))
+  const even = (value: number) => {
+    return Math.max(2, Math.round((value * scale) / 2) * 2)
+  }
+  return { width: even(cssWidth), height: even(cssHeight) }
+}
+
+/** ffmpeg inputs: JPEG frames on stdin, optional s16le PCM on fd 3. */
+function captureInputArgs(options: { fps: number; audio: boolean }): string[] {
+  const video = ['-f', 'image2pipe', '-c:v', 'mjpeg', '-framerate', String(options.fps), '-thread_queue_size', '512', '-i', 'pipe:0']
+  if (!options.audio) {
+    return video
+  }
+  return [
+    ...video,
+    '-f', 's16le', '-ar', String(AUDIO_SAMPLE_RATE), '-ac', '2', '-thread_queue_size', '512', '-i', 'pipe:3',
+  ]
+}
+
+/** Fix dimensions and SAR so viewport changes never reconfigure the encoder. */
+function fitFilter(options: { width: number; height: number }): string {
+  const { width, height } = options
+  return `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,setsar=1`
+}
+
+/** Bitrate for hardware and VP8 encoders, sized for screen content. */
+function screenBitrateKbps(options: { width: number; height: number; fps: number }): number {
+  const kbps = Math.round((options.width * options.height * options.fps * 0.1) / 1000)
+  return Math.min(20000, Math.max(2000, kbps))
+}
+
+/** H.264 video args for a file or stream, hardware encoder when available. */
+function h264Args(options: { codec: string; kbps: number }): string[] {
+  const { codec, kbps } = options
+  if (codec === 'libx264') {
+    return ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20']
+  }
+  if (codec === 'h264_videotoolbox') {
+    return ['-c:v', codec, '-b:v', `${kbps}k`, '-realtime', 'true']
+  }
+  return ['-c:v', codec, '-b:v', `${kbps}k`]
+}
+
 /**
- * Check if an error is related to missing activeTab permission for recording.
+ * ffmpeg argv that transcodes Chrome's native AV1/Opus fragmented MP4 from stdin
+ * to H.264/AAC while recording. Frames keep Chrome's variable timestamps; the
+ * fixed size makes segments of one recording concat with `-c copy`.
  */
-function isActiveTabPermissionError(error: string): boolean {
-  return (
-    error.includes('Extension has not been invoked') ||
-    error.includes('activeTab') ||
-    error.includes('enable recording')
-  )
+export function buildTranscodeFfmpegArgs(options: {
+  width: number
+  height: number
+  fps: number
+  audio: boolean
+  codec: string
+  outputPath: string
+}): string[] {
+  const { width, height, fps, audio, codec, outputPath } = options
+  const extension = path.extname(outputPath).toLowerCase()
+  const kbps = screenBitrateKbps({ width, height, fps })
+  return [
+    '-hide_banner', '-loglevel', 'error', '-nostdin',
+    '-f', 'mp4', '-i', 'pipe:0',
+    '-map', '0:v:0', ...(audio ? ['-map', '0:a:0?'] : []),
+    '-vf', fitFilter({ width, height }),
+    '-fps_mode', 'passthrough',
+    ...h264Args({ codec, kbps }),
+    ...(audio ? ['-c:a', 'aac', '-b:a', '160k'] : []),
+    // MP4 picks the track timescale from the guessed frame rate. Segments of one recording
+    // need the same one, else concat -c copy stretches the later ones. mkv always uses 1 ms.
+    ...(extension === '.mkv' ? [] : ['-video_track_timescale', '90000', '-movflags', '+faststart']),
+    '-y', outputPath,
+  ]
+}
+
+export interface StreamFfmpegOptions {
+  rtmpUrls: string[]
+  width: number
+  height: number
+  fps: number
+  videoBitrateKbps: number
+  audioBitrateKbps: number
+  /** true = page audio tap on pipe:3; false = silent track (X Live rejects streams without audio) */
+  audio: boolean
+  /** x264 preset, only applied for libx264 */
+  preset: string
+  /** ffmpeg -c:v value, e.g. libx264 or h264_videotoolbox */
+  codec: string
+  /** Keyframe interval in seconds. 3 = X Live recommended (and its max), 2 = Twitch. */
+  keyframeSeconds: number
+}
+
+/**
+ * ffmpeg argv for live RTMP streaming.
+ *
+ * - GOP = keyframeSeconds * fps with scene-cut keyframes off, for platform rules
+ * - `-tune zerolatency` only for libx264 (hardware encoders reject it)
+ * - audio is always input 1: the page tap or an infinite anullsrc, which
+ *   `-shortest` stops when the video input ends
+ * - multiple destinations use the tee muxer with onfail=ignore + use_fifo, so a
+ *   dead or stalled endpoint does not stop the others
+ */
+export function buildStreamFfmpegArgs(options: StreamFfmpegOptions): string[] {
+  const { rtmpUrls, width, height, fps, videoBitrateKbps, audioBitrateKbps, audio, preset, codec, keyframeSeconds } = options
+
+  if (rtmpUrls.length === 0) {
+    throw new Error('At least one RTMP destination is required')
+  }
+
+  const gop = Math.round(fps * keyframeSeconds)
+  const inputArgs = audio
+    ? captureInputArgs({ fps, audio: true })
+    : [...captureInputArgs({ fps, audio: false }), '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo']
+
+  const codecArgs: string[] = (() => {
+    const base = [
+      '-c:v', codec,
+      '-b:v', `${videoBitrateKbps}k`,
+      '-maxrate', `${videoBitrateKbps}k`,
+      '-bufsize', `${videoBitrateKbps * 2}k`,
+      '-g', String(gop),
+      '-keyint_min', String(gop),
+    ]
+    if (codec === 'libx264') {
+      return [...base, '-preset', preset, '-tune', 'zerolatency', '-sc_threshold', '0']
+    }
+    if (codec === 'h264_videotoolbox') {
+      return [...base, '-realtime', 'true']
+    }
+    return base
+  })()
+
+  const outputArgs: string[] = (() => {
+    if (rtmpUrls.length === 1) {
+      return ['-f', 'flv', rtmpUrls[0]]
+    }
+    const tee = rtmpUrls.map((url) => `[f=flv:onfail=ignore]${escapeTeeUrl(url)}`).join('|')
+    return [
+      '-flags', '+global_header',
+      '-f', 'tee',
+      '-use_fifo', '1',
+      '-fifo_options', 'attempt_recovery=1:recover_any_error=1',
+      tee,
+    ]
+  })()
+
+  return [
+    '-hide_banner',
+    '-nostdin',
+    ...inputArgs,
+    '-map', '0:v:0',
+    '-map', '1:a:0',
+    ...(audio ? [] : ['-shortest']),
+    '-vf', fitFilter({ width, height }),
+    '-r', String(fps),
+    ...codecArgs,
+    '-c:a', 'aac',
+    '-b:a', `${audioBitrateKbps}k`,
+    '-ar', '44100',
+    '-ac', '2',
+    ...outputArgs,
+  ]
+}
+
+/** Escape characters that are special to ffmpeg's tee muxer slave syntax. */
+export function escapeTeeUrl(url: string): string {
+  return url.replace(/([\\|\[\]])/g, '\\$1')
+}
+
+/**
+ * Redact the stream key from an RTMP URL for logging/status.
+ * File paths (used in tests) are returned as-is.
+ */
+export function redactStreamUrl(url: string): string {
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) {
+    return url
+  }
+  try {
+    const parsed = new URL(url)
+    return `${parsed.protocol}//${parsed.host}/…`
+  } catch {
+    return url.replace(/^([a-z][a-z0-9+.-]*:\/\/[^/]+).*$/i, '$1/…')
+  }
+}
+
+/** Parse an ffmpeg progress line like:
+ *  `frame=  123 fps= 30 q=28.0 size=1024KiB time=00:00:04.10 bitrate=2045.6kbits/s drop=0 speed=1x` */
+export function parseFfmpegProgressLine(line: string): {
+  fps?: number
+  bitrateKbps?: number
+  droppedFrames?: number
+} | null {
+  if (!line.includes('frame=')) {
+    return null
+  }
+  const fpsMatch = line.match(/\bfps=\s*([\d.]+)/)
+  const bitrateMatch = line.match(/\bbitrate=\s*([\d.]+)kbits\/s/)
+  const dropMatch = line.match(/\bdrop=\s*(\d+)/)
+  return {
+    fps: fpsMatch ? Number(fpsMatch[1]) : undefined,
+    bitrateKbps: bitrateMatch ? Number(bitrateMatch[1]) : undefined,
+    droppedFrames: dropMatch ? Number(dropMatch[1]) : undefined,
+  }
+}
+
+// ============================================================================
+// PageCapture: screencast + audio tap + ffmpeg, paced by a wall-clock ticker
+// ============================================================================
+
+/** Captures per page. They share one CDP session, so one Page.stopScreencast
+ *  would stop all of them: the last one to stop sends it. */
+const capturesByPage = new Map<Page, Set<PageCapture>>()
+
+let audioTapCode: string | null = null
+
+function getAudioTapCode(): string {
+  if (audioTapCode) {
+    return audioTapCode
+  }
+  const currentDir = path.dirname(fileURLToPath(import.meta.url))
+  audioTapCode = fs.readFileSync(path.join(currentDir, '..', 'dist', 'audio-tap-client.js'), 'utf-8')
+  return audioTapCode
+}
+
+export interface CaptureStats {
+  /** Frames written to ffmpeg (constant rate, repeats included) */
+  videoFrames: number
+  /** Frames received from Chrome's screencast */
+  capturedFrames: number
+  /** Non-silent audio chunks received from the page */
+  audioChunks: number
+  /** Encoder output fps parsed from ffmpeg progress lines */
+  ffmpegFps?: number
+  /** Encoder output bitrate in kbps parsed from ffmpeg progress lines */
+  ffmpegBitrateKbps?: number
+  /** Dropped frames parsed from ffmpeg progress lines */
+  droppedFrames?: number
+}
+
+export interface CaptureResult {
+  /** Media duration in ms (frames written / fps) */
+  duration: number
+  /** Set when ffmpeg failed, was stalled, or exited non-zero */
+  error?: Error
+}
+
+interface PageCaptureOptions {
+  page: Page
+  fps: number
+  audio: boolean
+  size: { width: number; height: number }
+  quality?: number
+  buildArgs: (input: { width: number; height: number; fps: number; audio: boolean }) => string[]
+  /** Applied to stderr lines before they are kept (hide RTMP stream keys) */
+  redact?: (line: string) => string
+  logger?: Logger
+}
+
+export class PageCapture {
+  readonly page: Page
+  readonly fps: number
+  readonly audio: boolean
+  readonly width: number
+  readonly height: number
+  readonly startedAt = Date.now()
+  readonly stats: CaptureStats = { videoFrames: 0, capturedFrames: 0, audioChunks: 0 }
+  /** Resolves once ffmpeg exited and page hooks are removed */
+  readonly done: Promise<CaptureResult>
+
+  private readonly session: PlaywrightCDPSessionAdapter
+  private readonly ffmpeg: ChildProcess
+  private readonly videoIn: Writable
+  private readonly audioIn: Writable | null
+  private readonly logger?: Logger
+  private readonly redact: (line: string) => string
+  private readonly stderrTail: string[] = []
+  private clockStart = performance.now()
+  private ticker: ReturnType<typeof setInterval> | null = null
+  /** Hooks on the page, removed at the end */
+  private pageCleanups: Array<() => Promise<unknown>> = []
+  private latestFrame: Buffer = Buffer.alloc(0)
+  private screencastParams: { format: 'jpeg'; quality: number; maxWidth: number; maxHeight: number; everyNthFrame: number }
+  private rateWindow = { startedAt: performance.now(), frames: 0 }
+  private audioQueue: Buffer[] = []
+  private audioQueuedBytes = 0
+  private samplesWritten = 0
+  private failure: Error | null = null
+  private finishing = false
+  private killed = false
+  private resolveDone!: (result: CaptureResult) => void
+
+  private constructor(options: {
+    opts: PageCaptureOptions
+    session: PlaywrightCDPSessionAdapter
+    ffmpeg: ChildProcess
+    size: { width: number; height: number }
+  }) {
+    const { opts, session, ffmpeg, size } = options
+    this.page = opts.page
+    this.fps = opts.fps
+    this.audio = opts.audio
+    this.width = size.width
+    this.height = size.height
+    this.logger = opts.logger
+    this.redact = opts.redact || ((line) => line)
+    this.session = session
+    this.ffmpeg = ffmpeg
+    this.videoIn = ffmpeg.stdin!
+    this.audioIn = opts.audio ? (ffmpeg.stdio[3] as Writable) : null
+    this.screencastParams = {
+      format: 'jpeg',
+      quality: opts.quality ?? DEFAULT_JPEG_QUALITY,
+      maxWidth: size.width,
+      maxHeight: size.height,
+      everyNthFrame: 1,
+    }
+    this.done = new Promise((resolve) => {
+      this.resolveDone = resolve
+    })
+  }
+
+  static async start(opts: PageCaptureOptions): Promise<PageCapture> {
+    const { page, fps, audio, size } = opts
+    const session = await getCDPSessionForPage({ page })
+    const args = opts.buildArgs({ width: size.width, height: size.height, fps, audio })
+    opts.logger?.log(`[capture] ffmpeg ${args.map(opts.redact || ((arg) => arg)).join(' ')}`)
+    const ffmpeg = spawn('ffmpeg', args, {
+      stdio: ['pipe', 'ignore', 'pipe', audio ? 'pipe' : 'ignore'],
+      windowsHide: true,
+    })
+    const spawnError = await new Promise<Error | null>((resolve) => {
+      ffmpeg.once('spawn', () => {
+        resolve(null)
+      })
+      ffmpeg.once('error', (error) => {
+        const missing = (error as NodeJS.ErrnoException).code === 'ENOENT'
+        resolve(missing ? new Error('ffmpeg not found. Install ffmpeg to record or stream.') : error)
+      })
+    })
+    if (spawnError) {
+      throw spawnError
+    }
+
+    const capture = new PageCapture({ opts, session, ffmpeg, size })
+    capture.wireProcess()
+    try {
+      await capture.attachPage()
+      capture.startTicker()
+    } catch (error) {
+      await capture.abort()
+      throw new Error('Could not start page capture', { cause: error })
+    }
+    return capture
+  }
+
+  /** Stop capturing, flush, and wait for ffmpeg to finish the output. */
+  stop(): Promise<CaptureResult> {
+    if (!this.finishing) {
+      this.finishing = true
+      this.stopTicker()
+      this.tick({ final: true })
+      void this.detach().finally(() => {
+        this.videoIn.end()
+        this.audioIn?.end()
+        this.killAfter(30_000)
+      })
+    }
+    return this.done
+  }
+
+  /** Stop without finishing the output. */
+  abort(): Promise<CaptureResult> {
+    if (!this.finishing) {
+      this.finishing = true
+      this.stopTicker()
+      void this.detach()
+    }
+    this.killed = true
+    this.failure ||= new Error('Capture was cancelled')
+    this.ffmpeg.kill('SIGKILL')
+    return this.done
+  }
+
+  get error(): Error | null {
+    return this.failure
+  }
+
+  get stderr(): string[] {
+    return [...this.stderrTail]
+  }
+
+  private wireProcess(): void {
+    this.ffmpeg.stdin?.on('error', () => {})
+    this.audioIn?.on('error', () => {})
+    this.wireStderr()
+    this.ffmpeg.once('close', (code, signal) => {
+      this.stopTicker()
+      const error = (() => {
+        if (this.failure) {
+          return this.failure
+        }
+        if (this.killed) {
+          return undefined
+        }
+        if (code === 0) {
+          return this.finishing ? undefined : new Error('ffmpeg exited before the capture was stopped')
+        }
+        const tail = this.stderrTail.slice(-5).join('\n')
+        return new Error(`ffmpeg exited with ${signal || `code ${code}`}${tail ? `:\n${tail}` : ''}`)
+      })()
+      if (error) {
+        this.failure = error
+      }
+      if (error && !this.killed) {
+        this.logger?.error('[capture] failed:', error.message)
+      }
+      void this.detach().finally(() => {
+        this.resolveDone({ duration: Math.round((this.stats.videoFrames * 1000) / this.fps), error })
+      })
+    })
+  }
+
+  private startTicker(): void {
+    this.clockStart = performance.now()
+    this.ticker = setInterval(() => {
+      this.tick({ final: false })
+    }, 1000 / this.fps)
+  }
+
+  private stopTicker(): void {
+    if (this.ticker) {
+      clearInterval(this.ticker)
+      this.ticker = null
+    }
+  }
+
+  /** Hook the page: frame source, close listeners, audio tap. */
+  private async attachPage(): Promise<void> {
+    const page = this.page
+
+    const onClose = () => {
+      void this.stop()
+    }
+    page.once('close', onClose)
+    const browser = page.context().browser()
+    browser?.once('disconnected', onClose)
+    this.pageCleanups.push(async () => {
+      page.off('close', onClose)
+      browser?.off('disconnected', onClose)
+    })
+
+    await this.attachScreencast()
+    if (this.audio) {
+      await this.attachAudio()
+    }
+  }
+
+  private async attachScreencast(): Promise<void> {
+    const { session, page } = this
+    const capturedFrames = this.stats.capturedFrames
+    let resolveFirstFrame!: () => void
+    const firstFrame = new Promise<void>((resolve) => {
+      resolveFirstFrame = resolve
+    })
+    const onFrame = (event: { data: string }) => {
+      this.latestFrame = Buffer.from(event.data, 'base64')
+      this.stats.capturedFrames += 1
+      this.rateWindow.frames += 1
+      resolveFirstFrame()
+    }
+    session.on('Page.screencastFrame', onFrame)
+    const siblings = capturesByPage.get(page) || new Set<PageCapture>()
+    siblings.add(this)
+    capturesByPage.set(page, siblings)
+    this.pageCleanups.push(async () => {
+      session.off('Page.screencastFrame', onFrame)
+      siblings.delete(this)
+      if (siblings.size > 0) {
+        await this.sendScreencast({ page, session })
+        return
+      }
+      capturesByPage.delete(page)
+      await session.send('Page.stopScreencast')
+    })
+    await this.sendScreencast({ page, session })
+    if (this.stats.capturedFrames > capturedFrames) {
+      return
+    }
+    // Start screencast first: it wakes the compositor on pages where screenshots stall.
+    // A live frame makes the seed optional; a late seed must not overwrite newer frames.
+    await Promise.race([
+      firstFrame,
+      this.screenshot().then((frame) => {
+        if (!this.finishing && this.stats.capturedFrames === capturedFrames) {
+          this.latestFrame = frame
+        }
+      }),
+    ])
+  }
+
+  private async attachAudio(): Promise<void> {
+    const { session } = this
+    const bindingName = `__playwriterAudio_${crypto.randomUUID().replace(/-/g, '')}`
+    const source = `${getAudioTapCode()}\n;globalThis.__playwriterAudioTap(${JSON.stringify(bindingName)})`
+
+    const onBinding = (event: { name: string; payload: string }) => {
+      if (event.name !== bindingName) {
+        return
+      }
+      const pcm = (() => {
+        try {
+          return (JSON.parse(event.payload) as { pcm?: string }).pcm
+        } catch {
+          return undefined
+        }
+      })()
+      if (!pcm || this.finishing) {
+        return
+      }
+      const chunk = Buffer.from(pcm, 'base64')
+      this.audioQueue.push(chunk)
+      this.audioQueuedBytes += chunk.length
+      this.stats.audioChunks += 1
+    }
+    session.on('Runtime.bindingCalled', onBinding)
+    await session.send('Runtime.addBinding', { name: bindingName })
+    const { identifier } = await session.send('Page.addScriptToEvaluateOnNewDocument', { source })
+    this.pageCleanups.push(async () => {
+      session.off('Runtime.bindingCalled', onBinding)
+      await Promise.allSettled([
+        session.send('Page.removeScriptToEvaluateOnNewDocument', { identifier }),
+        session.send('Runtime.evaluate', { expression: `globalThis.__playwriterAudioTapStop?.(${JSON.stringify(bindingName)})` }),
+        session.send('Runtime.removeBinding', { name: bindingName }),
+      ])
+    })
+    await session.send('Runtime.evaluate', { expression: source })
+  }
+
+  private async screenshot(): Promise<Buffer> {
+    const { data } = await this.session.send('Page.captureScreenshot', {
+      format: 'jpeg',
+      quality: this.screencastParams.quality,
+      optimizeForSpeed: true,
+    })
+    return Buffer.from(data, 'base64')
+  }
+
+  /**
+   * Captures of one page share one CDP session, so the relay sees one client:
+   * merge their params here. The relay merges across clients (skill recorder,
+   * other sessions), so neither ever stops the other's frames.
+   */
+  private sendScreencast(target: { page: Page; session: PlaywrightCDPSessionAdapter } = { page: this.page, session: this.session }): Promise<unknown> {
+    const siblings = [...(capturesByPage.get(target.page) || [])]
+    return target.session.send('Page.startScreencast', mergeScreencastParams(siblings.map((capture) => {
+      return capture.screencastParams
+    })))
+  }
+
+  private detachPromise: Promise<void> | null = null
+
+  /** Final cleanup. Runs once. */
+  private detach(): Promise<void> {
+    this.detachPromise ||= this.detachPage()
+    return this.detachPromise
+  }
+
+  private async detachPage(): Promise<void> {
+    const cleanups = this.pageCleanups.splice(0).reverse()
+    for (const cleanup of cleanups) {
+      await cleanup().catch(() => {})
+    }
+  }
+
+  private killAfter(ms: number): void {
+    const timer = setTimeout(() => {
+      this.failure ||= new Error('Timeout waiting for ffmpeg to finish')
+      this.ffmpeg.kill('SIGKILL')
+    }, ms)
+    void this.done.finally(() => {
+      clearTimeout(timer)
+    })
+  }
+
+  private wireStderr(): void {
+    let remainder = ''
+    this.ffmpeg.stderr?.on('data', (data: Buffer) => {
+      remainder += data.toString()
+      // progress lines end with \r, errors with \n
+      const lines = remainder.split(/[\r\n]+/)
+      remainder = lines.pop() || ''
+      lines.forEach((raw) => {
+        const line = this.redact(raw.trim())
+        if (!line) {
+          return
+        }
+        const progress = parseFfmpegProgressLine(line)
+        if (progress) {
+          this.stats.ffmpegFps = progress.fps ?? this.stats.ffmpegFps
+          this.stats.ffmpegBitrateKbps = progress.bitrateKbps ?? this.stats.ffmpegBitrateKbps
+          this.stats.droppedFrames = progress.droppedFrames ?? this.stats.droppedFrames
+          return
+        }
+        this.stderrTail.push(line)
+        if (this.stderrTail.length > STDERR_TAIL_SIZE) {
+          this.stderrTail.shift()
+        }
+      })
+    })
+  }
+
+  /** Write every output frame slot and audio sample due up to now. */
+  private tick({ final }: { final: boolean }): void {
+    if (this.failure) {
+      return
+    }
+    const elapsedMs = performance.now() - this.clockStart
+    const frameTarget = Math.floor((elapsedMs * this.fps) / 1000)
+    while (this.stats.videoFrames < frameTarget) {
+      this.videoIn.write(this.latestFrame)
+      this.stats.videoFrames += 1
+    }
+    this.adaptFrameRate()
+    if (this.audioIn) {
+      const audioMs = final ? elapsedMs : elapsedMs - AUDIO_LATENCY_MS
+      this.writeAudio(Math.floor((audioMs * AUDIO_SAMPLE_RATE) / 1000))
+    }
+    const buffered = this.videoIn.writableLength + (this.audioIn?.writableLength || 0)
+    if (buffered > MAX_PIPE_BUFFERED_BYTES) {
+      this.failure = new Error(`ffmpeg is too slow: ${buffered} bytes buffered. Lower fps or maxSize.`)
+      this.logger?.error('[capture]', this.failure.message)
+      this.ffmpeg.kill('SIGKILL')
+    }
+  }
+
+  /**
+   * Chrome sends a frame per compositor frame: 120-144 per second on ProMotion
+   * and gaming displays, each a JPEG encode. Above 1.5x the output fps, ask for
+   * every Nth frame only. Adapts once: other clients can change the delivered
+   * rate, and static moments undercount.
+   */
+  private adaptFrameRate(): void {
+    const windowMs = performance.now() - this.rateWindow.startedAt
+    if (this.screencastParams.everyNthFrame > 1 || windowMs < 1000) {
+      return
+    }
+    const deliveredRate = (this.rateWindow.frames * 1000) / windowMs
+    this.rateWindow = { startedAt: performance.now(), frames: 0 }
+    if (deliveredRate < this.fps * 1.5) {
+      return
+    }
+    this.screencastParams = { ...this.screencastParams, everyNthFrame: Math.floor(deliveredRate / this.fps) }
+    this.sendScreencast().catch(() => {})
+  }
+
+  /** Write queued page audio up to targetSamples, filling gaps with silence. */
+  private writeAudio(targetSamples: number): void {
+    const audioIn = this.audioIn
+    if (!audioIn) {
+      return
+    }
+    const maxQueued = ((AUDIO_MAX_QUEUE_MS * AUDIO_SAMPLE_RATE) / 1000) * AUDIO_BYTES_PER_SAMPLE
+    while (this.audioQueuedBytes > maxQueued && this.audioQueue.length > 1) {
+      this.audioQueuedBytes -= this.audioQueue.shift()!.length
+    }
+    let needed = (targetSamples - this.samplesWritten) * AUDIO_BYTES_PER_SAMPLE
+    while (needed > 0) {
+      const chunk = this.audioQueue[0]
+      const bytes = chunk ? Math.min(chunk.length, needed) : needed
+      audioIn.write(chunk ? chunk.subarray(0, bytes) : Buffer.alloc(bytes))
+      if (chunk && bytes === chunk.length) {
+        this.audioQueue.shift()
+      } else if (chunk) {
+        this.audioQueue[0] = chunk.subarray(bytes)
+      }
+      if (chunk) {
+        this.audioQueuedBytes -= bytes
+      }
+      this.samplesWritten += bytes / AUDIO_BYTES_PER_SAMPLE
+      needed -= bytes
+    }
+  }
+}
+
+// ============================================================================
+// Recording to a file: Chrome's native Page.startScreenRecording
+// ============================================================================
+
+/**
+ * Which wall-clock time ends up in the video:
+ * - `real`: all of it, from start to stop. Agent think time is in the video.
+ * - `manual`: only time inside `wait(ms)`. The page keeps running in between,
+ *   but nothing is recorded, so agent latency between execute calls is cut.
+ */
+export type RecordingClock = 'real' | 'manual'
+
+/** `h264`: transcoded live by ffmpeg, plays everywhere. `av1`: Chrome's own output, no ffmpeg. */
+export type RecordingCodec = 'h264' | 'av1'
+
+/** Why a recording ended. Anything but `stopped` means nobody called stop(). */
+export type RecordingEndReason = 'stopped' | 'max-duration' | 'page-closed' | 'chrome-ended'
+
+/** Codecs each container can hold, default first */
+const RECORDING_CODECS: Record<string, RecordingCodec[]> = {
+  '.mp4': ['h264', 'av1'],
+  '.mov': ['h264'],
+  '.mkv': ['h264', 'av1'],
+  '.webm': ['av1'],
+}
+
+// TODO: drop this augmentation once the devtools-protocol dependency ships Page.startScreenRecording.
+// https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-startScreenRecording
+declare module 'devtools-protocol/types/protocol-mapping.js' {
+  namespace ProtocolMapping {
+    interface Commands {
+      'Page.startScreenRecording': {
+        paramsType: [{ frameRate?: number; maxWidth?: number; maxHeight?: number; audio?: boolean }?]
+        returnType: { stream: string }
+      }
+      'Page.stopScreenRecording': {
+        paramsType: []
+        returnType: { stream: string }
+      }
+    }
+  }
+}
+
+function nativeStartError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes("wasn't found")) {
+    return new Error('Recording needs Chrome 153 or newer (CDP Page.startScreenRecording is missing). Update Chrome.', { cause: error })
+  }
+  if (message.includes('Screencast is already active')) {
+    return new Error(
+      'This tab already has a screencast: another recording, a stream, the skill recorder or a live view. Stop it first.',
+      { cause: error },
+    )
+  }
+  return new Error(`Could not start recording: ${message}`, { cause: error })
+}
+
+/** Where drained bytes go: a file (av1) or ffmpeg's stdin (h264) */
+interface SegmentSink {
+  /** Resolves with an error when the writer failed (ffmpeg exited, disk full) */
+  write(chunk: Buffer): Promise<Error | undefined>
+  /** Flush and close. Resolves with the writer's error, if any. */
+  close(): Promise<Error | undefined>
+  abort(): void
+}
+
+function openFileSink(filePath: string): SegmentSink {
+  const file = fs.createWriteStream(filePath)
+  let failure: Error | undefined
+  const finished = new Promise<void>((resolve) => {
+    file.once('close', () => {
+      resolve()
+    })
+    file.once('error', (error) => {
+      failure ||= error
+      resolve()
+    })
+  })
+  return {
+    async write(chunk) {
+      if (!file.write(chunk)) {
+        await Promise.race([once(file, 'drain'), finished])
+      }
+      return failure
+    },
+    async close() {
+      file.end()
+      await finished
+      return failure
+    },
+    abort() {
+      file.destroy()
+    },
+  }
+}
+
+async function openFfmpegSink(options: { args: string[]; logger?: Logger }): Promise<SegmentSink> {
+  const { args, logger } = options
+  logger?.log(`[recording] ffmpeg ${args.join(' ')}`)
+  const ffmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true })
+  const spawnError = await new Promise<Error | null>((resolve) => {
+    ffmpeg.once('spawn', () => {
+      resolve(null)
+    })
+    ffmpeg.once('error', (error) => {
+      const missing = (error as NodeJS.ErrnoException).code === 'ENOENT'
+      resolve(missing ? new Error("ffmpeg not found. Install ffmpeg for H.264 output, or pass codec: 'av1' to record without it.") : error)
+    })
+  })
+  if (spawnError) {
+    throw spawnError
+  }
+  const stderrTail: string[] = []
+  ffmpeg.stderr?.on('data', (data: Buffer) => {
+    stderrTail.push(...data.toString().split('\n').filter(Boolean))
+    stderrTail.splice(0, Math.max(0, stderrTail.length - STDERR_TAIL_SIZE))
+  })
+  const stdin = ffmpeg.stdin!
+  stdin.on('error', () => {})
+  const exited = new Promise<Error | undefined>((resolve) => {
+    ffmpeg.once('close', (code, signal) => {
+      if (code === 0) {
+        resolve(undefined)
+        return
+      }
+      const tail = stderrTail.slice(-5).join('\n')
+      resolve(new Error(`ffmpeg exited with ${signal || `code ${code}`}${tail ? `:\n${tail}` : ''}`))
+    })
+  })
+  return {
+    async write(chunk) {
+      const accepted = stdin.write(chunk)
+      const error = accepted ? undefined : await Promise.race([once(stdin, 'drain').then(() => undefined), exited])
+      return error || (ffmpeg.exitCode !== null ? new Error('ffmpeg exited while recording') : undefined)
+    },
+    async close() {
+      stdin.end()
+      const timer = setTimeout(() => {
+        ffmpeg.kill('SIGKILL')
+      }, FFMPEG_FINISH_TIMEOUT_MS)
+      const error = await exited
+      clearTimeout(timer)
+      return error
+    },
+    abort() {
+      ffmpeg.kill('SIGKILL')
+    },
+  }
+}
+
+type SegmentEnd = Exclude<RecordingEndReason, 'max-duration'>
+
+/**
+ * One native recording run on one page, drained into a sink while it records.
+ * Chrome writes `ftyp moov (moof mdat)*`, so the bytes drained so far are always
+ * a playable file. A recording uses several segments for `wait()` windows and
+ * tab switches, joined at stop.
+ */
+class NativeSegment {
+  readonly page: Page
+  readonly path: string
+  readonly startedAt = performance.now()
+  /** Bytes received from Chrome */
+  bytes = 0
+  /** Resolves once every byte is written and the sink is closed */
+  readonly done: Promise<{ end: SegmentEnd; error?: Error }>
+  private endedAt: number | null = null
+  private readonly cdp: PlaywrightCDPSessionAdapter
+  private readonly handle: string
+  private readonly sink: SegmentSink
+  /** Aborted to stop waiting between reads: stop requested or page gone */
+  private readonly wake = new AbortController()
+  private chromeStopped = false
+  private end: SegmentEnd = 'stopped'
+  private stopPromise: Promise<{ end: SegmentEnd; error?: Error }> | null = null
+
+  private constructor(options: { page: Page; path: string; cdp: PlaywrightCDPSessionAdapter; handle: string; sink: SegmentSink }) {
+    this.page = options.page
+    this.path = options.path
+    this.cdp = options.cdp
+    this.handle = options.handle
+    this.sink = options.sink
+    this.done = this.run()
+  }
+
+  static async start(options: {
+    page: Page
+    path: string
+    fps: number
+    maxSize: number
+    audio: boolean
+    /** Set for h264: live transcode to this size with this ffmpeg encoder */
+    transcode: { encoder: string; width: number; height: number } | null
+    logger?: Logger
+  }): Promise<NativeSegment> {
+    const { page, fps, maxSize, audio, transcode, logger } = options
+    const sink = transcode
+      ? await openFfmpegSink({
+          args: buildTranscodeFfmpegArgs({ ...transcode, codec: transcode.encoder, fps, audio, outputPath: options.path }),
+          logger,
+        })
+      : openFileSink(options.path)
+    const cdp = await getCDPSessionForPage({ page })
+    // maxWidth and maxHeight are always sent: Chrome's own box is 800x600
+    const started = await cdp
+      .send('Page.startScreenRecording', { frameRate: fps, maxWidth: maxSize, maxHeight: maxSize, audio })
+      .then(
+        (result) => result,
+        (error: unknown) => nativeStartError(error),
+      )
+    if (started instanceof Error) {
+      sink.abort()
+      fs.rmSync(options.path, { force: true })
+      throw started
+    }
+    return new NativeSegment({ page, path: options.path, cdp, handle: started.stream, sink })
+  }
+
+  /** Wall time from start to the end of recording */
+  get wallMs(): number {
+    return (this.endedAt ?? performance.now()) - this.startedAt
+  }
+
+  /** Stop recording and wait until the file is complete. Safe to call more than once. */
+  stop(): Promise<{ end: SegmentEnd; error?: Error }> {
+    this.stopPromise ||= (async () => {
+      if (!this.page.isClosed()) {
+        const stopped = await this.cdp.send('Page.stopScreenRecording').then(
+          () => true,
+          () => false,
+        )
+        // "No active screen recording": Chrome ended it on its own
+        if (!stopped && !this.page.isClosed()) {
+          this.end = 'chrome-ended'
+        }
+      }
+      this.endedAt ??= performance.now()
+      this.chromeStopped = true
+      this.wake.abort()
+      return this.done
+    })()
+    return this.stopPromise
+  }
+
+  private async run(): Promise<{ end: SegmentEnd; error?: Error }> {
+    const onGone = () => {
+      this.wake.abort()
+    }
+    const browser = this.page.context().browser()
+    this.page.once('close', onGone)
+    browser?.once('disconnected', onGone)
+    const drainError = await this.drain()
+    this.page.off('close', onGone)
+    browser?.off('disconnected', onGone)
+    this.endedAt ??= performance.now()
+    await this.cdp.send('IO.close', { handle: this.handle }).catch(() => {})
+    const sinkError = await this.sink.close()
+    return { end: this.end, error: drainError || sinkError }
+  }
+
+  /** Read the stream until Chrome stopped and everything is read, or the page is gone. */
+  private async drain(): Promise<Error | undefined> {
+    while (true) {
+      if (this.page.isClosed()) {
+        this.end = 'page-closed'
+        return undefined
+      }
+      if (this.page.context().browser()?.isConnected() === false) {
+        this.end = 'chrome-ended'
+        return undefined
+      }
+      // A read sent before stop can answer after it: only a read sent after stop proves the end
+      const stoppedBeforeRead = this.chromeStopped
+      const read = await this.cdp.send('IO.read', { handle: this.handle, size: IO_READ_CHUNK_BYTES }).then(
+        (result) => result,
+        (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+      )
+      if (read instanceof Error) {
+        if (this.page.isClosed()) {
+          continue
+        }
+        // Chrome answers "Read failed" until it writes the first fragment (~2 s)
+        if (read.message.includes('Read failed') && this.bytes === 0) {
+          if (stoppedBeforeRead) {
+            return undefined
+          }
+          await this.pause()
+          continue
+        }
+        this.end = 'chrome-ended'
+        return read
+      }
+      if (read.data) {
+        const chunk = Buffer.from(read.data, read.base64Encoded ? 'base64' : 'utf8')
+        this.bytes += chunk.length
+        const writeError = await this.sink.write(chunk)
+        if (writeError) {
+          await this.cdp.send('Page.stopScreenRecording').catch(() => {})
+          this.end = 'chrome-ended'
+          return writeError
+        }
+      }
+      // While recording, eof only means "caught up"
+      if (!read.eof) {
+        continue
+      }
+      if (stoppedBeforeRead) {
+        return undefined
+      }
+      await this.pause()
+    }
+  }
+
+  private async pause(): Promise<void> {
+    await delay(DRAIN_INTERVAL_MS, undefined, { signal: this.wake.signal }).catch(() => {})
+  }
 }
 
 export interface StartRecordingOptions {
-  /** Target page to record */
   page: Page
-  /** CDP tab session ID (pw-tab-* format) to identify which tab to record */
-  sessionId?: string
-  /** Frame rate (default: 30) */
-  frameRate?: number
-  /** Video bitrate in bps (default: 2500000 = 2.5 Mbps) */
-  videoBitsPerSecond?: number
-  /** Audio bitrate in bps (default: 128000 = 128 kbps) */
-  audioBitsPerSecond?: number
-  /** Include audio from tab (default: false) */
-  audio?: boolean
-  /** Path to save the video file */
+  /** Output file. Container from the extension: .mp4 (default choice), .mov, .mkv, .webm */
   outputPath: string
-  /** Relay server port (default: 19988) */
-  relayPort?: number
-  /** Aspect ratio to fit viewport to before recording (default: { width: 16, height: 9 }).
-   *  Set to null to skip viewport resizing. */
-  aspectRatio?: { width: number; height: number } | null
-  /** Max recording duration in ms (default: 15 min = 900000). Auto-stops recording
-   *  when exceeded to prevent accidentally filling disk. Set to 0 or Infinity to disable. */
-  maxDurationMs?: number
+  /** `h264` (default; needs ffmpeg) or `av1` (Chrome's own output, no ffmpeg). .webm is always av1. */
+  codec?: RecordingCodec
+  /** Max frame rate (default 60, max 120). Chrome writes only changed frames, so idle pages cost little. */
+  frameRate?: number
+  /** Record tab audio (default false) */
+  audio?: boolean
+  /** Longest output edge in pixels (default 3840). Output is the viewport in device pixels, never upscaled. */
+  maxSize?: number
+  /** `real` (default) records all wall-clock time. `manual` records only inside `wait(ms)`. */
+  clock?: RecordingClock
+  logger?: Logger
 }
 
-export interface StopRecordingOptions {
-  /** Target page that is being recorded */
+export interface RecordingResult {
+  path: string
+  /** Recorded wall time in ms (for clock: 'manual', the sum of wait() windows) */
+  duration: number
+  /** File size in bytes */
+  size: number
+  endReason: RecordingEndReason
+}
+
+interface RecordedSegment {
+  segment: NativeSegment
+  /** clock: 'manual' window length; the video gets exactly this much time */
+  windowMs: number | null
+}
+
+/** A screen recording of one page (or several, with setPage), written to outputPath on stop. */
+export class ScreenRecording {
+  readonly outputPath: string
+  readonly codec: RecordingCodec
+  readonly clock: RecordingClock
+  readonly startedAt = Date.now()
+  /** Settles once the file is finished, also when the page closed on its own */
+  readonly result: Promise<RecordingResult>
+  private readonly fps: number
+  private readonly audio: boolean
+  private readonly maxSize: number
+  private readonly encoder: string | null
+  private readonly logger?: Logger
+  private currentPage: Page
+  private readonly segments: RecordedSegment[] = []
+  private active: NativeSegment | null = null
+  /** h264 output size, fixed by the first segment so segments concat with -c copy */
+  private outputSize: { width: number; height: number } | null = null
+  private ending: RecordingEndReason | null = null
+  private cancelled = false
+  /** Segment being started; finish() waits for it so no recording is left running */
+  private starting: Promise<unknown> | null = null
+  /** Unique prefix of the visible partial files, so recordings to one path never collide */
+  private readonly partialBase: string
+  private resolveEnding!: (reason: RecordingEndReason) => void
+  private unwatchPage: () => void = () => {}
+
+  private constructor(options: {
+    outputPath: string
+    codec: RecordingCodec
+    encoder: string | null
+    clock: RecordingClock
+    fps: number
+    audio: boolean
+    maxSize: number
+    page: Page
+    logger?: Logger
+  }) {
+    this.outputPath = options.outputPath
+    this.codec = options.codec
+    this.encoder = options.encoder
+    this.clock = options.clock
+    this.fps = options.fps
+    this.audio = options.audio
+    this.maxSize = options.maxSize
+    this.currentPage = options.page
+    this.logger = options.logger
+    const extension = path.extname(this.outputPath)
+    this.partialBase = path.join(
+      path.dirname(this.outputPath),
+      `${path.basename(this.outputPath, extension)}.${crypto.randomUUID().slice(0, 8)}.partial`,
+    )
+    const ended = new Promise<RecordingEndReason>((resolve) => {
+      this.resolveEnding = resolve
+    })
+    this.result = ended.then((reason) => {
+      return this.finish(reason)
+    })
+    // stop() and cancel() surface errors; avoid unhandled rejections otherwise
+    this.result.catch(() => {})
+    this.watchPage()
+  }
+
+  static async start(options: StartRecordingOptions): Promise<ScreenRecording> {
+    const outputPath = path.resolve(options.outputPath)
+    const extension = path.extname(outputPath).toLowerCase()
+    const codecs: RecordingCodec[] | undefined = RECORDING_CODECS[extension]
+    if (!codecs) {
+      throw new Error(`Unsupported recording extension "${extension}". Use .mp4, .mov, .mkv or .webm.`)
+    }
+    const codec = options.codec ?? codecs[0]
+    if (!codecs.includes(codec)) {
+      throw new Error(`${extension} files cannot hold ${codec} video. Use ${codecs.join(' or ')}, or another extension.`)
+    }
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true })
+    const recording = new ScreenRecording({
+      outputPath,
+      codec,
+      encoder: codec === 'h264' ? (await detectEncoder()).codec : null,
+      clock: options.clock ?? 'real',
+      fps: Math.min(MAX_RECORDING_FPS, Math.max(1, Math.round(options.frameRate ?? DEFAULT_RECORDING_FPS))),
+      audio: options.audio ?? false,
+      maxSize: options.maxSize ?? DEFAULT_RECORDING_MAX_SIZE,
+      page: options.page,
+      logger: options.logger,
+    })
+    if (recording.clock === 'real') {
+      await recording.startSegment({ windowMs: null }).catch(async (error: unknown) => {
+        await recording.cancel()
+        throw error
+      })
+    }
+    return recording
+  }
+
+  get page(): Page {
+    return this.currentPage
+  }
+
+  get isRecording(): boolean {
+    return this.ending === null
+  }
+
+  get isCancelled(): boolean {
+    return this.cancelled
+  }
+
+  /** Bytes received from Chrome so far */
+  get bytes(): number {
+    return this.segments.reduce((sum, entry) => sum + entry.segment.bytes, 0)
+  }
+
+  /** Record another page from now on. The output size stays the same. */
+  async setPage(page: Page): Promise<void> {
+    if (this.ending) {
+      throw new Error('Recording already stopped')
+    }
+    if (page === this.currentPage) {
+      return
+    }
+    this.unwatchPage()
+    this.currentPage = page
+    this.watchPage()
+    if (this.clock === 'manual') {
+      return
+    }
+    await this.stopActive()
+    await this.startSegment({ windowMs: null }).catch(async (error: unknown) => {
+      await this.stop()
+      throw new Error('Could not move the recording to the new page. The recording was stopped.', { cause: error })
+    })
+  }
+
+  /**
+   * Manual clock only. Record the next `ms` of real time, then pause again.
+   * The video grows by exactly `ms`.
+   */
+  async wait(ms: number): Promise<void> {
+    if (this.clock !== 'manual') {
+      throw new Error('wait() needs a recording started with clock: "manual"')
+    }
+    if (this.ending) {
+      throw new Error('Recording already stopped')
+    }
+    if (this.active) {
+      throw new Error('wait() is already running. Await it before calling it again.')
+    }
+    const segment = await this.startSegment({ windowMs: ms })
+    await Promise.race([delay(ms), segment.done])
+    if (this.active === segment) {
+      await this.stopActive()
+    }
+  }
+
+  /** Stop and finish the file. */
+  stop(reason: RecordingEndReason = 'stopped'): Promise<RecordingResult> {
+    this.end(reason)
+    return this.result
+  }
+
+  /** Stop and delete everything recorded. */
+  async cancel(): Promise<void> {
+    this.cancelled = true
+    this.end('stopped')
+    await this.result.catch(() => {})
+  }
+
+  private end(reason: RecordingEndReason): void {
+    if (this.ending) {
+      return
+    }
+    this.ending = reason
+    this.resolveEnding(reason)
+  }
+
+  private watchPage(): void {
+    const page = this.currentPage
+    const browser = page.context().browser()
+    const onClose = () => {
+      this.end('page-closed')
+    }
+    const onDisconnect = () => {
+      this.end('chrome-ended')
+    }
+    page.once('close', onClose)
+    browser?.once('disconnected', onDisconnect)
+    this.unwatchPage = () => {
+      page.off('close', onClose)
+      browser?.off('disconnected', onDisconnect)
+    }
+  }
+
+  private startSegment({ windowMs }: { windowMs: number | null }): Promise<NativeSegment> {
+    if (this.ending) {
+      return Promise.reject(new Error('Recording already stopped'))
+    }
+    const starting = this.openSegment({ windowMs })
+    this.starting = starting
+    void starting.catch(() => {}).finally(() => {
+      if (this.starting === starting) {
+        this.starting = null
+      }
+    })
+    return starting
+  }
+
+  private async openSegment({ windowMs }: { windowMs: number | null }): Promise<NativeSegment> {
+    const page = this.currentPage
+    const index = this.segments.length
+    // h264 segments are already in the output container; av1 segments are Chrome's MP4
+    const segmentExtension = this.codec === 'h264' ? path.extname(this.outputPath) : '.mp4'
+    const segmentPath = `${this.partialBase}${index === 0 ? '' : `-${index + 1}`}${segmentExtension}`
+    const transcode = this.encoder ? { encoder: this.encoder, ...(this.outputSize ||= await this.measure(page)) } : null
+    const segment = await NativeSegment.start({
+      page,
+      path: segmentPath,
+      fps: this.fps,
+      maxSize: this.maxSize,
+      audio: this.audio,
+      transcode,
+      logger: this.logger,
+    })
+    this.segments.push({ segment, windowMs })
+    this.active = segment
+    void segment.done.then((result) => {
+      if (this.active === segment && result.end !== 'stopped') {
+        this.end(result.end)
+      }
+    })
+    return segment
+  }
+
+  private async stopActive(): Promise<void> {
+    const segment = this.active
+    if (!segment) {
+      return
+    }
+    this.active = null
+    await segment.stop()
+  }
+
+  /** Chrome's output size: viewport in device pixels, fit in maxSize, never upscaled. */
+  private async measure(page: Page): Promise<{ width: number; height: number }> {
+    const viewport = await evaluateInPlaywriterWorld<{ width: number; height: number; dpr: number }>({
+      page,
+      expression: '({ width: innerWidth, height: innerHeight, dpr: devicePixelRatio })',
+    })
+    return computeCaptureSize({
+      cssWidth: viewport.width,
+      cssHeight: viewport.height,
+      devicePixelRatio: viewport.dpr,
+      maxSize: this.maxSize,
+    })
+  }
+
+  private async finish(reason: RecordingEndReason): Promise<RecordingResult> {
+    this.unwatchPage()
+    await this.starting?.catch(() => {})
+    await this.stopActive()
+    const results = await Promise.all(this.segments.map((entry) => entry.segment.done))
+    const partials = this.segments.map((entry) => entry.segment.path)
+    if (this.cancelled) {
+      partials.forEach((file) => fs.rmSync(file, { force: true }))
+      throw new Error('Recording was cancelled')
+    }
+    const failed = results.find((result) => result.error)?.error
+    if (failed) {
+      throw new Error(`Recording failed: ${failed.message}\nPartial files kept: ${partials.join(', ')}`, { cause: failed })
+    }
+    const recorded = this.segments.filter((entry) => entry.segment.bytes > 0)
+    this.segments.filter((entry) => entry.segment.bytes === 0).forEach((entry) => fs.rmSync(entry.segment.path, { force: true }))
+    if (recorded.length === 0) {
+      throw new Error(this.clock === 'manual' ? 'Nothing was recorded. Call wait(ms) to record.' : 'Chrome sent no video. The page closed or Chrome ended the recording right away.')
+    }
+    const durations = recorded.map((entry) => {
+      const wallMs = entry.segment.wallMs
+      return entry.windowMs === null ? wallMs : Math.min(entry.windowMs, wallMs)
+    })
+    await this.join({ files: recorded.map((entry) => entry.segment.path), durations })
+    return {
+      path: this.outputPath,
+      duration: Math.round(durations.reduce((sum, ms) => sum + ms, 0)),
+      size: fs.statSync(this.outputPath).size,
+      endReason: reason,
+    }
+  }
+
+  /** Move or concat segments into the output file. */
+  private async join({ files, durations }: { files: string[]; durations: number[] }): Promise<void> {
+    const extension = path.extname(this.outputPath).toLowerCase()
+    if (files.length === 1 && (this.codec === 'h264' || extension === '.mp4')) {
+      fs.renameSync(files[0], this.outputPath)
+      return
+    }
+    const listPath = `${this.partialBase}-list.txt`
+    const joinedPath = `${this.partialBase}-joined${path.extname(this.outputPath)}`
+    // The concat demuxer starts each file at the sum of the previous durations
+    const list = files
+      .map((file, index) => {
+        return `file '${file.replaceAll("'", "'\\''")}'\nduration ${(durations[index] / MS_PER_SECOND).toFixed(3)}`
+      })
+      .join('\n')
+    fs.writeFileSync(listPath, `${list}\n`)
+    try {
+      await runCommand({
+        bin: 'ffmpeg',
+        args: [
+          '-hide_banner', '-loglevel', 'error', '-nostdin',
+          '-f', 'concat', '-safe', '0', '-i', listPath,
+          '-c', 'copy',
+          ...(extension === '.mp4' || extension === '.mov' ? ['-movflags', '+faststart'] : []),
+          '-y', joinedPath,
+        ],
+      })
+    } catch (error) {
+      fs.rmSync(joinedPath, { force: true })
+      throw new Error(`Could not join recording segments. Partial files kept: ${files.join(', ')}`, { cause: error })
+    } finally {
+      fs.rmSync(listPath, { force: true })
+    }
+    fs.renameSync(joinedPath, this.outputPath)
+    files.forEach((file) => fs.rmSync(file, { force: true }))
+  }
+}
+
+/** Start recording a page to a video file. Call `stop()` on the result to save it. */
+export function startRecording(options: StartRecordingOptions): Promise<ScreenRecording> {
+  return ScreenRecording.start(options)
+}
+
+// ============================================================================
+// Live RTMP streaming
+// ============================================================================
+
+export interface StartStreamOptions {
   page: Page
-  /** CDP tab session ID (pw-tab-* format) to identify which tab to stop recording */
-  sessionId?: string
-  /** Relay server port (default: 19988) */
-  relayPort?: number
+  /** RTMP destination URLs (or any ffmpeg-writable flv target, e.g. a file path for testing) */
+  rtmpUrls: string[]
+  /** Output resolution as WxH (default 1920x1080, X Live recommended) */
+  resolution?: string
+  /** Output frame rate (default 30) */
+  fps?: number
+  /** Video bitrate in kbps (default 9000, X Live recommended) */
+  videoBitrateKbps?: number
+  /** Audio bitrate in kbps (default 128) */
+  audioBitrateKbps?: number
+  /** Keyframe interval in seconds (default 3, X Live recommended and its max; Twitch recommends 2) */
+  keyframeSeconds?: number
+  /** Stream page audio (default true). When false a silent track is sent, because X Live rejects streams without audio. */
+  audio?: boolean
+  /** x264 preset (default veryfast). Only applies to libx264. */
+  preset?: string
+  /** Video codec for ffmpeg -c:v (default: hardware encoder when available, else libx264) */
+  codec?: string
+  logger?: Logger
 }
 
-export interface RecordingState {
-  isRecording: boolean
+export interface StreamStatus {
+  streaming: boolean
   startedAt?: number
-  tabId?: number
+  /** Destinations with stream keys redacted */
+  destinations?: string[]
+  stats?: CaptureStats
+  /** Why the last stream ended unexpectedly (ffmpeg crash, RTMP failure) */
+  error?: string
 }
+
+/** A live stream of one page to RTMP destinations. Runs until stop() or the page closes. */
+export class ScreenStream {
+  readonly destinations: string[]
+  readonly capture: PageCapture
+
+  private constructor(options: { destinations: string[]; capture: PageCapture }) {
+    this.destinations = options.destinations
+    this.capture = options.capture
+  }
+
+  static async start(options: StartStreamOptions): Promise<ScreenStream> {
+    if (!options.rtmpUrls || options.rtmpUrls.length === 0) {
+      throw new Error('rtmpUrls is required')
+    }
+    const resolution = options.resolution || '1920x1080'
+    const resolutionMatch = resolution.match(/^(\d+)x(\d+)$/)
+    if (!resolutionMatch) {
+      throw new Error(`Invalid resolution "${resolution}", expected WxH like 1920x1080`)
+    }
+    const rawUrls = options.rtmpUrls
+    const redact = (line: string) => {
+      return rawUrls.reduce((acc, url) => {
+        return acc.replaceAll(url, redactStreamUrl(url))
+      }, line)
+    }
+    const codec = options.codec || (await detectEncoder()).codec
+    const capture = await PageCapture.start({
+      page: options.page,
+      fps: options.fps || 30,
+      audio: options.audio !== false,
+      size: { width: Number(resolutionMatch[1]), height: Number(resolutionMatch[2]) },
+      redact,
+      logger: options.logger,
+      buildArgs: (input) => {
+        return buildStreamFfmpegArgs({
+          rtmpUrls: rawUrls,
+          width: input.width,
+          height: input.height,
+          fps: input.fps,
+          audio: input.audio,
+          videoBitrateKbps: options.videoBitrateKbps || 9000,
+          audioBitrateKbps: options.audioBitrateKbps || 128,
+          preset: options.preset || 'veryfast',
+          codec,
+          keyframeSeconds: options.keyframeSeconds || 3,
+        })
+      },
+    })
+    return new ScreenStream({ destinations: rawUrls.map(redactStreamUrl), capture })
+  }
+
+  async stop(): Promise<{ duration: number; frames: number }> {
+    const result = await this.capture.stop()
+    if (result.error) {
+      throw result.error
+    }
+    return { duration: result.duration, frames: this.capture.stats.videoFrames }
+  }
+
+  status(): StreamStatus {
+    const error = this.capture.error
+    if (error) {
+      return { streaming: false, error: error.message }
+    }
+    return {
+      streaming: true,
+      startedAt: this.capture.startedAt,
+      destinations: this.destinations,
+      stats: { ...this.capture.stats },
+    }
+  }
+}
+
+// ============================================================================
+// Executor sandbox APIs: `recording.*` and `stream.*`
+// ============================================================================
 
 export interface ExecutionTimestamp {
   start: number
@@ -129,404 +1588,329 @@ export interface ExecutionTimestamp {
 
 interface RecordingTargetOptions {
   page?: Page
-  sessionId?: string
 }
 
-interface CreateRecordingApiOptions {
-  context: BrowserContext
-  defaultPage: Page
-  relayPort: number
-  ghostCursorController: GhostCursorController
-  onStart: () => void
-  onFinish: () => void
-  getExecutionTimestamps: () => ExecutionTimestamp[]
+const RECORDING_TARGET_REQUIRED =
+  'requires an explicit target tab, e.g. ({ page: state.page }). There is no default page; create one with `state.page = await context.newPage()`.'
+
+function requirePage(helper: string, target?: RecordingTargetOptions): Page {
+  if (!target?.page) {
+    throw new Error(`${helper} ${RECORDING_TARGET_REQUIRED}`)
+  }
+  return target.page
 }
 
-interface StartRecordingWithDefaultsOptions extends Omit<StartRecordingOptions, 'relayPort'> {}
-interface StopRecordingWithDefaultsOptions extends Omit<StopRecordingOptions, 'relayPort'> {}
-interface IsRecordingWithDefaultsOptions {
-  page?: Page
-  sessionId?: string
-}
-interface CancelRecordingWithDefaultsOptions {
-  page?: Page
-  sessionId?: string
+export interface SandboxStartRecordingOptions extends Omit<StartRecordingOptions, 'page' | 'logger'> {
+  page: Page
+  /** Fit the viewport to this aspect ratio first (default 16:9, only shrinks). null skips resizing. */
+  aspectRatio?: { width: number; height: number } | null
+  /** Auto-stop after this many ms of wall time (default 60 min). 0 or Infinity disables it. */
+  maxDurationMs?: number
 }
 
-function resolveRecordingTargetPage(options: {
-  context: BrowserContext
-  defaultPage: Page
-  ghostCursorController: GhostCursorController
-  target?: RecordingTargetOptions
-}): Page {
-  return options.ghostCursorController.resolveRecordingTargetPage({
-    context: options.context,
-    defaultPage: options.defaultPage,
-    target: options.target,
-  })
-}
+export type RecordingHandleResult = RecordingResult & { executionTimestamps: ExecutionTimestamp[] }
 
-function withRecordingDefaults<T extends { page?: Page; sessionId?: string }, R>(options: {
-  relayPort: number
-  defaultPage: Page
-  fn: (opts: T & { relayPort: number; sessionId?: string }) => Promise<R>
-}): (input?: T) => Promise<R> {
-  const { relayPort, defaultPage, fn } = options
-  return async (input: T = {} as T) => {
-    const targetPage = input.page || defaultPage
-    const sessionId = input.sessionId || targetPage.sessionId() || undefined
-    return fn({ page: targetPage, sessionId, relayPort, ...input })
+type AspectRatio = { width: number; height: number } | null
+type ViewportSize = { width: number; height: number }
+
+/** Set the viewport, returning a function that restores the old one. */
+async function setViewport(options: { page: Page; size: ViewportSize | null }): Promise<() => Promise<void>> {
+  const { page, size } = options
+  const current = page.viewportSize()
+  if (!size || !current || (size.width === current.width && size.height === current.height)) {
+    return async () => {}
+  }
+  await page.setViewportSize(size)
+  return async () => {
+    if (!page.isClosed()) {
+      await page.setViewportSize(current).catch(() => {})
+    }
   }
 }
 
-export function createRecordingApi(options: CreateRecordingApiOptions): {
-  start: (opts?: StartRecordingWithDefaultsOptions) => Promise<RecordingState>
-  stop: (opts?: StopRecordingWithDefaultsOptions) => Promise<{ path: string; duration: number; size: number; executionTimestamps: ExecutionTimestamp[] }>
-  isRecording: (opts?: IsRecordingWithDefaultsOptions) => Promise<RecordingState>
-  cancel: (opts?: CancelRecordingWithDefaultsOptions) => Promise<void>
-} {
-  const { context, defaultPage, relayPort, ghostCursorController, onStart, onFinish, getExecutionTimestamps } = options
-
-  // Stores the original viewport before aspect-ratio resize so we can restore on stop/cancel
-  let preRecordingViewport: { width: number; height: number } | null = null
-  // Auto-stop timer to prevent unbounded recordings
-  let maxDurationTimer: ReturnType<typeof setTimeout> | null = null
-
-  const startWithDefaults = withRecordingDefaults<StartRecordingWithDefaultsOptions, RecordingState>({
-    relayPort,
-    defaultPage,
-    fn: startRecording,
-  })
-  const stopWithDefaults = withRecordingDefaults<StopRecordingWithDefaultsOptions, { path: string; duration: number; size: number }>({
-    relayPort,
-    defaultPage,
-    fn: stopRecording,
-  })
-  const isRecordingWithDefaults = async (opts: IsRecordingWithDefaultsOptions = {}): Promise<RecordingState> => {
-    const targetPage = opts.page || defaultPage
-    const sessionId = opts.sessionId || targetPage.sessionId() || undefined
-    return isRecording({ page: targetPage, sessionId, relayPort })
+/** Shrink the viewport to the aspect ratio. Returns a function that restores it. */
+async function fitViewport(options: { page: Page; aspectRatio: AspectRatio }): Promise<() => Promise<void>> {
+  const { page, aspectRatio } = options
+  const current = page.viewportSize()
+  if (!aspectRatio || !current) {
+    return async () => {}
   }
+  return setViewport({ page, size: fitToAspectRatio(current, aspectRatio) })
+}
 
-  const cancelWithDefaults = async (opts: CancelRecordingWithDefaultsOptions = {}): Promise<void> => {
-    const targetPage = opts.page || defaultPage
-    const sessionId = opts.sessionId || targetPage.sessionId() || undefined
-    await cancelRecording({ page: targetPage, sessionId, relayPort })
-  }
+type RecordingOutcome = { result?: RecordingResult; error?: unknown }
 
-  const start = async (opts?: StartRecordingWithDefaultsOptions): Promise<RecordingState> => {
-    const targetPage = resolveRecordingTargetPage({ context, defaultPage, ghostCursorController, target: opts })
+/**
+ * Returned by `recording.start()` in the sandbox. Keep it in `state` to stop
+ * it, add frames or switch tabs in later execute calls.
+ */
+export class RecordingHandle {
+  private readonly recording: ScreenRecording
+  private readonly ghostCursorController: GhostCursorController
+  /** Settles when the recording ends for any reason: stop, max duration, page closed, failure */
+  private readonly settled: Promise<RecordingOutcome & { executionTimestamps: ExecutionTimestamp[] }>
+  private readonly autoStopAt: number | null
+  private restoreViewport: () => Promise<void>
+  private completed = false
 
-    // Resize viewport to target aspect ratio (default 16:9) before recording.
-    // Only shrinks — never increases width or height beyond current values.
-    const aspectRatio = opts?.aspectRatio === undefined ? DEFAULT_ASPECT_RATIO : opts.aspectRatio
-    if (aspectRatio) {
-      const current = targetPage.viewportSize()
-      if (current) {
-        const fitted = fitToAspectRatio(current, aspectRatio)
-        if (fitted.width !== current.width || fitted.height !== current.height) {
-          preRecordingViewport = current
-          await targetPage.setViewportSize(fitted)
+  constructor(options: {
+    recording: ScreenRecording
+    restoreViewport: () => Promise<void>
+    ghostCursorController: GhostCursorController
+    maxDurationMs: number
+    onFinish: (outcome: RecordingOutcome) => void
+    getExecutionTimestamps: () => ExecutionTimestamp[]
+  }) {
+    const { recording, maxDurationMs, onFinish, getExecutionTimestamps } = options
+    this.recording = recording
+    this.restoreViewport = options.restoreViewport
+    this.ghostCursorController = options.ghostCursorController
+
+    const autoStop = maxDurationMs > 0 && maxDurationMs < Infinity
+    this.autoStopAt = autoStop ? Date.now() + maxDurationMs : null
+    const maxDurationTimer = autoStop
+      ? setTimeout(() => {
+          void recording.stop('max-duration').catch(() => {})
+        }, maxDurationMs)
+      : null
+
+    this.settled = recording.result
+      .then(
+        (result): RecordingOutcome => {
+          return { result }
+        },
+        (error: unknown): RecordingOutcome => {
+          return { error }
+        },
+      )
+      .then(async (outcome) => {
+        // Idle detection for createDemoVideo only makes sense on wall-clock video
+        const executionTimestamps = this.clock === 'real' ? [...getExecutionTimestamps()] : []
+        this.completed = true
+        if (maxDurationTimer) {
+          clearTimeout(maxDurationTimer)
         }
-      }
-    }
-
-    const result = await startWithDefaults(opts)
-    onStart()
-
-    // Schedule auto-stop to prevent unbounded recordings filling disk.
-    // Default 15 min. Set maxDurationMs to 0 or Infinity to disable.
-    const maxMs = opts?.maxDurationMs ?? DEFAULT_MAX_DURATION_MS
-    if (maxMs > 0 && maxMs < Infinity) {
-      maxDurationTimer = setTimeout(() => {
-        maxDurationTimer = null
-        stop(opts ? { page: opts.page, sessionId: opts.sessionId } : undefined).catch(() => {})
-      }, maxMs)
-    }
-
-    return result
+        onFinish(outcome)
+        await this.restoreViewport()
+        return { ...outcome, executionTimestamps }
+      })
   }
 
-  const clearMaxDurationTimer = (): void => {
-    if (maxDurationTimer) {
-      clearTimeout(maxDurationTimer)
-      maxDurationTimer = null
-    }
+  get page(): Page {
+    return this.recording.page
   }
 
-  const restoreViewport = async (targetPage: Page): Promise<void> => {
-    if (!preRecordingViewport) {
+  get clock(): RecordingClock {
+    return this.recording.clock
+  }
+
+  get outputPath(): string {
+    return this.recording.outputPath
+  }
+
+  get startedAt(): number {
+    return this.recording.startedAt
+  }
+
+  get isRecording(): boolean {
+    return !this.completed
+  }
+
+  /** Record another tab from now on, at the same viewport size. The ghost cursor moves with it. */
+  async setPage(page: Page): Promise<void> {
+    if (this.completed) {
+      throw new Error('Recording already stopped')
+    }
+    if (page === this.page) {
       return
     }
-    const saved = preRecordingViewport
-    preRecordingViewport = null
-    await targetPage.setViewportSize(saved)
-  }
-
-  const stop = async (
-    opts?: StopRecordingWithDefaultsOptions,
-  ): Promise<{ path: string; duration: number; size: number; executionTimestamps: ExecutionTimestamp[] }> => {
-    clearMaxDurationTimer()
-    const targetPage = resolveRecordingTargetPage({ context, defaultPage, ghostCursorController, target: opts })
-    const result = await stopWithDefaults(opts)
-    const executionTimestamps = [...getExecutionTimestamps()]
-    onFinish()
-    await restoreViewport(targetPage)
-    return { ...result, executionTimestamps }
-  }
-
-  const cancel = async (opts?: CancelRecordingWithDefaultsOptions): Promise<void> => {
-    clearMaxDurationTimer()
-    const targetPage = resolveRecordingTargetPage({ context, defaultPage, ghostCursorController, target: opts })
-    await cancelWithDefaults(opts)
-    onFinish()
-    await restoreViewport(targetPage)
-  }
-
-  return {
-    start,
-    stop,
-    isRecording: isRecordingWithDefaults,
-    cancel,
-  }
-}
-
-/**
- * Start recording the page.
- * The recording is handled by the extension, so it survives page navigation.
- */
-export async function startRecording(options: StartRecordingOptions): Promise<RecordingState> {
-  const {
-    sessionId,
-    frameRate = 30,
-    videoBitsPerSecond = 2500000,
-    audioBitsPerSecond = 128000,
-    audio = false,
-    outputPath,
-    relayPort = 19988,
-  } = options
-
-  // Resolve relative paths to absolute using the caller's cwd.
-  // The relay server may have a different cwd, so we must resolve here.
-  const absoluteOutputPath = path.resolve(outputPath)
-
-  const response = await fetch(`http://127.0.0.1:${relayPort}/recording/start`, {
-    method: 'POST',
-    headers: recordingHeaders(),
-    body: JSON.stringify({
-      sessionId,
-      frameRate,
-      videoBitsPerSecond,
-      audioBitsPerSecond,
-      audio,
-      outputPath: absoluteOutputPath,
-    }),
-  })
-
-  const result = (await response.json()) as StartRecordingResult
-
-  if (!result.success) {
-    const errorMsg = result.error || 'Unknown error'
-
-    // If the error is about missing activeTab permission, provide helpful guidance
-    if (isActiveTabPermissionError(errorMsg)) {
-      const restartCmd = getChromeRestartCommand()
-      throw new Error(
-        `Failed to start recording: ${errorMsg}\n\n` +
-          `For automated recording, start a managed Playwriter browser with the bundled extension loaded:\n\n` +
-          `  ${restartCmd}\n\n` +
-          `Or click the Playwriter extension icon on the tab once to grant permission.`,
-      )
+    this.ghostCursorController.attachToPage({ page })
+    // Same CSS size on the new tab, so every segment has the output size
+    const restoreNewViewport = await setViewport({ page, size: this.page.viewportSize() })
+    try {
+      await this.recording.setPage(page)
+    } catch (error) {
+      await restoreNewViewport()
+      throw error
     }
-
-    throw new Error(`Failed to start recording: ${errorMsg}`)
-  }
-
-  return {
-    isRecording: true,
-    startedAt: result.startedAt,
-    tabId: result.tabId,
-  }
-}
-
-/**
- * Stop recording and save to file.
- * Returns the path to the saved video file.
- */
-export async function stopRecording(
-  options: StopRecordingOptions,
-): Promise<{ path: string; duration: number; size: number }> {
-  const { sessionId, relayPort = 19988 } = options
-
-  const response = await fetch(`http://127.0.0.1:${relayPort}/recording/stop`, {
-    method: 'POST',
-    headers: recordingHeaders(),
-    body: JSON.stringify({ sessionId }),
-  })
-
-  const result = (await response.json()) as StopRecordingResult
-
-  if (!result.success) {
-    throw new Error(`Failed to stop recording: ${result.error}`)
-  }
-
-  return { path: result.path, duration: result.duration, size: result.size }
-}
-
-/**
- * Check if recording is currently active.
- */
-export async function isRecording(options: {
-  page: Page
-  sessionId?: string
-  relayPort?: number
-}): Promise<RecordingState> {
-  const { sessionId, relayPort = 19988 } = options
-
-  const url = new URL(`http://127.0.0.1:${relayPort}/recording/status`)
-  if (sessionId) {
-    url.searchParams.set('sessionId', sessionId)
-  }
-  // GET request — only the Authorization header matters here
-  const response = await fetch(url.toString(), { headers: recordingHeaders() })
-  const result = (await response.json()) as IsRecordingResult
-
-  return { isRecording: result.isRecording, startedAt: result.startedAt, tabId: result.tabId }
-}
-
-// ============================================================================
-// Live RTMP streaming (reuses the tabCapture pipeline; the relay pipes chunks
-// to ffmpeg instead of writing a file). ffmpeg runs inside the relay process,
-// so streams keep running after the CLI or executor call returns.
-// ============================================================================
-
-export interface StartStreamOptions extends Omit<StartStreamParams, 'sessionId'> {
-  /** Target page to stream (defaults to the executor's current page) */
-  page?: Page
-  /** CDP tab session ID (pw-tab-*) to identify which tab to stream */
-  sessionId?: string
-}
-
-/** Start streaming a tab to one or more RTMP destinations. */
-export async function startStream(
-  options: StartStreamOptions & { relayPort?: number },
-): Promise<StartStreamResult & { success: true }> {
-  const { page: _page, relayPort = 19988, ...params } = options
-
-  const response = await fetch(`http://127.0.0.1:${relayPort}/stream/start`, {
-    method: 'POST',
-    headers: recordingHeaders(),
-    body: JSON.stringify(params),
-  })
-
-  const result = (await response.json()) as StartStreamResult
-
-  if (!result.success) {
-    const errorMsg = result.error || 'Unknown error'
-    if (isActiveTabPermissionError(errorMsg)) {
-      const restartCmd = getChromeRestartCommand()
-      throw new Error(
-        `Failed to start stream: ${errorMsg}\n\n` +
-          `For automated streaming, start a managed Playwriter browser with the bundled extension loaded:\n\n` +
-          `  ${restartCmd}\n\n` +
-          `Or click the Playwriter extension icon on the tab once to grant permission.`,
-      )
+    await this.restoreViewport()
+    this.restoreViewport = restoreNewViewport
+    // Ended while switching: the final cleanup already ran with the old restore
+    if (this.completed) {
+      await restoreNewViewport()
     }
-    throw new Error(`Failed to start stream: ${errorMsg}`)
   }
 
-  return result
-}
-
-/** Stop an active stream. Closes ffmpeg gracefully and waits for it to exit. */
-export async function stopStream(options: {
-  page?: Page
-  sessionId?: string
-  relayPort?: number
-}): Promise<{ duration: number; bytesReceived: number }> {
-  const { sessionId, relayPort = 19988 } = options
-
-  const response = await fetch(`http://127.0.0.1:${relayPort}/stream/stop`, {
-    method: 'POST',
-    headers: recordingHeaders(),
-    body: JSON.stringify({ sessionId }),
-  })
-
-  const result = (await response.json()) as StopStreamResult
-
-  if (!result.success) {
-    throw new Error(`Failed to stop stream: ${result.error}`)
+  /** clock: 'manual' only. Record the next `ms` of real time. */
+  wait(ms: number): Promise<void> {
+    return this.recording.wait(ms)
   }
 
-  return { duration: result.duration, bytesReceived: result.bytesReceived }
-}
-
-/** Get status and encoder stats for the active stream (if any). */
-export async function streamStatus(options: {
-  page?: Page
-  sessionId?: string
-  relayPort?: number
-}): Promise<StreamStatusResult> {
-  const { sessionId, relayPort = 19988 } = options
-
-  const url = new URL(`http://127.0.0.1:${relayPort}/stream/status`)
-  if (sessionId) {
-    url.searchParams.set('sessionId', sessionId)
+  /** Finish the file. Also returns the file if the recording already ended on its own. */
+  async stop(): Promise<RecordingHandleResult> {
+    await this.recording.stop().catch(() => {})
+    const outcome = await this.settled
+    if (!outcome.result) {
+      throw outcome.error
+    }
+    return { ...outcome.result, executionTimestamps: outcome.executionTimestamps }
   }
-  const response = await fetch(url.toString(), { headers: recordingHeaders() })
-  return (await response.json()) as StreamStatusResult
+
+  /** Stop without saving the file. */
+  async cancel(): Promise<void> {
+    await this.recording.cancel()
+    await this.settled
+  }
+
+  /** Short summary when an agent logs or returns the handle */
+  [util.inspect.custom](): object {
+    return {
+      outputPath: this.outputPath,
+      clock: this.clock,
+      isRecording: this.isRecording,
+      page: this.page.isClosed() ? '(closed)' : this.page.url(),
+      elapsedSec: Math.round((Date.now() - this.startedAt) / MS_PER_SECOND),
+      bytes: this.recording.bytes,
+      autoStopInSec: this.autoStopAt === null || this.completed ? null : Math.max(0, Math.round((this.autoStopAt - Date.now()) / MS_PER_SECOND)),
+    }
+  }
 }
 
-/**
- * Create the `stream` API exposed in the executor sandbox. Resolves the target
- * tab's pw-tab-* sessionId from the page like the recording API does. Unlike
- * recording there is no viewport resize or max-duration timer: streams pick an
- * explicit output resolution (ffmpeg scales) and run indefinitely.
- */
-export function createStreamApi(options: { defaultPage: Page; relayPort: number }): {
-  start: (opts: StartStreamOptions) => Promise<StartStreamResult & { success: true }>
-  stop: (opts?: { page?: Page; sessionId?: string }) => Promise<{ duration: number; bytesReceived: number }>
-  status: (opts?: { page?: Page; sessionId?: string }) => Promise<StreamStatusResult>
+export function createRecordingApi(options: {
+  ghostCursorController: GhostCursorController
+  logger: Logger
+  /** Session cwd: relative output paths resolve against it */
+  cwd: string | null
+  onStart: () => void
+  onFinish: () => void
+  /** Shown in the next execute output: recordings that ended without stop() or failed */
+  onWarning: (message: string) => void
+  getExecutionTimestamps: () => ExecutionTimestamp[]
+}): {
+  start: (opts: SandboxStartRecordingOptions) => Promise<RecordingHandle>
+  stop: (opts?: RecordingTargetOptions) => Promise<RecordingHandleResult>
 } {
-  const { defaultPage, relayPort } = options
+  const { ghostCursorController, logger, cwd, onStart, onFinish, onWarning, getExecutionTimestamps } = options
+  const active = new Set<RecordingHandle>()
 
-  const resolveSessionId = (opts?: { page?: Page; sessionId?: string }): string | undefined => {
-    const targetPage = opts?.page || defaultPage
-    return opts?.sessionId || targetPage.sessionId() || undefined
+  return {
+    start: async (opts) => {
+      const page = requirePage('recording.start', opts)
+      const existing = [...active].find((handle) => handle.page === page)
+      if (existing) {
+        throw new Error(`This page is already recording to ${existing.outputPath}. Call recording.stop({ page }) first.`)
+      }
+      if (!opts.outputPath) {
+        throw new Error('recording.start needs an outputPath, e.g. { outputPath: "demo.mp4" }')
+      }
+      const outputPath = path.resolve(cwd || process.cwd(), opts.outputPath)
+      ghostCursorController.attachToPage({ page })
+      const restoreViewport = await fitViewport({ page, aspectRatio: opts.aspectRatio === undefined ? DEFAULT_ASPECT_RATIO : opts.aspectRatio })
+      const recording = await ScreenRecording.start({ ...opts, outputPath, page, logger }).catch(async (error: unknown) => {
+        await restoreViewport()
+        throw error
+      })
+      const realClock = recording.clock === 'real'
+      if (realClock) {
+        onStart()
+      }
+      const handle: RecordingHandle = new RecordingHandle({
+        recording,
+        restoreViewport,
+        ghostCursorController,
+        maxDurationMs: opts.maxDurationMs ?? DEFAULT_RECORDING_MAX_DURATION_MS,
+        onFinish: (outcome) => {
+          active.delete(handle)
+          if (realClock) {
+            onFinish()
+          }
+          if (outcome.error && !recording.isCancelled) {
+            const message = outcome.error instanceof Error ? outcome.error.message : String(outcome.error)
+            onWarning(`Recording to ${outputPath} failed: ${message}`)
+          }
+          const reason = outcome.result?.endReason
+          if (reason && reason !== 'stopped') {
+            onWarning(`Recording ended without stop() (${reason}). Saved ${outcome.result?.path}`)
+          }
+        },
+        getExecutionTimestamps,
+      })
+      active.add(handle)
+      return handle
+    },
+
+    stop: async (opts) => {
+      const handles = [...active]
+      const handle = opts?.page ? handles.find((item) => item.page === opts.page) : handles[0]
+      if (!opts?.page && handles.length > 1) {
+        throw new Error('recording.stop: several recordings are active. Pass { page } to pick one.')
+      }
+      if (!handle) {
+        throw new Error('No active recording')
+      }
+      return handle.stop()
+    },
+  }
+}
+
+/**
+ * `stream.*` in the executor sandbox. Streams run until stopped or until the page
+ * closes. stop/status work without a target when exactly one stream is active.
+ */
+export function createStreamApi(options: { logger: Logger }): {
+  start: (opts: Omit<StartStreamOptions, 'logger'>) => Promise<{ startedAt: number; destinations: string[] }>
+  stop: (opts?: RecordingTargetOptions) => Promise<{ duration: number; frames: number }>
+  status: (opts?: RecordingTargetOptions) => Promise<StreamStatus>
+} {
+  const { logger } = options
+  const active = new Map<Page, ScreenStream>()
+  let lastError: string | undefined
+
+  const find = (helper: string, target?: RecordingTargetOptions): ScreenStream | undefined => {
+    if (target?.page) {
+      return active.get(target.page)
+    }
+    const streams = [...active.values()]
+    if (streams.length > 1) {
+      throw new Error(`${helper}: several streams are active. Pass { page } to pick one.`)
+    }
+    return streams[0]
   }
 
   return {
     start: async (opts) => {
-      return startStream({ ...opts, sessionId: resolveSessionId(opts), relayPort })
+      const page = requirePage('stream.start', opts)
+      if (active.has(page)) {
+        throw new Error('A stream is already running for this page. Call stream.stop({ page }) first.')
+      }
+      const stream = await ScreenStream.start({ ...opts, page, logger })
+      active.set(page, stream)
+      lastError = undefined
+      void stream.capture.done.then((result) => {
+        if (active.get(page) === stream) {
+          active.delete(page)
+        }
+        if (result.error) {
+          lastError = result.error.message
+        }
+      })
+      return { startedAt: stream.capture.startedAt, destinations: stream.destinations }
     },
-    stop: async (opts = {}) => {
-      return stopStream({ ...opts, sessionId: resolveSessionId(opts), relayPort })
+
+    stop: async (opts) => {
+      const stream = find('stream.stop', opts)
+      if (!stream) {
+        throw new Error(lastError ? `No active stream. Last stream failed: ${lastError}` : 'No active stream')
+      }
+      return stream.stop()
     },
-    status: async (opts = {}) => {
-      return streamStatus({ ...opts, sessionId: resolveSessionId(opts), relayPort })
+
+    status: async (opts) => {
+      const stream = find('stream.status', opts)
+      if (!stream) {
+        return { streaming: false, error: lastError }
+      }
+      return stream.status()
     },
-  }
-}
-
-/**
- * Cancel recording without saving.
- */
-export async function cancelRecording(options: {
-  page: Page
-  sessionId?: string
-  relayPort?: number
-}): Promise<void> {
-  const { sessionId, relayPort = 19988 } = options
-
-  const response = await fetch(`http://127.0.0.1:${relayPort}/recording/cancel`, {
-    method: 'POST',
-    headers: recordingHeaders(),
-    body: JSON.stringify({ sessionId }),
-  })
-
-  const result = (await response.json()) as CancelRecordingResult
-
-  if (!result.success) {
-    throw new Error(`Failed to cancel recording: ${result.error}`)
   }
 }

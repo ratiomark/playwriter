@@ -1,5 +1,494 @@
 # Changelog
 
+## 0.11.0
+
+1. **New `--patchright` session mode with human-like input**: for production sites where you are logged in. The session connects with Patchright (`@playwriter/patchright-core`) instead of Playwright. Mouse moves follow curved paths, clicks get human press timing, scrolling glides in wheel flicks, and key presses are spaced 30-110 ms apart.
+
+   ```bash
+   playwriter session new --tab-group shop --patchright
+   # switch an existing session; tabs stay open, state is cleared
+   playwriter session update 1 --patchright
+   playwriter session update 1 --patchright false
+   ```
+
+   With Patchright, `page.evaluate` runs in the main world like in Playwright. Pass `true` as fourth argument for Patchright's isolated world, where pages cannot see the call. `snapshot`, `getPageMarkdown` and `waitForPageLoad` always run isolated. `page.on('console')` stays silent because Patchright keeps CDP `Runtime` off; use `getLatestLogs`. The Node API takes `connectViaExtension({ patchright: true })`, and `playwriter --patchright` (MCP) also humanizes input. The driver is now per session, not per relay.
+
+2. **Each CLI session sees only its own tabs**: a session sees the tabs it opened (and their popups), plus tabs you enabled with the extension icon. Parallel agents no longer navigate or close each other's tabs. Tabs of a deleted session become shared again. SDK scripts and the MCP still see every tab. Needs extension 0.0.174; with an older extension every tab stays shared.
+
+3. **Tabs report focus only while an execute uses them**: `document.hasFocus()`, `focus` and `blur` events of a CLI session's tab are active only while an execute of that session runs. Before, every attached tab claimed focus all the time, and chat apps marked messages as read in tabs nobody looked at. MCP and SDK connections keep the always-focused behavior.
+
+4. **Native screen recording**: `recording.start` now uses Chrome's own screen recorder (Chrome 153+). A 1080p recording costs about 4x less Chrome CPU and 15x less CDP traffic.
+   - Defaults are 60 fps (max 120) and a 3840 px longest edge. Pass `maxSize: 1920` for X uploads.
+   - Output is H.264 MP4, so stop takes under a second. `codec: 'av1'` keeps Chrome's output and needs no ffmpeg.
+   - `audio: true` records tab audio, cross-origin iframes included.
+   - Auto-stop is 60 minutes and saves the file. A closed page keeps what was recorded. `stop()` returns `endReason`.
+   - The video grows in `<name>.<id>.partial.mp4`, so a crash leaves a playable file.
+   - `recording.stop({ page })` recovers a lost handle. Relative `outputPath` resolves against the session cwd.
+   - The `quality` option is removed. Older Chrome fails with an "update Chrome" error.
+
+5. **Warnings for verification and block pages**: after an execute navigates, Playwriter checks for a verification page. Checks that clear by themselves are waited out. Otherwise execute prints a `[WARNING]` that tells the agent not to reload and to ask the user.
+
+6. **Pages can no longer see Playwriter's scripts**: the ghost cursor, bot challenge check and screenshot cleanup run in a private isolated world. Pages find no `__playwriterGhostCursor` global, leftover `<style>` or `<html>` class. With human-like input, element clicks land a few pixels off center, inside the element.
+
+7. **`snapshot()` shows element state**: in Playwright aria syntax, before the locator:
+
+   ```
+   - heading "Settings" [level=2]
+   - checkbox "Alerts" [checked] [id="alerts"]
+   - [expanded] role=button[name="Menu"i]
+   ```
+
+   `snapshot({ search })` now matches strings case-insensitively, handles regexes with the `g` flag, and starts with a match count like `12 matches (showing 10)`. Snapshots never show Playwriter's toolbar.
+
+8. **Web workers work**: `page.on('worker')`, `page.workers()` and `worker.evaluate()` work in Playwright and Patchright sessions, also for workers that already ran before a reconnect.
+
+9. **Safe CLI upgrades**: a newer CLI asks the old relay to drain. It refuses new executes with a "relay is restarting" error and waits up to 30 seconds for running ones. `playwriter serve restart` refuses while executes run; pass `--force` to restart anyway. Ctrl-C or an agent bash timeout on `playwriter -e` aborts the running script.
+
+10. **Session ids are never reused**: ids survive relay restarts in `~/.playwriter/session-counter.json`. A stale `-s 1` now fails with `Session N ended or was lost when the relay restarted` instead of running in another agent's session.
+
+11. **Relay survives agent mistakes**: a missing `await` or a throwing timer callback no longer kills the relay. The session gets a `[WARNING] Unhandled promise rejection in your code (missing await?)` line. `reset` and `session delete` clear pending sandbox timers. `relay-server.log` keeps the previous run as `relay-server.log.1` and rotates at 20 MB. A background relay now uses `PLAYWRITER_PORT`.
+
+12. **Execute output keeps the return value**: long `console.log` output no longer hides the result. Logs keep their start and end, and repeated lines show once with a count, like `[log] retrying (x37)`. `playwriter -e` no longer cuts error output at 64 KiB when piped.
+
+13. **Better recovery guidance**: execute warns when a page in state crashes. Errors for crashed tabs, closed pages and failed navigations give specific steps instead of a session reset. Actions are never retried automatically.
+
+14. **Cookies and `route.fetch()` work**: `route.fetch()`, `context.cookies()` and `context.addCookies()` work, also with older extensions. `context.clearCookies()` throws a clear error, because it would delete cookies for every site in your browser. Fixes [#66](https://github.com/remorses/playwriter/issues/66).
+
+15. **Long `page.evaluate()` calls**: `page.evaluate()` and `page.waitForFunction()` can wait up to 5 minutes. Before, the relay cut them at 30 seconds with a misleading "Execution context was destroyed" error.
+
+16. **New CDP clients no longer break other sessions on a tab**: a running `page.evaluate()` keeps working and element handles stay valid when another client connects.
+
+17. **Raw CDP clients get `Target.targetInfoChanged`**: browser-use and other clients that track page URLs from this event no longer see every page as blank.
+
+18. **`refToLocator` resolves labelled screenshot refs**: it uses refs from the last `screenshotWithAccessibilityLabels` call. Labels are also drawn in the right place on scrolled pages.
+
+19. **Extension welcome page shows if Playwriter is pinned**: the "Pin the extension" step turns into a checkmark when you pin it.
+
+20. **Playwright 1.64.1**: `@xmorse/playwright-core` is based on Playwright 1.64.1. `locator.dblclick()` sends a real double click, and `playwriter recorder` reports clicks live, so a click comes before the popup it opens. Every recording names its first page `page`.
+
+## 0.10.0
+
+1. **`recording.start()` returns a handle and supports a manual clock**: a manual clock keeps agent thinking time out of demo videos.
+
+   ```js
+   state.video = await recording.start({ page: state.page, outputPath: '/abs/demo.mp4', clock: 'manual' })
+
+   await state.page.getByRole('button', { name: 'Open' }).click()
+   await state.video.wait(800)          // records the next 800ms
+
+   await state.video.setPage(otherTab)  // record another tab from now on
+   await state.video.stop()
+   ```
+
+   With `clock: 'manual'` frames are written only inside `wait(ms)`. The page keeps running normally, so the video has no idle time and needs no `createDemoVideo` pass. Put each action and its `wait()` in the same execute call. The default `clock: 'real'` records wall-clock time like before. The library `startRecording()` also accepts `clock: 'manual'` and has `wait(ms)` and `setPage(page)`.
+
+   **Breaking:** `recording.stop({ page })`, `recording.isRecording({ page })` and `recording.cancel({ page })` are removed, and so are the `startRecording`, `stopRecording`, `isRecording` and `cancelRecording` sandbox aliases. Use the handle:
+
+   ```js
+   state.video = await recording.start({ page: state.page, outputPath })
+   await state.video.stop() // also: state.video.cancel(), state.video.isRecording
+   ```
+
+   This also fixes `recording.stop()` in a later execute call, which failed with "No active recording for this page" and left the recording running.
+
+2. **Timed-out `execute` code is aborted and cannot overlap the next call**: on timeout the script's running Playwright action is cancelled (a pending click never fires later), its later calls throw, and a new `signal` global (AbortSignal) is aborted. New execute calls always run at once. Pass `signal` to `fetch` or check `signal.aborted` in long loops so they stop on timeout:
+
+   ```js
+   for (const url of urls) {
+     if (signal.aborted) break
+     await fetch(url, { signal })
+   }
+   ```
+
+3. **Idle headless sessions are deleted after 30 minutes**: the shared headless Chrome now exits when its last session goes away, instead of running for days when agents forget `playwriter session delete`.
+
+4. **Headless mode keeps the Chromium sandbox on**: `--browser headless` sessions now run sandboxed, so a page that exploits a Chrome bug stays inside the renderer sandbox. Linux as root (Docker) keeps the old behaviour, since Chromium cannot start sandboxed there.
+
+5. **Recording no longer crashes NVIDIA NVENC encoders when the viewport changes**: frames keep a fixed sample aspect ratio. Recording also starts faster: the first live frame is used without waiting for a slow screenshot.
+
+6. **Screenshots always restore the page UI**: page screenshots and `screenshotWithAccessibilityLabels` restore the hidden toolbar, scrollbars, caret and labels when capture fails.
+
+7. **Skill docs no longer suggest `.first()`, `.last()` or `.nth()` for strict mode violations**: these click by position and can hit the wrong element. Agents now retry with the unique locator listed in the Playwright error.
+
+8. **Shorter agent install prompt on the extension welcome page**.
+
+## 0.9.0
+
+1. **Screen recording and streaming without an extension click**: `recording.*` and `stream.*` now use CDP screencast piped to `ffmpeg` instead of `chrome.tabCapture`. No user click and no special Chrome flags. Recording now also works in direct CDP mode, headless, cloud browsers and Remote control, and survives cross-site navigation.
+
+   ```js
+   await recording.start({ page: state.page, outputPath: './demo.mp4', audio: true })
+   await state.page.click('a')
+   const { path, duration, size } = await recording.stop({ page: state.page })
+   ```
+
+   - **`ffmpeg` on PATH is required.** `.mp4`, `.mov`, `.mkv` use H.264 (hardware encoder when available) + AAC. `.webm` uses VP8 + Opus.
+   - **Page audio** with `audio: true` taps `<audio>`, `<video>` and AudioContext output. Default off for recordings, on for streams. Cross-origin iframe audio is not captured.
+   - New options `maxSize` (longest edge, default 1920) and `quality` (JPEG, default 90).
+   - **Breaking:** `videoBitsPerSecond` and `audioBitsPerSecond` are removed. The library exports `stopRecording`, `isRecording` and `cancelRecording` are replaced by `startRecording({ page, outputPath })`, which returns a recording with `stop()` and `cancel()`. The relay `/recording/*` and `/stream/*` endpoints are removed.
+   - `stream.stop()` returns `{ duration, frames }`. Streams end when the page closes or the session is reset.
+   - The skill recorder and a video recording on the same tab no longer stop each other.
+   - The extension no longer asks for the `tabCapture` permission.
+
+2. **Skill recordings explain why a step failed**:
+
+   - **Toasts and alerts**: new `toast` events hold the text of `role=alert`, `role=status` and `aria-live` regions. A click that sent no request because the site refused it on the client (limits, validation) now shows the reason.
+   - **Same-origin GETs** (quota checks, job polling) are recorded. Cross-origin GETs are still skipped.
+   - **Compressed response bodies**: gzip and brotli JSON responses are stored instead of `responseBodyOmitted: "encoded"`.
+   - **`afterAction`**: `network` and `toast` events carry the id of the action that happened up to 3s before them.
+   - **Auto-stop at 500 MB**: recordings stop when frames and events grow past 500 MB. The `recording-stopped` event has `reason: "max-size"` and the total `bytes`.
+
+   New CLI options to read recordings faster:
+
+   ```bash
+   playwriter recorder events --errors                          # failed requests, console and page errors, toasts
+   playwriter recorder events --exclude 'analytics|telemetry'   # drop noisy network URLs
+   playwriter recorder frame 42 --offset 1500                   # screencast frame 1.5s after event 42
+   ```
+
+   The thin timeline merges runs of identical requests into one event with `repeat` and `lastId`.
+
+3. **Chrome menus and a smaller in-page toolbar**: right-click a page or the extension icon to find Playwriter actions.
+
+   ```
+   page right-click > Playwriter         extension icon right-click
+   ├─ Copy Playwriter Locator for this element
+   ├─ ───────────                ┐
+   ├─ Copy remote agent prompt   │ only while sharing ──> same items
+   ├─ Copy remote id             │
+   └─ Stop sharing               ┘
+   ```
+
+   - **Copy Playwriter Locator** works on any tab, even before you enable Playwriter on it. It pins the right-clicked element (also inside open shadow roots), copies the `playwriter -e 'inspectPinnedElement(...)'` command and attaches the tab.
+   - Short toasts like `Copied locator` and a short sound confirm every copy.
+   - The in-page toolbar now starts as a small tab at the top center of the page. Click it to open the full toolbar with labels; `×` collapses it again. No hover expansion or dragging. Agent clicks still pass through it.
+   - **Record Skill** and **Remote control** start from the toolbar. Toolbar and menus share one Remote control state, so you can start sharing from the toolbar and stop it from the menu.
+
+4. **Breaking: `connectViaExtension()` keeps tabs open on `close()` by default**: each SDK script closes the tabs it opens, so a later process or another script sharing the tab can keep using it.
+
+   ```ts
+   await using connection = await connectViaExtension({ tabGroup: 'docs' })
+   await using page = await connection.browser.contexts()[0].newPage() // closes its tab at scope end
+   await page.goto('https://example.com')
+   ```
+
+   Pass `closeTabsOnEnd: true` for the old behavior: `close()` also closes every tab the connection opened, plus popups they opened.
+
+5. **Ghost cursor stays hidden until the agent uses the mouse**: it now appears on the first click, move or scroll, then fades out after 5 seconds idle.
+
+6. **Remote control tunnels no longer stay awake while idle**: relays send WebSocket protocol pings that Cloudflare answers at the edge, instead of a JSON ping every 5 seconds. Dials to a browser that stopped sharing fail at once and back off from 1s up to 60s; after 10 minutes offline the relay stops dialing, and the next `execute` on that session dials again. A failed `playwriter session new --remote <id>` no longer leaves a dial running.
+
+7. **Fixed the page closing when another extension injects an iframe**: password managers like 1Password inject a `chrome-extension://` iframe on focus, and Chrome then detaches the debugger from the whole tab. The extension now removes those iframes, reattaches with the same session and restores init scripts, exposed functions, viewport and emulation, so the same `page` keeps working. Chromium treats this detach as intended: https://issues.chromium.org/issues/498987209
+
+8. **Fixed new tabs missing from `context.pages()`** when Chrome creates them inside a Playwriter group without a later group-change event. Child tabs are now controllable without another extension click.
+
+9. **Fixed `Function "__pw_recorderRecordAction" is not exposed` page errors** when several sessions or CDP clients share a tab. Only the client that exposed a function now answers its calls (via `@xmorse/playwright-core@1.59.14`).
+
+10. **Better welcome page**: the agent install prompt now ends with the agent telling you what Playwriter can do (your own Chrome with logins, working together in one browser, full Playwright API, Record skill, Remote control). CLI examples fit on one line.
+
+11. **Skill tells agents to pass a short `--tab-group` name** like `docs` or `shop` instead of using the default `playwriter` group.
+
+## 0.8.0
+
+1. **Remote control shares the browser, not one tab** — a remote agent connected with `playwriter session new --remote <id>` now gets the same access as a local agent. It sees and drives every tab where Playwriter is enabled, and opens new background tabs with `context.newPage()` in the session's `remote` tab group. `context.pages()[0]` is still the tab where sharing started.
+
+   ```bash
+   playwriter session new --remote <id>
+   playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
+   ```
+
+   Whole-profile cookie APIs (`Network.getAllCookies`, `Network.clearBrowserCookies`, `Storage.*Cookies`) and `Network.clearBrowserCache` stay blocked, so an agent cannot wipe every login by accident. Remote control is still not a sandbox: share the id only with agents you fully trust.
+
+   **Stop sharing** works from the Remote ON dropdown of any Playwriter tab and closes the tunnel immediately. Tabs the remote agent opened are detached and left open. Sharing also ends when the tab where it started is closed. Remote sessions only regroup or rename tabs they opened, and never touch the tabs of a local session with the same id.
+
+2. **Breaking: no default `page` global, Playwriter never opens tabs on its own** — before, every execute call made sure a default page existed and opened `about:blank` when no tab was open, even when your code never used `page`. Now reading `page` throws with a hint, the relay no longer auto-creates a tab, headless and direct CDP sessions start without a tab, and `PLAYWRITER_AUTO_ENABLE` is removed. Store your own page in `state`:
+
+   ```js
+   // new tab
+   state.page = await context.newPage()
+   await state.page.goto('https://example.com')
+
+   // a tab the user already opened (last match = most recently opened)
+   state.page = context.pages().findLast((p) => p.url().includes('example.com'))
+
+   await snapshot({ page: state.page })
+   ```
+
+   Helpers now need an explicit page: `snapshot` (also accepts a `locator` or `frame`), `getLatestLogs`, `waitForPageLoad`, `refToLocator`, `screenshotWithAccessibilityLabels`, `getPageMarkdown`, `ghostCursor.*`, `recording.*`, `stream.*`, and `cloud.sendCookies({ from })`. `playwriter stream start` streams `state.page`; `stream stop` and `stream status` also work after a session reset. `reset` no longer reports a current page URL.
+
+3. **`connectViaExtension()` closes only its own tabs, supports `await using`, and can keep tabs** — the connection closes automatically at scope end, also when code throws. `close()` closes only the tabs that connection opened, plus popups they opened, so two SDK scripts or an SDK script next to a CLI session no longer close each other's tabs. Pass `closeTabsOnEnd: false` to keep the tabs, so a later process can reuse them:
+
+   ```ts
+   import { connectViaExtension } from 'playwriter'
+
+   // process A
+   await using a = await connectViaExtension({ tabGroup: 'job', closeTabsOnEnd: false })
+   await (await a.browser.contexts()[0].newPage()).goto('https://example.com')
+
+   // process B, later
+   await using b = await connectViaExtension({ tabGroup: 'job' })
+   const page = b.browser.contexts()[0].pages().findLast((p) => p.url().includes('example.com'))
+   ```
+
+   `await using` needs Node 24+, or TypeScript 5.2+ / tsx. Tab cleanup needs the latest extension; older extensions leave the tabs open and log a warning. `deleteRelaySession({ sessionId, closeCreatedTabs: true })` exposes the same cleanup for custom clients. Popups opened from a session's tab now belong to that session, so `session update --tab-group` moves them too. After a relay restart, a new session `1` never owns or closes the tabs of an older session `1`.
+
+   The recorder instructions and `playwriter skill` now show how to turn a recording into a standalone typed SDK with `connectViaExtension`. See https://playwriter.dev/docs/sessions#node-api.
+
+4. **Pick a browser with `selectBrowser` and `listBrowsers()`** — when the extension runs in more than one browser or profile, choose which one `connectViaExtension()` controls:
+
+   ```ts
+   import { connectViaExtension, listBrowsers } from 'playwriter'
+
+   await using connection = await connectViaExtension({
+     selectBrowser: (browsers) => {
+       // [{ id, browser: 'Brave', email: 'me@work.com', activeTabs, playwriterVersion }]
+       return browsers.find((b) => b.browser === 'Brave' && b.email === 'me@work.com')
+     },
+   })
+
+   // same list, without connecting
+   const browsers = await listBrowsers()
+   ```
+
+   `id` is stable across restarts, so you can save it. Without `selectBrowser`, connecting with several browsers fails with a list of connected browsers.
+
+5. **Anonymous usage stats** — the local relay sends event names, a random install id, the Playwriter version, OS, session kind, and hourly execute counts to [Strada](https://strada.sh). It never sends code, URLs, page content, emails, or hostnames. The CLI prints a one-time notice. Opt out, then restart the relay:
+
+   ```bash
+   export PLAYWRITER_TELEMETRY=0   # or DO_NOT_TRACK=1
+   playwriter serve restart
+   ```
+
+6. **One clear "extension not connected" error** — `playwriter session new`, `playwriter -e` and `connectViaExtension()` print the same message, written so an agent can pass the install steps to the user. The text and the install URL are exported as `EXTENSION_NOT_CONNECTED_ERROR` and `PLAYWRITER_EXTENSION_URL`.
+
+7. **Simpler extension welcome page** — leads with a short blurb and a "Copy agent prompt to install" button that copies a prompt telling your coding agent to install the Playwriter skill. Full setup docs moved into a collapsible section. The tutorial page is shorter.
+
+8. **Fixed agent clicks blocked by the in-page toolbar** — `locator.click()`, `hover()`, `tap()` and `dragTo()` on elements under the toolbar no longer fail with `<div data-playwriter-toolbar> intercepts pointer events`. Toolbar buttons are no longer focusable, so agent `Tab`, `Enter` or `Space` presses can never trigger them. Needs the latest extension. Fixes #126.
+
+9. **Fixed `PLAYWRITER_TOKEN` being ignored by auto-started relays** — the relay that the CLI and MCP start in the background now enforces the token on privileged requests, the same as `playwriter serve`. Fixes #119.
+
+10. **Fixed enabling a tab while the extension reconnects** — the tab was attached twice, failed with `Another debugger is already attached`, and later commands such as `recorder start` failed with `No tab found`.
+
+## 0.7.0
+
+1. **Remote-control tunnels use path-based URLs** — the share id now travels as `wss://playwriter.dev/tunnel/{id}/extension` (upstream dials `wss://playwriter.dev/tunnel/{id}/upstream`), so it no longer leaks through DNS queries or TLS SNI. Subdomain URLs (`{id}-tunnel.playwriter.dev`) still work so older extensions keep connecting.
+
+   ```sh
+   playwriter session new --remote <id>   # unchanged, now dials the path-based tunnel
+   ```
+
+   The relay keys remote dials by the full WebSocket URL, so several shared ids on the path form stay distinct tunnels.
+
+2. **Tab groups on remote-control sessions** — shared tabs join a `remote` group by default, and remote agents can set the group title and color when they connect or later with `session update`.
+
+   ```sh
+   playwriter session new --remote <id> --tab-group support
+   playwriter session update 1 --tab-group review --tab-group-color cyan
+   ```
+
+3. **`connectViaExtension()` Node API** — open a Playwriter session, connect over CDP, and close it without posting `/cli/session/new` yourself.
+
+   ```ts
+   import { connectViaExtension } from 'playwriter'
+
+   const connection = await connectViaExtension({
+     tabGroup: 'email-check',
+     tabGroupColor: 'grey',
+   })
+   const page = await connection.browser.contexts()[0].newPage()
+   await page.goto('https://example.com')
+   await connection.close()
+   ```
+
+   `tabGroupColor` is typed as Chrome's tab group colors. `close()` closes leftover pages, disconnects CDP, and deletes the session.
+
+4. **vs agent-browser comparison page** — new docs page and refreshed comparison tables with Playwriter as the first column. Covers why one programmable `execute` tool in your real Chrome beats a fixed command-per-action CLI.
+
+5. **Fewer extension connect/disconnect loops and startup hangs on Chrome 153.** A late `connect()` can no longer install its WebSocket over a newer attempt. `chrome.storage.local`, `chrome.identity.getProfileUserInfo`, and the high-entropy User-Agent lookup time out after 2s. Debugger detach during startup is bounded so one stuck target cannot stall the restart chain. Related to #40.
+
+6. **Website** — “Get Chrome Extension” CTA, page-width heroes with an ASCII video background, sidebar Changelog link to GitHub releases, `/changelog` redirects, public nav to `/login`, and a `screenshot-2x.png` homepage image so Cloudflare no longer 307s `@` in the filename.
+
+## 0.6.0
+
+1. **Remote control — share one tab of your browser with a remote agent or person, no local install needed.**
+
+   Click the light-blue **Remote control** cloud button in the Playwriter toolbar and confirm the disclosure. The extension opens a secret tunnel (128-bit random id) and copies a ready-to-paste agent prompt to your clipboard. A remote agent connects from any machine with just the share id:
+
+   ```bash
+   playwriter session new --remote abc123
+   playwriter -s 1 -e "console.log(await page.title())"
+   ```
+
+   **The same share is also a live view.** Open `https://playwriter.dev/remote-control#<id>` in any browser to watch the tab streamed frame by frame, with a URL bar and a **Take control** button for clicking, scrolling, and typing. So you can share a tab with a person, not only an agent, and neither side needs an install.
+
+   ```text
+   Your Chrome tab ──► extension tunnel upstream ──► wss://{id}-tunnel.playwriter.dev/extension
+                                                          │
+                                        ┌─────────────────┴─────────────────┐
+                                        ▼                                    ▼
+                              agent relay (--remote)                 live viewer page
+   ```
+
+   Scope and safety:
+   - Every host lives under **playwriter.dev**, and shares run on Playwriter's own Durable Objects, isolated from unrelated tunnel traffic.
+   - The recipient gets broad CDP access and must be fully trusted. `context.newPage()` / `Target.createTarget` are rejected with a helpful error asking for another shared tab instead.
+   - Whole-profile cookie APIs (`Network.getAllCookies`, `Storage.getCookies`, `Storage.setCookies`) and destructive clears are blocked; URL/domain-targeted cookie commands remain available.
+   - Only a real click starts a share: the button lives in Chrome's isolated world and the prompt is copied by an offscreen document, so page scripts cannot start it or read the link.
+   - Clicking the button again revokes the link instantly. The link survives service-worker restarts but dies when the browser closes, and a debugger detach or tab close also revokes it.
+   - Screencast frames are relayed in memory only, never stored; credentials are redacted from logs. The stream drops stale frames past a 2 MiB buffer and asks Chrome for a 960px JPEG at quality 50 every third frame.
+   - The tunnel handshake sends only the browser name and Playwriter version, never your email, Google account id, or install id.
+   - While a tab is shared, **Remote ON** is a dropdown with **Copy remote URL**, **Copy agent prompt**, **Copy id**, and **Stop sharing**.
+
+2. **Per-session tab groups** — tabs created by a session join a Chrome tab group named after the session's `--tab-group` (default `playwriter`), so multiple agents sharing one browser keep their tabs visually separate.
+
+   ```bash
+   # tabs created by this session join a group named "docs"
+   playwriter session new --tab-group docs --tab-group-color blue
+
+   # rename or recolor later (moves the session's existing tabs)
+   playwriter session update 1 --tab-group research
+   ```
+
+   Colors: `grey, blue, red, yellow, green, pink, purple, cyan, orange`. Without a color, each custom group gets a deterministic color from its name; the default `playwriter` group stays green. `session list` shows the group in a new `GROUP` column. Dragging a tab between playwriter groups keeps the connection; moving a whole group to another window no longer disconnects its tabs. Popups and child tabs inherit the opener's group. Only extension sessions support tab groups; the flag warns and is ignored for headless, direct CDP, cloud, and remote-control sessions. Old extensions safely ignore the group name.
+
+3. **`cloud` helper in CLI execution sessions** — list active cloud browsers and send the current page's cookies into one without printing or saving cookie values:
+
+   ```js
+   const browsers = await cloud.browsers.list()
+   await cloud.sendCookies({ from: state.page, to: browsers[0] })
+   ```
+
+   Pass `from` to use another page or `urls` when a login spans more than one HTTP origin.
+
+4. **Toolbar moved into Chrome's isolated extension world** — websites can no longer trigger **Record Skill** or **Remote control**. Previously the toolbar ran in the page's own JavaScript world and any script could post a forged `window.postMessage` to start a recording or open a tunnel. The toolbar now calls `chrome.runtime.sendMessage()` directly, privileged buttons require a real user gesture from the top frame, prompts and pinned-element commands are copied by an offscreen document, and the host uses `all:initial` and refuses clicks when a page hides, covers, or moves it. The toolbar looks exactly the same.
+
+5. **Relay metadata and MCP logs now require the configured relay token** — browser metadata such as profile details, tab titles, and tab URLs is no longer returned without the token.
+
+6. **Secrets redacted from action recordings** — URL credentials, credential-like query parameters, structured network fields, and all form fill values are redacted. Response bodies with unsafe bounds are omitted instead of loaded into memory.
+
+7. **Screen recordings stream to disk** — recording chunks are written directly to a temporary file instead of retained in memory. Failed or disconnected captures remove partial output, capture cancels if the WebSocket send buffer grows too large, and recording stop waits for the final encoded chunk.
+
+8. **Record Skill toolbar button reliability** — the button now shows **Starting…** while the recorder attaches, keeps a stable width, stays clickable during start (a click then stops the recording), shows an error toast on failed start, and no longer starts extra recordings on repeated clicks. The start cue is a short lock-on sweep that resolves to a clear tone.
+
+9. **Quieter, faster CDP handling on chatty sites** — the extension no longer sends a debug log for every Network and page-lifecycle CDP event. On Vite HMR pages those arrive thousands of times per second and used to starve real commands, so `page.screenshot()` and `context.newPage()` timed out and CPU spiked. Events are still forwarded to Playwright. Related to #96.
+
+10. **`session new` no longer kills a busy but healthy relay** — the `/version` probe (and `waitForRelayVersion`) now waits up to 10 seconds. A relay busy attaching many tabs used to miss the old 2 second probe, look dead, and get killed, wiping every in-memory session.
+
+11. **Reconnect no longer wipes attached tabs** — inventory handshake failures now close with browser-safe codes `4005`/`4006` instead of `1011` (which Chrome rejects with `InvalidAccessError`), and a stale ungroup event after reconnect no longer detaches tabs already back in the Playwriter group.
+
+12. **Snapshot correctness** — snapshot references and diff baselines are invalidated after main-frame navigation so old document locators cannot be reused on a new page, and role locators now resolve accessible names changed by CSS text transforms.
+
+13. **Fail closed on stale CDP routing** — a CDP client requesting a stale target or session now gets an error instead of an unrelated attached tab.
+
+14. **Serialized session operations** — commands from one session run in order, and reset/deletion wait for active work.
+
+15. **Stable error codes when no extension is connected** — session creation now returns structured error codes when it cannot find a connected extension. Closes #121.
+
+16. **`listScripts()` waits for parsed scripts** — the debugger waits for `Debugger.scriptParsed` after `Debugger.enable`, so `listScripts()` no longer returns an empty list on an already-loaded page.
+
+17. **Ghost Browser support** — the Playwriter extension installed by Ghost Browser can connect to the local relay.
+
+18. **Better CLI hints** — unknown commands print `Run "playwriter --help"` on stderr, and `session new` prints a reminder to run `playwriter skill`.
+
+19. **Toolbar polish** — toasts match the toolbar's dark surface and appear where you look, the drop shadow is no longer clipped to a gray rectangle, trailing button spacing is fixed, and controls sit at a balanced size. Tooltips hide while a Remote control dialog or menu is open.
+
+20. **Updated vulnerable dependencies** — runtime dependencies moved to patched releases and vulnerable HTML formatting dependencies were removed while preserving readable clean-HTML output.
+
+## 0.5.0
+
+1. **Skill Recorder** — record a workflow once in your real Chrome and let an agent turn it into a reusable skill. Click **Record Skill** on the in-page toolbar, or run:
+
+   ```bash
+   playwriter recorder start            # reuse the only session, or create one
+   playwriter recorder start -s 1       # attach to an existing session
+   # ... perform the workflow in the browser ...
+   playwriter recorder stop             # stop the only active recording
+   playwriter recorder events           # thin timeline of the latest recording
+   playwriter recorder events 4 7       # full details of events 4 and 7
+   playwriter recorder events -r 3      # events of recording 3
+   playwriter recorder status           # active recordings + current page urls
+   ```
+
+   Every click, fill, press, select, and file pick is recorded with Playwright locator code plus structured fields (`text`, `key`, `options`, `files`, `button`, `modifiers`). Mutating xhr/fetch (POST/PUT/PATCH/DELETE) is captured with request and response bodies so the agent can reverse-engineer a site API into an in-page SDK. Analytics collector hosts are dropped. WebSockets are not recorded.
+
+   Events live at `~/.playwriter/recordings/<id>.json`. A jpeg is saved for each visual change in `~/.playwriter/recordings/<id>/frames/<ms>.jpg`. Every event has an `ms` timestamp so you can pick the frame just before a click. Recording runs in the relay daemon, survives CLI exit, and auto-stops after 20 minutes. At most 10 recordings can be active; a new start stops the oldest one.
+
+   `recorder start` prints instructions for writing a `SKILL.md` plus a named helper (`submit.js`, `sdk.js`). The agent skill now installs from https://playwriter.dev:
+
+   ```bash
+   npx -y skills add https://playwriter.dev
+   ```
+
+   The toolbar Record button creates a session when none exists and no longer fails when many sessions are open. Websites cannot start or stop recordings: CORS on those routes allows only the Playwriter extension origin.
+
+2. **Live RTMP streaming** — stream a browser tab to X Live, Twitch, YouTube, or any RTMP endpoint via ffmpeg. Uses the same `chrome.tabCapture` pipeline as video recording, so the stream survives page navigation. ffmpeg runs inside the relay, so the stream keeps running after the CLI exits.
+
+   ```bash
+   playwriter stream start -s 1 --rtmp rtmp://va.pscp.tv:80/x/<stream-key>
+   playwriter stream status -s 1
+   playwriter stream stop -s 1
+   ```
+
+   Repeat `--rtmp` to fan out to several destinations with one encode. Defaults match X Live (1080p, 9000 kbps, 30 fps, 3s keyframes). For Twitch use `--video-bitrate 6000 --keyframe-interval 2`. Same API inside execute:
+
+   ```js
+   await stream.start({ rtmpUrls: ['rtmp://va.pscp.tv:80/x/KEY'] })
+   await stream.status()
+   await stream.stop()
+   ```
+
+   Stream keys are never logged. Status output only shows redacted destinations like `rtmp://host/…`.
+
+3. **Native ESM imports in execute** — `import()` now works inside `-e` / MCP execute. Relative modules resolve from the session working directory and run with normal Node.js permissions:
+
+   ```js
+   const { inspectPage } = await import('./scripts/inspect-page.mjs')
+   console.log(await inspectPage({ page }))
+   ```
+
+   Sandboxed `require()` and `importModule()` remain available for restricted access to allowlisted built-ins.
+
+4. **Daemon tutorial on idle icon click** — clicking the extension icon while the local daemon is down now opens a short tutorial tab instead of sitting on a gray or orange badge. A second click focuses the existing tutorial tab.
+
+5. **`PLAYWRITER_EXEC_TIMEOUT` env var** — set the default execution timeout (ms) for CLI `-e`/`-f` and the MCP `execute` tool. Explicit `--timeout` or the MCP `timeout` argument still wins:
+
+   ```bash
+   export PLAYWRITER_EXEC_TIMEOUT=30000
+   playwriter -s 1 -e 'await page.goto("https://slow.example")'
+   ```
+
+6. **Hide Playwriter UI during screenshots** — toolbar, overlay, ghost cursor, scrollbars, and the blinking caret are hidden for `Page.captureScreenshot`, so captured frames stay clean.
+
+7. **Show tracked page errors in execution output** — uncaught exceptions from pages assigned to the current session now appear automatically:
+
+   ```text
+   [PAGE ERROR] Uncaught TypeError: Cannot read properties of undefined
+   ```
+
+8. **Drop noisy CDP events** — high-frequency events such as `Network.dataReceived`, `*ExtraInfo`, and `webSocketFrame*` are no longer forwarded to Playwright clients. Relay and CDP logs also flush in 500ms batches, so heavy pages no longer flood the relay.
+
+9. **Ghost cursor works on strict CSP pages** — the cursor is now an inline `<svg>` instead of a `data:` background image, so sites like Hacker News no longer block it.
+
+10. **Fix long-running CLI executions** — `-e` / `-f` now follow the configured `--timeout` instead of failing at Node's fixed 300-second response-header timeout.
+
+11. **Fix cross-OS session cwd** — a Windows CLI talking to a WSL relay no longer mangles `C:\Users\...` into a POSIX path. Windows paths are translated to `/mnt/c/...`.
+
+12. **Fix remote relay auth** — MCP startup against token-protected remote relays, including Docker and devcontainer hosts, now sends the bearer token on the health check.
+
+    ```bash
+    playwriter --host host.docker.internal --token MY_SECRET_TOKEN
+    ```
+
+13. **Harden the execute sandbox** — `process.getBuiltinModule()` and `import()` no longer bypass the built-in allowlist.
+
+14. **Fix stale snapshots after navigation** — `snapshot()` waits for the accessibility cache to update after a full-page or client-side navigation.
+
+15. **Fix `Cannot find module 'ajv'` on `npx playwriter`** — `ajv` is now a direct dependency so npx can resolve it.
+
+16. **Document extension-mode keyboard focus** — skill docs now say agents should click a field before filling it, because Chrome routes OS key events to the focused Chrome window.
+
+Thanks @Ylandolsi for #103 and @tylergibbs1 for #101.
+
 ## 0.4.0
 
 1. **Cloud browser sessions via Browser Use** — spin up stealth Chromium VMs in the cloud with `playwriter session new --browser cloud`. Cloud browsers support residential proxies (`--proxy us`, `--proxy de`), custom proxies (`--custom-proxy host:port`), and configurable timeouts (`--timeout 120`). Idle sessions auto-disconnect after 10 minutes.

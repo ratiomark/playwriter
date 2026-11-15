@@ -1,288 +1,176 @@
 /**
- * Offscreen document for Playwriter screen recording.
- *
- * WHY OFFSCREEN DOCUMENT?
- * Manifest V3 service workers cannot use MediaRecorder or getUserMedia directly.
- * This hidden document provides access to Web APIs while the service worker orchestrates.
- *
- * RECORDING FLOW:
- *
- * ┌─────────────────┐     HTTP      ┌─────────────────┐    WebSocket    ┌─────────────────┐
- * │  User Code      │ ────────────► │  Relay Server   │ ───────────────►│  Extension      │
- * │  startRecording │               │  /recording/*   │                 │  background.ts  │
- * └─────────────────┘               └─────────────────┘                 └────────┬────────┘
- *                                                                                │
- *                                          ┌─────────────────────────────────────┘
- *                                          ▼
- *                                   ┌─────────────────┐
- *                                   │  Offscreen Doc  │  ◄── MediaRecorder
- *                                   │  (this file)    │
- *                                   └─────────────────┘
- *
- * STEP BY STEP:
- * 1. User calls startRecording() → HTTP POST to relay server
- * 2. Relay server forwards to extension via WebSocket
- * 3. Extension calls chrome.tabCapture.getMediaStreamId() to get capture permission
- *    - Requires --allowlisted-extension-id flag OR user clicking extension icon
- * 4. Extension creates this offscreen document via chrome.offscreen.createDocument()
- * 5. Extension sends streamId to offscreen document
- * 6. Offscreen calls navigator.mediaDevices.getUserMedia() with streamId
- * 7. Offscreen creates MediaRecorder and starts encoding to mp4
- * 8. Chunks are sent back to extension → relay server → written to output file
- *
- * KEY APIS:
- * - chrome.tabCapture.getMediaStreamId() - Extension API, gets capture permission
- * - chrome.offscreen.createDocument()    - Extension API, creates this document
- * - navigator.mediaDevices.getUserMedia() - Web API, gets MediaStream from streamId
- * - MediaRecorder                         - Web API, encodes video to mp4
+ * Offscreen document for extension-owned clipboard writes and menu sounds.
+ * Manifest V3 service workers have no DOM clipboard and no Web Audio, so the
+ * service worker sends copyText and playSound messages here.
  */
 
 import type {
   OffscreenMessage,
-  OffscreenStartRecordingMessage,
-  OffscreenStopRecordingMessage,
-  OffscreenIsRecordingMessage,
-  OffscreenCancelRecordingMessage,
-  OffscreenStartRecordingResult,
-  OffscreenStopRecordingResult,
-  OffscreenIsRecordingResult,
-  OffscreenCancelRecordingResult,
-  ChromeTabCaptureAudioConstraints,
-  ChromeTabCaptureVideoConstraints,
+  OffscreenCopyTextMessage,
+  OffscreenCopyTextResult,
+  OffscreenPlaySoundMessage,
+  OffscreenPlaySoundResult,
+  SoundName,
 } from './offscreen-types'
 
-interface OffscreenRecordingState {
-  recorder: MediaRecorder
-  stream: MediaStream
-  startedAt: number
-  tabId: number
-}
+const OFFSCREEN_ACTIONS = new Set<OffscreenMessage['action']>(['copyText', 'playSound'])
 
-// Map of tabId -> recording state for concurrent recording support
-const recordings = new Map<number, OffscreenRecordingState>()
-
-type OffscreenResult =
-  | OffscreenStartRecordingResult
-  | OffscreenStopRecordingResult
-  | OffscreenIsRecordingResult
-  | OffscreenCancelRecordingResult
+type OffscreenResult = OffscreenCopyTextResult | OffscreenPlaySoundResult
 
 chrome.runtime.onMessage.addListener((message: OffscreenMessage, _sender, sendResponse) => {
-  handleMessage(message).then(sendResponse)
+  if (!OFFSCREEN_ACTIONS.has(message.action)) {
+    return false
+  }
+  void handleMessage(message).then(sendResponse)
   return true // Keep channel open for async response
 })
 
 async function handleMessage(message: OffscreenMessage): Promise<OffscreenResult> {
   switch (message.action) {
-    case 'startRecording':
-      return handleStartRecording(message)
-    case 'stopRecording':
-      return handleStopRecording(message)
-    case 'isRecording':
-      return handleIsRecording(message)
-    case 'cancelRecording':
-      return handleCancelRecording(message)
-    default:
-      return { success: false, error: 'Unknown action' }
+    case 'copyText':
+      return handleCopyText(message)
+    case 'playSound':
+      return handlePlaySound(message)
   }
 }
 
-async function handleStartRecording(params: OffscreenStartRecordingMessage): Promise<OffscreenStartRecordingResult> {
-  const { tabId } = params
+// Sounds are synthesized live with Web Audio, no audio files.
+// Recipes from https://github.com/Danilaa1/cuelume
+type SoundLayer =
+  | {
+      kind: 'tone'
+      waveform: OscillatorType
+      frequency: number
+      glideTo?: number
+      glideTime?: number
+      offset?: number
+      attack: number
+      decay: number
+      peak: number
+    }
+  | {
+      kind: 'noise'
+      filterType: BiquadFilterType
+      filterFreq: number
+      filterQ: number
+      offset?: number
+      attack: number
+      decay: number
+      peak: number
+    }
 
-  if (recordings.has(tabId)) {
-    return { success: false, error: `Recording already in progress for tab ${tabId}` }
-  }
+interface SoundRecipe {
+  masterGain: number
+  layers: SoundLayer[]
+  shimmer: { delay: number; feedback: number; wet: number; lowpass: number }
+}
 
+const SOUND_RECIPES: Record<SoundName, SoundRecipe> = {
+  // Three-note ascending confirmation, played after clipboard copies.
+  success: {
+    masterGain: 0.5,
+    layers: [
+      { kind: 'tone', waveform: 'sine', frequency: 880, attack: 0.004, decay: 0.09, peak: 0.06 },
+      { kind: 'tone', waveform: 'sine', frequency: 1108.73, offset: 0.06, attack: 0.004, decay: 0.1, peak: 0.06 },
+      { kind: 'tone', waveform: 'sine', frequency: 1318.51, offset: 0.12, attack: 0.004, decay: 0.18, peak: 0.07 },
+    ],
+    shimmer: { delay: 0.1, feedback: 0.22, wet: 0.16, lowpass: 4500 },
+  },
+}
+
+let audioContext: AudioContext | null = null
+
+function renderSound(ctx: AudioContext, recipe: SoundRecipe): void {
+  const now = ctx.currentTime
+  const output = ctx.createGain()
+  output.gain.value = 4
+  output.connect(ctx.destination)
+  const master = ctx.createGain()
+  master.gain.value = recipe.masterGain
+  master.connect(output)
+
+  const { shimmer } = recipe
+  const delay = ctx.createDelay(1)
+  delay.delayTime.value = shimmer.delay
+  const lowpass = ctx.createBiquadFilter()
+  lowpass.type = 'lowpass'
+  lowpass.frequency.value = shimmer.lowpass
+  const feedback = ctx.createGain()
+  feedback.gain.value = shimmer.feedback
+  const wet = ctx.createGain()
+  wet.gain.value = shimmer.wet
+  master.connect(delay)
+  delay.connect(lowpass).connect(feedback).connect(delay)
+  lowpass.connect(wet).connect(output)
+
+  recipe.layers.forEach((layer) => {
+    const start = now + (layer.offset || 0)
+    const duration = layer.attack + layer.decay + 0.05
+    const envelope = ctx.createGain()
+    envelope.gain.setValueAtTime(0.0001, start)
+    envelope.gain.exponentialRampToValueAtTime(layer.peak, start + layer.attack)
+    envelope.gain.exponentialRampToValueAtTime(0.0001, start + layer.attack + layer.decay)
+    envelope.connect(master)
+
+    if (layer.kind === 'tone') {
+      const oscillator = ctx.createOscillator()
+      oscillator.type = layer.waveform
+      oscillator.frequency.setValueAtTime(layer.frequency, start)
+      if (layer.glideTo) {
+        oscillator.frequency.exponentialRampToValueAtTime(layer.glideTo, start + (layer.glideTime || duration))
+      }
+      oscillator.connect(envelope)
+      oscillator.start(start)
+      oscillator.stop(start + duration)
+      return
+    }
+
+    const buffer = ctx.createBuffer(1, Math.max(1, Math.floor(duration * ctx.sampleRate)), ctx.sampleRate)
+    const samples = buffer.getChannelData(0)
+    samples.forEach((_, index) => {
+      samples[index] = 2 * Math.random() - 1
+    })
+    const source = ctx.createBufferSource()
+    source.buffer = buffer
+    const filter = ctx.createBiquadFilter()
+    filter.type = layer.filterType
+    filter.frequency.value = layer.filterFreq
+    filter.Q.value = layer.filterQ
+    source.connect(filter).connect(envelope)
+    source.start(start)
+    source.stop(start + duration)
+  })
+}
+
+async function handlePlaySound(message: OffscreenPlaySoundMessage): Promise<OffscreenPlaySoundResult> {
   try {
-    // Build Chrome-specific tabCapture constraints
-    // These use Chrome's proprietary API that TypeScript doesn't have built-in types for
-    const audioConstraints: ChromeTabCaptureAudioConstraints | false = params.audio
-      ? {
-          mandatory: {
-            chromeMediaSource: 'tab',
-            chromeMediaSourceId: params.streamId,
-          },
-        }
-      : false
-
-    const videoConstraints: ChromeTabCaptureVideoConstraints = {
-      mandatory: {
-        chromeMediaSource: 'tab',
-        chromeMediaSourceId: params.streamId,
-        minFrameRate: params.frameRate || 30,
-        maxFrameRate: params.frameRate || 30,
-      },
+    audioContext ||= new AudioContext()
+    if (audioContext.state !== 'running') {
+      await audioContext.resume()
     }
-
-    // Get media stream from the streamId provided by tabCapture.getMediaStreamId
-    // Cast to MediaStreamConstraints since Chrome accepts the extended constraints
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: audioConstraints,
-      video: videoConstraints,
-    } as MediaStreamConstraints)
-
-    const recorder = new MediaRecorder(stream, {
-      mimeType: 'video/mp4',
-      videoBitsPerSecond: params.videoBitsPerSecond || 2500000,
-      audioBitsPerSecond: params.audioBitsPerSecond || 128000,
-    })
-
-    const startedAt = Date.now()
-
-    recordings.set(tabId, {
-      recorder,
-      stream,
-      startedAt,
-      tabId,
-    })
-
-    // Send chunks to service worker - each chunk includes tabId for routing
-    recorder.ondataavailable = async (event) => {
-      if (event.data.size > 0) {
-        // Convert blob to array buffer and send to service worker
-        const arrayBuffer = await event.data.arrayBuffer()
-        const uint8Array = new Uint8Array(arrayBuffer)
-        chrome.runtime.sendMessage({
-          action: 'recordingChunk',
-          tabId,
-          data: Array.from(uint8Array), // Convert to regular array for message passing
-        })
-      }
-    }
-
-    recorder.onerror = (event: Event) => {
-      console.error(`MediaRecorder error for tab ${tabId}:`, (event as ErrorEvent).error)
-      handleCancelRecordingForTab(tabId)
-    }
-
-    recorder.onstop = () => {
-      console.log(`MediaRecorder stopped for tab ${tabId}`)
-    }
-
-    // Wait for MediaRecorder to actually start before returning.
-    // This ensures the encoder is initialized and ready to capture frames.
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('MediaRecorder failed to start within 5 seconds'))
-      }, 5000)
-
-      recorder.onstart = () => {
-        clearTimeout(timeout)
-        console.log(`MediaRecorder started for tab ${tabId}`)
-        resolve()
-      }
-
-      // Start with 1 second chunks
-      recorder.start(1000)
-    })
-
-    return { success: true, tabId, startedAt, mimeType: 'video/mp4' }
-  } catch (error: any) {
-    console.error(`Failed to start recording for tab ${tabId}:`, error)
-    return { success: false, error: error.message }
+    renderSound(audioContext, SOUND_RECIPES[message.sound])
+    return { success: true }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
-async function handleStopRecording(params: OffscreenStopRecordingMessage): Promise<OffscreenStopRecordingResult> {
-  const { tabId } = params
-  const recording = recordings.get(tabId)
-
-  if (!recording) {
-    return { success: false, error: `No active recording for tab ${tabId}` }
-  }
-
+async function handleCopyText(message: OffscreenCopyTextMessage): Promise<OffscreenCopyTextResult> {
   try {
-    const { recorder, stream, startedAt } = recording
-
-    // Stop recorder and wait for final data
-    await new Promise<void>((resolve) => {
-      const originalOnStop = recorder.onstop
-      recorder.onstop = (event: Event) => {
-        if (originalOnStop) {
-          originalOnStop.call(recorder, event)
-        }
-        resolve()
-      }
-      if (recorder.state !== 'inactive') {
-        recorder.stop()
-      } else {
-        resolve()
-      }
-    })
-
-    // Stop all tracks
-    stream.getTracks().forEach((track: MediaStreamTrack) => {
-      track.stop()
-    })
-
-    const duration = Date.now() - startedAt
-
-    // Send final marker
-    chrome.runtime.sendMessage({
-      action: 'recordingChunk',
-      tabId,
-      final: true,
-    })
-
-    recordings.delete(tabId)
-
-    return { success: true, tabId, duration }
-  } catch (error: any) {
-    console.error(`Failed to stop recording for tab ${tabId}:`, error)
-    return { success: false, error: error.message }
-  }
-}
-
-function handleIsRecording(params: OffscreenIsRecordingMessage): OffscreenIsRecordingResult {
-  const { tabId } = params
-  const recording = recordings.get(tabId)
-
-  if (!recording) {
-    return { isRecording: false, tabId }
-  }
-
-  return {
-    isRecording: recording.recorder?.state === 'recording',
-    tabId,
-    startedAt: recording.startedAt,
-  }
-}
-
-function handleCancelRecording(params: OffscreenCancelRecordingMessage): OffscreenCancelRecordingResult {
-  const { tabId } = params
-  return handleCancelRecordingForTab(tabId)
-}
-
-// Helper function to cancel recording for a specific tab - used by error handlers too
-function handleCancelRecordingForTab(tabId: number): OffscreenCancelRecordingResult {
-  const recording = recordings.get(tabId)
-
-  if (!recording) {
-    return { success: true, tabId }
-  }
-
-  try {
-    const { recorder, stream } = recording
-
-    if (recorder.state !== 'inactive') {
-      recorder.stop()
+    const textarea = document.querySelector<HTMLTextAreaElement>('#clipboard-text')
+    if (!textarea) {
+      return { success: false, error: 'Clipboard textarea is missing' }
     }
-    stream.getTracks().forEach((track: MediaStreamTrack) => {
-      track.stop()
-    })
-
-    chrome.runtime.sendMessage({
-      action: 'recordingCancelled',
-      tabId,
-    })
-
-    recordings.delete(tabId)
-
-    return { success: true, tabId }
-  } catch (error: any) {
-    console.error(`Failed to cancel recording for tab ${tabId}:`, error)
-    return { success: false, error: error.message }
+    textarea.value = message.text
+    textarea.select()
+    const copied = document.execCommand('copy')
+    textarea.value = ''
+    if (!copied) {
+      return { success: false, error: 'Clipboard copy command failed' }
+    }
+    return { success: true }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
   }
 }
 

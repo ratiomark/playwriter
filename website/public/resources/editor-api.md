@@ -30,7 +30,7 @@ export interface EditResult {
  *
  * @example
  * ```ts
- * const cdp = await getCDPSession({ page })
+ * const cdp = await getCDPSession({ page: state.page })
  * const editor = new Editor({ cdp })
  * await editor.enable()
  *
@@ -212,11 +212,11 @@ export declare class Editor {
 ## Examples
 
 ```ts
-import { page, getCDPSession, createEditor, console } from './debugger-examples-types.js'
+import { state, getCDPSession, createEditor, console } from './debugger-examples-types.js'
 
 // Example: List available scripts
 async function listScripts() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const editor = createEditor({ cdp })
   await editor.enable()
 
@@ -226,7 +226,7 @@ async function listScripts() {
 
 // Example: Read a script with line numbers
 async function readScript() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const editor = createEditor({ cdp })
   await editor.enable()
 
@@ -246,7 +246,7 @@ async function readScript() {
 
 // Example: Edit a script (exact string replacement)
 async function editScript() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const editor = createEditor({ cdp })
   await editor.enable()
 
@@ -267,7 +267,7 @@ async function editScript() {
 
 // Example: Search across all scripts
 async function searchScripts() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const editor = createEditor({ cdp })
   await editor.enable()
 
@@ -283,7 +283,7 @@ async function searchScripts() {
 
 // Example: Write entire script content
 async function writeScript() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const editor = createEditor({ cdp })
   await editor.enable()
 
@@ -298,7 +298,7 @@ async function writeScript() {
 
 // Example: Edit an inline script (scripts without URL get inline://{id} URLs)
 async function editInlineScript() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const editor = createEditor({ cdp })
   await editor.enable()
 
@@ -317,7 +317,7 @@ async function editInlineScript() {
 
 // Example: List and read CSS stylesheets
 async function readStylesheet() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const editor = createEditor({ cdp })
   await editor.enable()
 
@@ -335,7 +335,7 @@ async function readStylesheet() {
 
 // Example: Edit a CSS stylesheet
 async function editStylesheet() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const editor = createEditor({ cdp })
   await editor.enable()
 
@@ -348,7 +348,7 @@ async function editStylesheet() {
 
 // Example: Search CSS for specific properties
 async function searchStyles() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const editor = createEditor({ cdp })
   await editor.enable()
 

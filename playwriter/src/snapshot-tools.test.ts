@@ -6,12 +6,12 @@ import type { AriaSnapshotNode } from './aria-snapshot.js'
 import path from 'node:path'
 import fs from 'node:fs'
 import os from 'node:os'
-import { imageSize } from 'image-size'
+import sharp from 'sharp'
 import { getCdpUrl } from './utils.js'
 import { getCDPSessionForPage } from './cdp-session.js'
 import type { CDPCommand } from './cdp-types.js'
 import { screenshotWithAccessibilityLabels } from './aria-snapshot.js'
-import { setupTestContext, cleanupTestContext, getExtensionServiceWorker, type TestContext, js } from './test-utils.js'
+import { setupTestContext, cleanupTestContext, getExtensionServiceWorker, type TestContext, js, findTestPageJs } from './test-utils.js'
 import './test-declarations.js'
 
 const TEST_PORT = 19991
@@ -54,7 +54,7 @@ describe('Snapshot & Screenshot Tests', () => {
 
     await new Promise((r) => setTimeout(r, 100))
 
-    const capturedCommands: CDPCommand[] = []
+    const capturedCommands: Extract<CDPCommand, { method: 'Page.captureScreenshot' }>[] = []
     const commandHandler = ({ command }: { clientId: string; command: CDPCommand }) => {
       if (command.method === 'Page.captureScreenshot') {
         capturedCommands.push(command)
@@ -76,7 +76,7 @@ describe('Snapshot & Screenshot Tests', () => {
     const viewportScreenshot = await cdpPage!.screenshot()
     expect(viewportScreenshot).toBeDefined()
 
-    const viewportDimensions = imageSize(viewportScreenshot)
+    const viewportDimensions = await sharp(viewportScreenshot).metadata()
     console.log('Viewport screenshot dimensions:', viewportDimensions)
     expect(viewportDimensions.width).toBeGreaterThan(0)
     expect(viewportDimensions.height).toBeGreaterThan(0)
@@ -88,7 +88,7 @@ describe('Snapshot & Screenshot Tests', () => {
     const fullPageScreenshot = await cdpPage!.screenshot({ fullPage: true })
     expect(fullPageScreenshot).toBeDefined()
 
-    const fullPageDimensions = imageSize(fullPageScreenshot)
+    const fullPageDimensions = await sharp(fullPageScreenshot).metadata()
     console.log('Full page screenshot dimensions:', fullPageDimensions)
     expect(fullPageDimensions.width).toBeGreaterThan(0)
     expect(fullPageDimensions.height).toBeGreaterThan(0)
@@ -97,43 +97,46 @@ describe('Snapshot & Screenshot Tests', () => {
     testCtx!.relayServer.off('cdp:command', commandHandler)
 
     expect(capturedCommands.length).toBe(2)
+    // example.com is live: its full page height changes by a pixel with fonts
+    const fullPageClip = capturedCommands[1]?.params?.clip
+    expect(fullPageClip?.height).toBeGreaterThanOrEqual(720)
     expect(
       capturedCommands.map((c) => ({
         method: c.method,
-        params: c.params,
+        params: c === capturedCommands[1] ? { ...c.params, clip: { ...fullPageClip, height: 'page height' } } : c.params,
       })),
     ).toMatchInlineSnapshot(`
-          [
-            {
-              "method": "Page.captureScreenshot",
-              "params": {
-                "captureBeyondViewport": false,
-                "clip": {
-                  "height": 720,
-                  "scale": 1,
-                  "width": 1280,
-                  "x": 0,
-                  "y": 0,
-                },
-                "format": "png",
-              },
+      [
+        {
+          "method": "Page.captureScreenshot",
+          "params": {
+            "captureBeyondViewport": false,
+            "clip": {
+              "height": 720,
+              "scale": 1,
+              "width": 1280,
+              "x": 0,
+              "y": 0,
             },
-            {
-              "method": "Page.captureScreenshot",
-              "params": {
-                "captureBeyondViewport": false,
-                "clip": {
-                  "height": 581,
-                  "scale": 1,
-                  "width": 1280,
-                  "x": 0,
-                  "y": 0,
-                },
-                "format": "png",
-              },
+            "format": "png",
+          },
+        },
+        {
+          "method": "Page.captureScreenshot",
+          "params": {
+            "captureBeyondViewport": true,
+            "clip": {
+              "height": "page height",
+              "scale": 1,
+              "width": 1280,
+              "x": 0,
+              "y": 0,
             },
-          ]
-        `)
+            "format": "png",
+          },
+        },
+      ]
+    `)
 
     const screenshotPath = path.join(os.tmpdir(), 'playwriter-test-screenshot.png')
     fs.writeFileSync(screenshotPath, viewportScreenshot)
@@ -175,7 +178,7 @@ describe('Snapshot & Screenshot Tests', () => {
 
     // Plain screenshot with scale:'css', NO clip
     const screenshot = await cdpPage!.screenshot({ scale: 'css' })
-    const dimensions = imageSize(screenshot)
+    const dimensions = await sharp(screenshot).metadata()
     console.log('Screenshot dimensions (no clip):', dimensions)
 
     expect(dimensions.width).toBe(actualViewport.width)
@@ -230,7 +233,7 @@ describe('Snapshot & Screenshot Tests', () => {
 
     await new Promise((r) => setTimeout(r, 400))
 
-    const capturedCommands: CDPCommand[] = []
+    const capturedCommands: Extract<CDPCommand, { method: 'Page.captureScreenshot' }>[] = []
     const commandHandler = ({ command }: { clientId: string; command: CDPCommand }) => {
       if (command.method === 'Page.captureScreenshot') {
         capturedCommands.push(command)
@@ -296,18 +299,11 @@ describe('Snapshot & Screenshot Tests', () => {
       await globalThis.toggleExtensionForActiveTab()
     })
 
-    await new Promise((r) => setTimeout(r, 400))
-
     const result = await client.callTool({
       name: 'execute',
       arguments: {
         code: js`
-                    let testPage;
-                    for (const p of context.pages()) {
-                        const html = await p.content();
-                        if (html.includes('test-btn')) { testPage = p; break; }
-                    }
-                    if (!testPage) throw new Error('Test page not found');
+                    ${findTestPageJs('test-btn')}
                     const btn = testPage.locator('#test-btn');
                     const locatorString = await getLocatorStringForElement(btn);
                     console.log('Locator string:', locatorString);
@@ -360,18 +356,11 @@ describe('Snapshot & Screenshot Tests', () => {
       await globalThis.toggleExtensionForActiveTab()
     })
 
-    await new Promise((r) => setTimeout(r, 400))
-
     const stylesResult = await client.callTool({
       name: 'execute',
       arguments: {
         code: js`
-                    let testPage;
-                    for (const p of context.pages()) {
-                        const html = await p.content();
-                        if (html.includes('main-btn')) { testPage = p; break; }
-                    }
-                    if (!testPage) throw new Error('Test page not found');
+                    ${findTestPageJs('main-btn')}
                     const btn = testPage.locator('#main-btn');
                     const styles = await getStylesForLocator({ locator: btn });
                     return styles;
@@ -448,12 +437,7 @@ describe('Snapshot & Screenshot Tests', () => {
       name: 'execute',
       arguments: {
         code: js`
-                    let testPage;
-                    for (const p of context.pages()) {
-                        const html = await p.content();
-                        if (html.includes('main-btn')) { testPage = p; break; }
-                    }
-                    if (!testPage) throw new Error('Test page not found');
+                    ${findTestPageJs('main-btn')}
                     const btn = testPage.locator('#main-btn');
                     const styles = await getStylesForLocator({ locator: btn });
                     return formatStylesAsText(styles);
@@ -960,18 +944,12 @@ describe('Snapshot & Screenshot Tests', () => {
     await serviceWorker.evaluate(async () => {
       await globalThis.toggleExtensionForActiveTab()
     })
-    await new Promise((r) => setTimeout(r, 400))
 
     const result = await client.callTool({
       name: 'execute',
       arguments: {
         code: js`
-                    let testPage;
-                    for (const p of context.pages()) {
-                        const html = await p.content();
-                        if (html.includes('submit-btn')) { testPage = p; break; }
-                    }
-                    if (!testPage) throw new Error('Test page not found');
+                    ${findTestPageJs('submit-btn')}
                     await screenshotWithAccessibilityLabels({ page: testPage });
                 `,
         timeout: 15000,
@@ -997,7 +975,7 @@ describe('Snapshot & Screenshot Tests', () => {
     expect(imageContent.data.length).toBeGreaterThan(100)
 
     const buffer = Buffer.from(imageContent.data, 'base64')
-    const dimensions = imageSize(buffer)
+    const dimensions = await sharp(buffer).metadata()
 
     const viewport = await page.evaluate(() => ({
       innerWidth: window.innerWidth,
@@ -1008,7 +986,7 @@ describe('Snapshot & Screenshot Tests', () => {
     console.log('Screenshot dimensions:', dimensions.width, 'x', dimensions.height)
     console.log('Window viewport:', viewport)
 
-    expect(dimensions.type).toBe('png')
+    expect(dimensions.format).toBe('png')
     expect(dimensions.width).toBeGreaterThan(0)
     expect(dimensions.height).toBeGreaterThan(0)
 

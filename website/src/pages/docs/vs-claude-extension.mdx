@@ -1,7 +1,7 @@
 ---
 title: Playwriter vs Claude Browser Extension
 sidebarTitle: vs Claude Extension
-description: Any MCP client, full Playwright API, and cross-platform support.
+description: Playwriter works with any MCP client, the full Playwright API, and every Chromium browser. Claude's extension is Claude-only.
 icon: lucide:bot
 ---
 
@@ -14,16 +14,16 @@ uses accessibility snapshots instead of screenshots by default.
 
 ## Comparison
 
-|  | Claude Extension | Playwriter |
+|  | Playwriter | Claude Extension |
 |---|---|---|
-| Agent support | Claude only | Any MCP client |
-| Windows/WSL | No | Yes |
-| Context method | Screenshots (100KB+) | A11y snapshots (5-20KB) |
-| Playwright API | No | Full |
-| Debugger | No | Yes |
-| Live code editing | No | Yes |
-| Network interception | Limited | Full |
-| Raw CDP access | No | Yes |
+| Agent support | **Any MCP client** | Claude only |
+| Windows/WSL | **Yes** | No |
+| Context method | **A11y snapshots (5-20KB)** | Screenshots (100KB+) |
+| Playwright API | **Full** | No |
+| Debugger | **Yes** | No |
+| Live code editing | **Yes** | No |
+| Network interception | **Full** | Limited |
+| Raw CDP access | **Yes** | No |
 
 ## Context efficiency
 
@@ -45,8 +45,9 @@ your browser setup.
 ```bash
 # Works with any MCP client, any agent
 playwriter session new
-playwriter -s 1 -e "snapshot({ page })"
-playwriter -s 1 -e "page.locator('button:has-text(\"Submit\")').click()"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
+playwriter -s 1 -e "snapshot({ page: state.page })"
+playwriter -s 1 -e "state.page.locator('button:has-text(\"Submit\")').click()"
 ```
 
 ## Advanced capabilities

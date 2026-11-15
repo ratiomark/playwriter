@@ -5,8 +5,8 @@ If `playwriter` command is not found, install globally or use npx/bunx:
 ```bash
 npm install -g playwriter@latest
 # or use without installing:
-npx playwriter@latest session new
-bunx playwriter@latest session new
+npx playwriter@latest session new --tab-group docs
+bunx playwriter@latest session new --tab-group docs
 ```
 
 If using npx or bunx always use @latest for the first session command. so we are sure of using the latest version of the package
@@ -19,10 +19,10 @@ Each session runs in an **isolated sandbox** with its own `state` object. Use se
 - Persist data (pages, variables) across multiple execute calls
 - Avoid interference when multiple agents use playwriter simultaneously
 
-Get a new session ID to use in commands:
+Get a new session ID to use in commands. Always pass a short task-specific `--tab-group` name (see Tab groups):
 
 ```bash
-playwriter session new
+playwriter session new --tab-group docs
 # outputs: 1
 ```
 
@@ -44,6 +44,46 @@ Reset a session if the browser connection is stale or broken:
 playwriter session reset <sessionId>
 ```
 
+### Tab groups
+
+**Always** set a custom group name for every session instead of the defaults (`playwriter` locally, `remote` for remote control). Use the shortest clear **single-word** name with no spaces, describing the task or site: `docs`, `shop`, `test`, `scrape`, `github`. When verifying a local dev server, use the short project name, like `--tab-group kimaki`.
+
+```bash
+playwriter session new --tab-group docs
+playwriter session new --tab-group scrape --tab-group-color grey
+```
+
+Colors: `grey, blue, red, yellow, green, pink, purple, cyan, orange`; otherwise color is derived from the name. Chrome can collapse or move groups. Dragging a tab between Playwriter groups keeps it connected; dragging it out disconnects it. Local and remote-control extension sessions only.
+
+### Patchright
+
+**Always** use `--patchright` for production websites where the user is logged in with their own account (email, social, shopping, admin dashboards). **Never** for localhost, dev servers or tunnels. It connects with Patchright and moves the mouse and types like a person. Switch an existing session mid-task, even after pages loaded:
+
+```bash
+playwriter session new --tab-group shop --patchright
+playwriter session update <sessionId> --patchright  # --patchright false switches back
+```
+
+Switching reconnects: tabs stay open, `state` is cleared, so get the page again with `context.pages().find(p => p.url().includes('...'))`. `page.evaluate` runs in the main world as usual. Pages can notice code that touches DOM methods or globals they hook; on bot-protected pages pass `true` as fourth argument for an isolated world that sees the DOM but not page globals: `page.evaluate(() => document.title, undefined, undefined, true)`. `page.on('console')` and `page.on('pageerror')` stay silent; use `getLatestLogs`, which turns on CDP Runtime for a few milliseconds to read buffered logs (pages could notice in that moment).
+
+Node programs and TypeScript SDKs use the `playwriter` package as a library. Do not POST `/cli/session/new` yourself. Docs: https://playwriter.dev/docs/sessions#node-api
+
+```ts
+import { connectViaExtension } from 'playwriter'
+
+// connection: disconnects and deletes the session at scope end, also on throw. It does NOT close tabs
+await using connection = await connectViaExtension({ tabGroup: 'docs' })
+// page: closes the tab this script opened
+await using page = await connection.browser.contexts()[0].newPage()
+await page.goto('https://example.com')
+```
+
+**Always** close the tabs your script opens (`await using page` or `page.close()`). A tab you leave open stays in Chrome, so a later process can reuse it via `context.pages()`. Match the tab by its **exact** url (`p.url() === 'https://example.com/app'`), never `startsWith`/`includes`: `context.pages()` also lists tabs other sessions opened for other work. `closeTabsOnEnd: true` makes `close()` also close every tab the session opened.
+
+To share one tab between processes (for example many SDK scripts calling `fetch` inside a signed-in site), keep the holder list inside the tab (`window.__shared`, updated with one atomic `page.evaluate`), and let the last holder call `page.close()`. Full example: https://playwriter.dev/docs/sessions#sharing-one-tab-between-processes
+
+With several browsers or profiles connected, pass `selectBrowser: (browsers) => browsers.find((b) => b.email === 'me@work.com')`. Each item has `id` (stable), `browser` (Chrome, Brave, Ghost...), `email`.
+
 ### Remote access (control browser from another machine)
 
 Playwriter can control a Chrome browser running on a different machine over the internet. The host machine runs `playwriter serve` with a [traforo](https://traforo.dev) tunnel, and the remote machine connects through the tunnel URL.
@@ -55,8 +95,8 @@ npx -y traforo -p 19988 -- npx -y playwriter serve --token MY_SECRET_TOKEN
 # Remote machine
 export PLAYWRITER_HOST=https://<tunnel-id>-tunnel.traforo.dev
 export PLAYWRITER_TOKEN=MY_SECRET_TOKEN
-playwriter session new
-playwriter -s 1 -e "await page.goto('https://example.com')"
+playwriter session new --tab-group docs
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
 ```
 
 For the full guide (Docker, LAN, MCP config, security), see: https://playwriter.dev/docs/remote-access
@@ -90,7 +130,7 @@ playwriter session new --direct wss://xxx.cdp.browser-use.com
 playwriter session new --direct 192.168.1.50:9222
 
 # Then use the session normally
-playwriter -s 1 -e "await page.goto('https://example.com')"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
 ```
 
 **MCP configuration** (for AI assistants): set the `PLAYWRITER_DIRECT` env var in your MCP client config. If the user provides a CDP URL (like `wss://xxx.cdp.browser-use.com`), use it as the value:
@@ -115,7 +155,29 @@ playwriter -s 1 -e "await page.goto('https://example.com')"
 - `ws://` or `wss://` URL — explicit WebSocket endpoint (local or cloud browser provider)
 - `host:port` — resolves via HTTP probe to a ws:// URL
 
-**Limitations:** screen recording (`recording.start`/`recording.stop`) is not available in direct CDP mode since it relies on the extension's `chrome.tabCapture` API.
+### Remote control (drive another user's browser)
+
+When a user shares their browser with you, they send a secret **id** (created by the toolbar **Remote control** button). The user needs no playwriter install, only the extension.
+
+**How it works:** the extension opens a secret tunnel. Your CLI dials it with the id and talks CDP as if the browser were local. You see every tab where the user enabled Playwriter and can open new tabs with `context.newPage()` (older extensions reject new tabs; then stay in the shared tab). `context.pages()[0]` is the tab where the user started sharing.
+
+Connect with:
+
+```bash
+playwriter session new --remote <id> --tab-group shop
+# prints a session id; use it normally afterwards, no extra flags needed
+playwriter -s 1 -e "state.page = context.pages()[0]; console.log(await state.page.title())"
+```
+
+Tabs you open join the `--tab-group` group (default `remote`). Always pass a short task name.
+
+Rules for remote-control sessions:
+
+- Other tabs may belong to the user or their local agents. Prefer your own pages: `state.page = context.pages()[0]` for the shared tab, or `await context.newPage()` for new work.
+- The user revokes access anytime with **Stop sharing**, or by closing the tab where sharing started; the id then stops working permanently. If the connection dies, ask the user for a fresh id.
+- Never print, log, or share the id: whoever has it can control the user's browser as them.
+
+**Use cases:** the user is logged into a website and wants you (a remote agent like Devin, a cloud bot, or a CLI agent on another machine) to act in their authenticated session without sharing passwords.
 
 ### Headless browser (no extension, no user browser)
 
@@ -129,11 +191,11 @@ playwriter browser install
 playwriter session new --browser headless
 
 # Use the session normally
-playwriter -s 1 -e "await page.goto('https://example.com')"
-playwriter -s 1 -e "console.log(await snapshot({ page }))"
+playwriter -s 1 -e "state.page = await context.newPage(); await state.page.goto('https://example.com')"
+playwriter -s 1 -e "console.log(await snapshot({ page: state.page }))"
 ```
 
-Multiple sessions reuse the same headless Chrome process. Recording is not available in headless mode.
+Multiple sessions reuse the same headless Chrome process. A headless session is deleted after 30 minutes with no execute; Chrome exits with the last one. Run `playwriter session delete <id>` when done.
 
 If no Chrome binary is found, `playwriter session new --browser headless` will tell you to run `playwriter browser install` first to download Chrome for Testing.
 
@@ -186,7 +248,7 @@ Cloud sessions auto-stop after 10 minutes of inactivity. When proxy is enabled, 
 playwriter -s <sessionId> -e "<code>"
 ```
 
-The `-s` flag specifies a session ID (required). Get one with `playwriter session new`. Use the same session to persist state across commands.
+The `-s` flag specifies a session ID (required). Get one with `playwriter session new --tab-group <name>`. Use the same session to persist state across commands.
 
 **Execution timeout:** default is 10000ms. Override per call with `--timeout <ms>`, or set a new default via env:
 
@@ -200,6 +262,26 @@ playwriter -s 1 -e '...'
 ```
 
 PLAYWRITER_EXEC_TIMEOUT is the default fallback. --timeout overrides it, and MCP clients can set the env var or pass a per-call timeout.
+
+On timeout the code is aborted: its running and later Playwright calls fail and the global `signal` (AbortSignal) is aborted. Steps done before the timeout stay done, so check the page before retrying. In long-running code, pass `signal` to `fetch` and check `signal.aborted` in loops so it stops on timeout:
+
+```js
+for (const url of urls) {
+  if (signal.aborted) break
+  state.results.push(await (await fetch(url, { signal })).text())
+}
+```
+
+Calls in one session run in order.
+
+**File-based execution:** for complex multi-line code, write a `.js` file and run it with `-f` instead of fighting with bash quoting:
+
+```bash
+playwriter -s 1 -f ./scripts/my-automation.js
+```
+
+`-f` and `-e` cannot be used together. The file content is executed with the same sandbox context (context, state, snapshot, etc.).
+
 **Examples:**
 
 ```bash
@@ -219,7 +301,7 @@ playwriter -s 1 -e 'await state.page.screenshot({ path: "/absolute/path/to/scree
 playwriter -s 1 -e 'await snapshot({ page: state.page })'
 
 # Get accessibility snapshot for a specific iframe
-playwriter -s 1 -e 'const frame = await state.page.locator("iframe").contentFrame(); await snapshot({ frame })'
+playwriter -s 1 -e 'const frame = await state.page.locator("iframe").contentFrame(); await snapshot({ page: state.page, frame })'
 ```
 
 **Why single quotes?** Always wrap `-e` code in single quotes (`'...'`) to prevent bash from interpreting `$`, backticks, and other special characters inside your JS code. Use double quotes or backtick template literals for strings inside the JS code.
@@ -257,11 +339,36 @@ For longer scripts, use `-f` instead of `-e` to execute JavaScript from a file:
 playwriter -s 1 -f script.js
 ```
 
-The file is read from disk and executed in the same sandbox as `-e`. All context variables (`state`, `page`, `context`, etc.) are available. `-e` and `-f` cannot be used together.
+The file is read from disk and executed in the same sandbox as `-e`. All context variables (`state`, `context`, etc.) are available. `-e` and `-f` cannot be used together.
+
+### Recording user actions for skill generation
+
+Before any recorder work, run `playwriter skill` once and read the full output (never truncate).
+
+The user can start recording from the Playwriter toolbar (**Record Skill** button) or ask you to run `playwriter recorder start`. Both write the same event file. The toolbar does not pick a session; the relay attaches to any free extension session (or creates one). Session choice does not matter: extension sessions share the same Chrome tabs. You identify the recording later at **stop** time.
+
+`playwriter recorder start` records everything the user does in the browser (clicks, typing, navigations, xhr/fetch, toast and alert text) as events with generated locator strings. It also saves a jpeg of each visual change into a frames folder. User clicks flash a ripple in those frames. To see the screen at an event, open the path printed by `playwriter recorder frame <eventId>`. When the user asks you to "start recording", run it and let them perform their workflow. You may run playwriter commands on that session if they ask (snapshot, inspect, click something). If they did not ask, ask first. Do not drive the workflow yourself.
+
+```bash
+playwriter recorder start            # reuse the only session, or create one
+playwriter recorder start -s 1       # attach to an existing session
+playwriter recorder status           # active recordings + current page urls
+playwriter recorder stop             # stop the only active recording
+playwriter recorder stop 3           # stop recording 3 when several are active
+playwriter recorder events           # thin timeline of the latest recording
+playwriter recorder events -r 3      # events of recording 3
+playwriter recorder events 4 7       # full details of events 4 and 7
+playwriter recorder events --errors   # failed requests, console errors, toasts
+playwriter recorder frame 7 --offset 1000  # screenshot path 1s after event 7
+```
+
+Run `playwriter recorder stop` when they say done, then `playwriter recorder events -r <id>` to read the events. If stop fails because **more than one recording is active**, the error lists each recording id, session, and current or last page URL. Pick the one that matches the workflow (or ask the user), then `playwriter recorder stop <id>`. Replay the flow with **playwriter** commands only (`playwriter -s <id> -e '...'`), never raw Playwright. The `recorder start` output prints full instructions for turning a recording into a reusable skill: a SKILL.md of markdown instructions with example playwriter commands, plus an importable helper script (`submit.js`, `sdk.js`) for cheap replay. Recording runs inside the relay daemon, so it survives CLI exits. Pass `-s <id>` to record an existing session; the recorder attaches to all Playwriter-enabled tabs and does not open a new tab. A recording auto-stops after 20 minutes or 500 MB of frames and events (`reason: "max-size"`).
+
+If the user started from the toolbar and then says "done", still run `playwriter recorder stop` (or `stop <id>` if several are listed). The toolbar **Stop recording…** button also works.
 
 ### Live streaming to RTMP (X Live, Twitch, YouTube)
 
-Niche use case: `playwriter stream start|stop|status` streams a tab live to RTMP endpoints via ffmpeg, surviving navigation and running 24/7 after the CLI exits. Docs: https://playwriter.dev/docs/streaming
+Niche use case: `playwriter stream start|stop|status` streams `state.page` live to RTMP endpoints via CDP screencast and ffmpeg (must be on PATH). It survives navigation and CLI exit, and ends when the page closes or the session is reset. Docs: https://playwriter.dev/docs/streaming
 
 ### Debugging playwriter issues
 
@@ -306,19 +413,6 @@ start chrome.exe --profile-directory=Default
 Start-Process chrome.exe -ArgumentList '--profile-directory=Default'
 ```
 
-To also enable automatic tab capture for screen recording (no manual extension click needed), add the `--allowlisted-extension-id` and `--auto-accept-this-tab-capture` flags:
-
-```bash
-# macOS
-open -a "Google Chrome" --args --profile-directory=Default --allowlisted-extension-id=jfeammnjpkecdekppnclgkkffahnhfhe --auto-accept-this-tab-capture
-
-# Linux
-google-chrome --profile-directory=Default --allowlisted-extension-id=jfeammnjpkecdekppnclgkkffahnhfhe --auto-accept-this-tab-capture &
-
-# Windows
-start chrome.exe --profile-directory=Default --allowlisted-extension-id=jfeammnjpkecdekppnclgkkffahnhfhe --auto-accept-this-tab-capture
-```
-
 You can collaborate with the user - they can help with captchas, difficult elements, or reproducing bugs.
 
 **Direct CDP mode (no extension needed):** Playwriter can connect directly to Chrome's DevTools Protocol, bypassing the extension. This is useful in CI, Docker, headless environments, when Chrome has `--remote-debugging-port=9222`, or with cloud browser providers (e.g. `wss://xxx.cdp.browser-use.com`). If the user provides a CDP URL, set `PLAYWRITER_DIRECT` in the MCP client config:
@@ -337,19 +431,87 @@ You can collaborate with the user - they can help with captchas, difficult eleme
 }
 ```
 
-`PLAYWRITER_DIRECT` accepts `1` (auto-discover Chrome on port 9222), a `ws://` or `wss://` endpoint (including cloud browser providers), or `host:port`. Screen recording is not available in direct CDP mode since it relies on the extension's `chrome.tabCapture` API.
+`PLAYWRITER_DIRECT` accepts `1` (auto-discover Chrome on port 9222), a `ws://` or `wss://` endpoint (including cloud browser providers), or `host:port`.
 
 ## context variables
 
 - `state` - object persisted between calls **within your session**. Each session has its own isolated state. Use to store pages, data, listeners (e.g., `state.page = await context.newPage()`)
-- `page` - a default page (may be shared with other agents). Prefer creating your own page and storing it in `state` (see "working with pages")
-- `context` - browser context, access all pages via `context.pages()`
-- `require` - load Node.js modules (e.g., `const fs = require('node:fs')`). ESM `import` is not available in the sandbox
+- `context` - browser context, access all pages via `context.pages()`, create one with `context.newPage()`
+- `cloud` - list active cloud browsers and send a page's cookies to one. Available in local CLI sessions, but not in cloud or remote-control sessions
+- `require` - load Node.js modules (e.g., `const fs = require('node:fs')`)
+- `import()` - use Node.js ESM to load local scripts, packages, and built-ins (e.g., `const helpers = await import('./scripts/helpers.js')`). Relative paths resolve from the session cwd
+- `importModule` - restricted async import for allowlisted Node.js built-ins (e.g., `const fs = await importModule('node:fs')`)
 - Node.js globals: `setTimeout`, `setInterval`, `fetch`, `URL`, `Buffer`, `crypto`, `process`, etc.
 
-**Not available in the sandbox:** `__dirname`, `__filename`, `import`.
+**Not available in the sandbox:** `__dirname`, `__filename`, and a default `page`. Reading `page` throws. Get your own page (see "working with pages").
 
-**Important:** `state` is **session-isolated** but pages are **shared** across all sessions. See "working with pages" for how to avoid interference.
+### sending page cookies to a cloud browser
+
+List active cloud browsers, then send the cookies that apply to a page URL:
+
+```js
+const browsers = await cloud.browsers.list()
+console.log(browsers)
+await cloud.sendCookies({ from: state.page, to: browsers[0] })
+```
+
+You can use a cloud key or either session ID directly:
+
+```js
+await cloud.sendCookies({ from: state.page, to: 'cloud-1' })
+```
+
+`sendCookies` reads cookies for `from.url()`. `from` is required. Pass `urls` when the login uses more than one HTTP origin:
+
+```js
+await cloud.sendCookies({
+  from: state.page,
+  to: 'cloud-1',
+  urls: ['https://example.com', 'https://api.example.com'],
+})
+```
+
+The result contains the browser key, cookie count, domains, and skipped count. It never contains cookie values. This copies cookies only. It does not copy local storage, IndexedDB, service workers, saved passwords, or device-bound credentials.
+
+`cloud` is available for local extension, headless, and direct CLI sessions. It is not available inside managed cloud sessions, remote-control sessions, or the MCP server. Run `playwriter cloud login` or set `PLAYWRITER_API_KEY` on the CLI machine before you create the session. The CLI forwards the credentials to the relay without exposing them in the execution scope. Credentials already present on the relay machine also work.
+
+### importing local scripts
+
+Local modules use normal Node.js ESM. Export helper functions from a `.js` or `.mjs` file and pass Playwriter values such as `page` explicitly:
+
+```js
+// scripts/page-helpers.mjs
+export async function getPageInfo({ page }) {
+  return {
+    title: await page.title(),
+    url: page.url(),
+  }
+}
+```
+
+Load the module from the directory where the Playwriter session was created:
+
+```js
+const { getPageInfo } = await import('./scripts/page-helpers.mjs')
+console.log(await getPageInfo({ page: state.page }))
+```
+
+Local modules can use static imports and package imports normally:
+
+```js
+// scripts/save-title.mjs
+import fs from 'node:fs/promises'
+import path from 'node:path'
+
+export async function saveTitle({ page, outputPath }) {
+  await fs.mkdir(path.dirname(outputPath), { recursive: true })
+  await fs.writeFile(outputPath, await page.title())
+}
+```
+
+**Security:** Modules loaded with `import()` run with normal Node.js permissions. Only import code you trust. Use sandboxed `require` or `importModule` when you need restricted built-ins and scoped filesystem writes.
+
+**Important:** `state` is **session-isolated**. Tabs your session opens are visible only to your session; tabs the user enabled are shared. See "working with pages".
 
 **Sandboxed `fs` write restrictions:** `require('node:fs')` is scoped. Writes (writeFileSync, mkdirSync, etc.) only succeed in:
 - The **directory where `playwriter` CLI was invoked** (the session's cwd)
@@ -360,38 +522,40 @@ Writing to any other path (e.g. `~/Downloads`, `~/Desktop`) throws `EPERM: opera
 
 ## rules
 
-- **Initialize state.page first**: see "working with pages" — at the start of a task, assign `state.page` (reuse `about:blank` or create one) and use `state.page` for all automation steps.
+- **Initialize state.page first**: see "working with pages". There is no default `page`. At the start of a task, assign `state.page` (a new tab, or the tab the user pointed to) and use `state.page` for all automation steps.
 - **Multiple calls**: use multiple execute calls for complex logic - helps understand intermediate state and isolate which action failed
 - **Never close**: never call `browser.close()` or `context.close()`. Only close pages you created or if user asks
 - **No bringToFront**: never call unless user asks - it's disruptive and unnecessary, you can interact with background pages
 - **Click before keyboard input in extension mode.** Call `click()` on the target field immediately before `fill()` or `keyboard` methods. CDP sends keyboard input to the browser's OS-focused surface, so DOM focus and `bringToFront()` can still leave text in Chrome's omnibox.
 - **Check state after actions**: always verify page state after clicking/submitting (see next section)
-- **Clean up listeners**: call `state.page.removeAllListeners()` at end of message to prevent leaks
-- **Always print page logs after every action**: call `getLatestLogs({ page: state.page, sinceLastCall: true })` after every goto, click, or submit to catch console errors and warnings. Do not manually collect `page.on('console')` events; manual listeners miss logs emitted before the listener is attached. The first `sinceLastCall` call returns all buffered logs including startup and hydration errors.
+- **Verification pages**: when a navigation lands on a verification or block page, execute prints a `[WARNING]` and already waited for checks that clear by themselves. Never reload or retry in a loop; ask the user to complete it in the tab, or stop on a block.
+- **Clean up only your listeners**: remove listeners you added by event name or handler reference. Never call `removeAllListeners()` because it also removes Playwriter's page error and console listeners.
+- **Tracked page errors are automatic**: uncaught errors from pages assigned directly to `state` keys appear in the current or next execute output as `[PAGE ERROR]`. Errors from pages tracked by other sessions are excluded.
+- **Always print page logs after every action**: call `getLatestLogs({ page: state.page, sinceLastCall: true })` after every goto, click, or submit to catch console errors and warnings. Do not manually collect `page.on('console')` events; manual listeners miss logs emitted before the listener is attached. The first `sinceLastCall` call returns all buffered logs including startup and hydration errors. `getLatestLogs` needs `page`. `snapshot` needs `page`, or a `locator`/`frame` from your tab.
 - **CDP sessions**: use `getCDPSession({ page: state.page })` not `state.page.context().newCDPSession()` - NEVER use `newCDPSession()` method, it doesn't work through playwriter relay
 - **Wait for load**: use `state.page.waitForLoadState('domcontentloaded')` not `state.page.waitForEvent('load')` - waitForEvent times out if already loaded
 - **Minimize timeouts**: prefer proper waits (`waitForSelector`, `waitForPageLoad`) over `state.page.waitForTimeout()`. Short timeouts (1-2s) are acceptable for non-deterministic events like animations, tab opens, or async UI updates where no specific selector is available
-- **Snapshot before screenshot**: always use `snapshot()` first to understand page state (text-based, fast, cheap). Only use `screenshot` when you specifically need visual/spatial information. Never take a screenshot just to check if a page loaded or to read text content — snapshot gives you that instantly without burning image tokens
+- **Snapshot before screenshot**: always use `snapshot({ page: state.page })` first to understand page state (text-based, fast, cheap). Only use `screenshot` when you specifically need visual/spatial information. Never take a screenshot just to check if a page loaded or to read text content — snapshot gives you that instantly without burning image tokens
 - **Always use absolute file paths for Playwright artifact APIs**: for `page.screenshot({ path })`, `locator.screenshot({ path })`, `elementHandle.screenshot({ path })`, `page.pdf({ path })`, `download.saveAs(path)`, and `video.saveAs(path)`, always pass an absolute path. Relative paths are resolved by Playwright client internals, not the sandboxed `fs`, so they may use the relay server cwd instead of your session cwd.
-- **Snapshot replaces page.evaluate() for inspection**: do NOT write `page.evaluate()` calls to manually query class names, bounding boxes, child counts, or visibility flags. `snapshot()` already shows every interactive element with its text, role, and a ready-to-use locator. If you catch yourself writing `document.querySelector` or `getBoundingClientRect` inside evaluate — stop and use `snapshot()` instead. Reserve `page.evaluate()` for actions that modify page state (e.g., `localStorage.clear()`, scroll manipulation) or extract non-DOM data (e.g., `window.__CONFIG__`)
+- **Use snapshot() for element discovery, inspect() for layout**: `snapshot({ page: state.page })` shows roles, text, and locators — use it to find elements and check visibility. `inspect()` shows bounding boxes, scroll state, and computed styles — use it when you need layout or scroll info. Do NOT write `page.evaluate()` calls to query class names, bounding boxes, or visibility flags. Reserve `page.evaluate()` for state mutations (e.g., `localStorage.clear()`, `el.scrollTop += 300`) or extracting non-DOM data (e.g., `window.__CONFIG__`)
 
 ## interaction feedback loop
 
 Every browser interaction must follow **observe → act → observe**. Never chain multiple actions blindly.
 
 1. **Open page** — get or create your page, navigate to URL
-2. **Observe** — print `state.page.url()` + `snapshot()` + `getLatestLogs({ sinceLastCall: true })`. Always print URL — pages can redirect unexpectedly.
+2. **Observe** — print `state.page.url()` + `snapshot({ page: state.page })` + `getLatestLogs({ page: state.page, sinceLastCall: true })`. Always print URL — pages can redirect unexpectedly.
 3. **Check** — if page isn't ready (loading, wrong URL, content missing), wait and observe again
 4. **Act** — perform one action (click, type, submit)
 5. **Observe again** — print URL + snapshot + page logs to verify the action's effect
 6. **Repeat** from step 3 until task is complete
 
-**Always print page logs after every action** using `getLatestLogs({ sinceLastCall: true })`. This returns only new console messages and errors since the last call, so you catch hydration errors, failed network requests, and runtime exceptions without duplicates. The first call returns all buffered logs from the page, including logs emitted before your script started.
+**Always print page logs after every action** using `getLatestLogs({ page: state.page, sinceLastCall: true })`. This returns only new console messages and errors since the last call, so you catch hydration errors, failed network requests, and runtime exceptions without duplicates. The first call returns all buffered logs from the page, including logs emitted before your script started.
 
 ```js
 // Each step should be a separate execute call:
 // Step 1: navigate + observe
-state.page = context.pages().find((p) => p.url() === 'about:blank') ?? (await context.newPage())
+state.page = await context.newPage()
 await state.page.goto('https://example.com', { waitUntil: 'domcontentloaded' })
 console.log('URL:', state.page.url())
 console.log('Page logs:', await getLatestLogs({ page: state.page, sinceLastCall: true }))
@@ -421,7 +585,7 @@ console.log('UI:', snap)
 console.log('Logs:', logs)
 ```
 
-Use `getLatestLogs({ sinceLastCall: true })` after every action, `getLatestLogs({ search })` for targeted debugging, `state.page.url()` for navigation, screenshots only for visual layout issues.
+Use `getLatestLogs({ page: state.page, sinceLastCall: true })` after every action, `getLatestLogs({ page: state.page, search })` for targeted debugging, `state.page.url()` for navigation, screenshots only for visual layout issues.
 
 ## common mistakes to avoid
 
@@ -447,7 +611,7 @@ await state.page.keyboard.press('Meta+v') // always verify with screenshot!
 ```
 
 **3. Using stale locators from old snapshots**
-Locators (especially ones with `>> nth=`) can change when the page updates. Always get a fresh snapshot before clicking, then immediately use locators from that output:
+Locators (especially ones with `>> nth=`) can change when the page updates. Main-frame navigation invalidates all refs and diff baselines for that page. Always get a fresh snapshot before clicking, then immediately use locators from that output:
 
 ```js
 await snapshot({ page: state.page, showDiffSinceLastCall: true })
@@ -509,7 +673,7 @@ await waitForPageLoad({ page: state.page, timeout: 5000 })
 Do NOT waste context trying webfetch, curl, or Playwright CLI screenshots on SPAs (Instagram, Twitter, etc.). These return empty HTML shells. Use playwriter directly:
 
 ```js
-state.page = context.pages().find((p) => p.url() === 'about:blank') ?? (await context.newPage())
+state.page = await context.newPage()
 await state.page.goto('https://www.instagram.com/p/ABC123/', { waitUntil: 'domcontentloaded' })
 await waitForPageLoad({ page: state.page, timeout: 8000 })
 await snapshot({ page: state.page, search: /cookie|consent|accept/i }).then(console.log)
@@ -527,7 +691,7 @@ const pages = context.pages()
 const loginPage = pages[pages.length - 1]
 
 // Complete login flow in loginPage, cookies are shared with original page
-await loginPage.locator('[data-email]').first().click()
+await loginPage.getByText('me@example.com').click()
 await loginPage.waitForURL('**/callback**')
 // Original page should now be authenticated
 ```
@@ -552,13 +716,13 @@ await state.page.getByRole('radio', { name: 'Node.js' }).click()
 **13. Over-investigating instead of just interacting**
 When something doesn't respond to a click, do NOT start inspecting CDP event listeners, React fibers, canvas pixel data, or writing `page.evaluate()` to read class names and bounding boxes. This wastes massive context. Instead:
 
-1. Take a `snapshot()` — it shows every interactive element and what to click
+1. Take a `snapshot({ page: state.page })` — it shows every interactive element and what to click
 2. Try a different interaction pattern if `click()` didn't work:
    - **Drawing/annotation tools, canvas paint** → `mouse.down`, move with steps, `mouse.up` (see drag section)
    - **Keyboard-activated modes** → press the shortcut key (snapshot shows tooltip text like "Draw mode D")
    - **Sliders, timeline scrubbers** → drag pattern
    - **Collapsed/toggled toolbars** → click the toggle first, wait, then interact
-3. Take another `snapshot()` to see what changed
+3. Take another `snapshot({ page: state.page })` to see what changed
 4. Only investigate DOM internals if correct interaction patterns produce zero response after 2–3 attempts
 
 ## accessibility snapshots
@@ -567,14 +731,25 @@ When something doesn't respond to a click, do NOT start inspecting CDP event lis
 await snapshot({ page: state.page, search?, showDiffSinceLastCall? })
 ```
 
-- `search` - string/regex to filter results (returns first 10 matching lines)
+Always pass `{ page: state.page }`, or pass a `locator`/`frame` from that tab. `snapshot()` with no arguments throws. A locator is enough: the helper uses `locator.page()`.
+
+```js
+await snapshot({ page: state.page, locator: state.page.locator('form') })
+await snapshot({ locator: state.page.locator('form') })
+```
+
+- `search` - string (case-insensitive) or regex to filter results (returns first 10 matching lines, with the total match count)
 - `showDiffSinceLastCall` - returns diff since last snapshot (default: `true`, but `false` when `search` is provided). Pass `false` to get full snapshot.
 
-Snapshots return full content on first call, then diffs on subsequent calls. Diff is only returned when shorter than full content. If nothing changed, returns "No changes since last snapshot" message. Use `showDiffSinceLastCall: false` to always get full content. When `search` is provided, diffing is disabled by default so the search filters the full content — pass `showDiffSinceLastCall: true` explicitly to combine both. This diffing behavior also applies to `getCleanHTML` and `getPageMarkdown`.
+Snapshots return full content on first call, then diffs on subsequent calls. Diff is only returned when shorter than full content. If nothing changed, returns "No changes since last snapshot" after the URL line. Use `showDiffSinceLastCall: false` to always get full content. When `search` is provided, diffing is disabled by default so the search filters the full content — pass `showDiffSinceLastCall: true` explicitly to combine both. This diffing behavior also applies to `getCleanHTML` and `getPageMarkdown`.
+
+Every snapshot starts with `URL: <current page url>` so you can see which tab was snapshotted. Diffs and "No changes" / "No matches found" include that line too.
 
 Example output:
 
 ```md
+URL: https://example.com/
+
 - banner:
   - link "Home" [id="nav-home"]
   - navigation:
@@ -584,7 +759,7 @@ Example output:
 
 Each interactive line ends with a Playwright locator you can pass to `state.page.locator()`.
 If multiple elements share the same locator, a `>> nth=N` suffix is added (0-based)
-to make it unique.
+to make it unique. It is positional and only valid for that snapshot. Before destructive actions, prefer scoping to a unique parent (dialog, row, form) instead.
 
 **Use snapshot locators directly — never invent selectors.** The snapshot output IS the selector. Do not guess CSS selectors or `getByText` when the snapshot already gives you the exact match:
 
@@ -601,7 +776,7 @@ If a screenshot shows ref labels like `e3`, resolve them using the last snapshot
 
 ```js
 const snap = await snapshot({ page: state.page })
-const locator = refToLocator({ ref: 'e3' })
+const locator = refToLocator({ ref: 'e3', page: state.page })
 await state.page.locator(locator!).click()
 ```
 
@@ -611,18 +786,18 @@ Search for specific elements:
 const snap = await snapshot({ page: state.page, search: /button|submit/i })
 ```
 
-**Scoping snapshots to a specific element** — pass a `locator` instead of `page` to snapshot only a subtree. This dramatically reduces output size when you only care about one section of the page (e.g., the main content area, ignoring the sidebar/header/footer):
+**Scoping snapshots to a specific element** — pass `page` and a `locator` to snapshot only a subtree. This dramatically reduces output size when you only care about one section of the page (e.g., the main content area, ignoring the sidebar/header/footer):
 
 ```js
 // Full page snapshot: ~150 lines (sidebar, nav, header, footer, everything)
 await snapshot({ page: state.page })
 
 // Scoped to main: ~20 lines (just the content you care about)
-await snapshot({ locator: state.page.locator('main') })
+await snapshot({ page: state.page, locator: state.page.locator('main') })
 
 // Scope to a specific form, dialog, or section
-await snapshot({ locator: state.page.locator('[role="dialog"]') })
-await snapshot({ locator: state.page.locator('form#checkout') })
+await snapshot({ page: state.page, locator: state.page.locator('[role="dialog"]') })
+await snapshot({ page: state.page, locator: state.page.locator('form#checkout') })
 ```
 
 Use this whenever the full page snapshot is dominated by navigation or layout elements you don't need. It saves significant tokens and makes the output much easier to parse.
@@ -635,7 +810,7 @@ Use `snapshot` for text-heavy pages (forms, articles) — fast, cheap, searchabl
 
 ## selector best practices
 
-**For unknown websites**: use `snapshot()` - it shows what's actually interactive with stable locators.
+**For unknown websites**: use `snapshot({ page: state.page })` - it shows what's actually interactive with stable locators.
 
 **For development** (when you have source code access), prefer stable selectors in this order:
 
@@ -650,54 +825,41 @@ Combine locators for precision:
 
 ```js
 state.page.locator('tr').filter({ hasText: 'John' }).locator('button').click()
-state.page.locator('button').nth(2).click()
 ```
 
-If a locator matches multiple elements, Playwright throws "strict mode violation". Use `.first()`, `.last()`, or `.nth(n)`:
-
-```js
-await state.page.locator('button').first().click() // first match
-await state.page.locator('.item').last().click() // last match
-await state.page.locator('li').nth(3).click() // 4th item (0-indexed)
-```
+`filter({ hasText: '' })` or `null`/`undefined` applies no filter at all. Check computed values before using them in locators.
 
 ## working with pages
 
-**Pages are shared, state is not.** `context.pages()` returns all browser tabs with playwriter enabled — shared across all sessions. Multiple agents see the same tabs. If another agent navigates or closes a page you're using, you'll be affected. To avoid interference, **get your own page**.
+**Your tabs are yours.** `context.pages()` returns the tabs your session opened (and their popups) plus tabs the user enabled with the extension icon. Other CLI sessions never see your tabs, but user-enabled tabs are shared, so another agent may navigate or close them. To avoid interference, **get your own page**.
 
-**Get or create your page (first call):**
+There is **no default `page`** in the sandbox. Reading `page` throws. Helpers that take `page` (`snapshot`, `getLatestLogs`, `waitForPageLoad`, `recording`, `ghostCursor`, `refToLocator`) need `{ page: state.page }`. `snapshot` also accepts a `locator` or `frame` from your tab.
 
-On your very first execute call, reuse an existing empty tab or create a new one, and navigate it **in the same execute call**. Store it in `state` and use `state.page` for all subsequent operations instead of the default `page` variable:
+**New task: create your own tab (first call):**
+
+Create a tab, store it in `state`, and navigate it **in the same execute call**. Use `state.page` for all later operations:
 
 ```js
-// Reuse an empty about:blank tab if available, otherwise create a new one.
-// IMPORTANT: always navigate immediately in the same call to avoid another
-// agent grabbing the same about:blank tab between execute calls.
-state.page = context.pages().find((p) => p.url() === 'about:blank') ?? (await context.newPage())
+state.page = await context.newPage()
 await state.page.goto('https://example.com')
-// Use state.page for ALL subsequent operations
+```
+
+**User points to an existing tab:**
+
+Use a page from `context.pages()` only if the user asks you to control a tab they already opened (e.g., they're logged into an app, or they mention its URL or content). Find it by URL and take the **last** match. `context.pages()` is ordered oldest first, so the last match is the most recently opened tab:
+
+```js
+state.page = context.pages().findLast((p) => p.url().includes('myapp.com'))
+if (!state.page) throw new Error('No myapp.com tab found. Ask the user to enable playwriter on it.')
 ```
 
 **Handle page closures gracefully:**
 
-The user may close your page by accident (e.g., closing a tab in Chrome). Always check before using it and recreate if needed:
+The user may close your page by accident (e.g., closing a tab in Chrome). Check before using it and recreate if needed:
 
 ```js
-if (!state.page || state.page.isClosed()) {
-  state.page = context.pages().find((p) => p.url() === 'about:blank') ?? (await context.newPage())
-}
+if (!state.page || state.page.isClosed()) state.page = await context.newPage()
 await state.page.goto('https://example.com')
-```
-
-**Use an existing page only when the user asks:**
-
-Only use a page from `context.pages()` if the user explicitly asks you to control a specific tab they already opened (e.g., they're logged into an app). Find it by URL pattern and store it in state:
-
-```js
-const pages = context.pages().filter((x) => x.url().includes('myapp.com'))
-if (pages.length === 0) throw new Error('No myapp.com page found. Ask user to enable playwriter on it.')
-if (pages.length > 1) throw new Error(`Found ${pages.length} matching pages, expected 1`)
-state.targetPage = pages[0]
 ```
 
 **List all available pages:**
@@ -730,15 +892,11 @@ const data = await state.page.evaluate(async (url) => {
 }, 'https://example.com/protected/resource')
 ```
 
-**Read page cookies via CDP** - use `Network.getCookies` on the page CDP session:
+**Read and set cookies** - `context.cookies(url)`, `context.addCookies()` and `route.fetch()` work. Always pass a URL to `context.cookies()`: without one it returns every cookie in the user profile. `context.clearCookies()` throws, because it would delete cookies for every site.
 
 ```js
-const cdp = await getCDPSession({ page: state.page })
-const { cookies } = await cdp.send('Network.getCookies', { urls: [state.page.url()] })
-console.log(cookies)
+const cookies = await context.cookies(state.page.url())
 ```
-
-MUST use this for page-scoped cookies in extension mode. `Storage.getCookies` is a root-session command and will fail in playwriter.
 
 **NEVER use `Network.clearBrowserCookies` or `Network.clearBrowserCache`** — these CDP commands are **profile-wide destructive operations** that wipe ALL cookies/cache across every domain in the user's Chrome profile. They will log the user out of Gmail, GitHub, and every authenticated session.
 
@@ -795,7 +953,7 @@ await frame.locator('button').click()
 
 // contentFrame: returns a Frame object, needed for snapshot({ frame })
 const frame2 = await state.page.locator('iframe').contentFrame()
-await snapshot({ frame: frame2 })
+await snapshot({ page: state.page, frame: frame2 })
 ```
 
 **Dialogs** - handle alerts/confirms/prompts:
@@ -808,7 +966,7 @@ state.page.on('dialog', async (dialog) => {
 await state.page.click('button.trigger-alert')
 ```
 
-**Handling page obstacles (cookie modals, login walls, age gates)** - most major websites show blocking overlays. Always check for these with `snapshot()` right after navigation and dismiss them before doing anything else:
+**Handling page obstacles (cookie modals, login walls, age gates)** - most major websites show blocking overlays. Always check for these with `snapshot({ page: state.page })` right after navigation and dismiss them before doing anything else:
 
 ```js
 // After navigating, check for common obstacles
@@ -851,18 +1009,49 @@ For carousels or lazy-loaded galleries, you may need to click navigation arrows 
 
 ## utility functions
 
+**inspect** - get layout, scroll, visibility, input state, and aria attributes for a locator as formatted text. Use this instead of `page.evaluate()` for element inspection:
+
+```js
+const info = await inspect({ locator: state.page.locator('.sidebar') })
+console.log(info)
+// Element: div.sidebar
+// Box: x=1000 y=144 w=396 h=756
+// Children: 4  Text length: 1832
+// Scroll Y: size=1200 client=756 overflowing=true top=0
+// Scroll X: size=396 client=396 overflowing=false left=0
+// Styles: overflow-y=auto overflow-x=visible position=sticky max-height=756px display=flex flex-direction=column flex-shrink=0
+
+// Visibility line only appears when something is non-default:
+// Visibility: opacity=0 pointer-events=none
+
+// Input line only appears for form elements:
+// Input: value="hello" checked=true disabled
+
+// Aria line only appears when aria attributes are set:
+// Aria: aria-expanded=true aria-selected=false
+
+// Custom CSS properties
+const info = await inspect({
+  locator: state.page.locator('.card'),
+  properties: ['background-color', 'border-radius', 'gap', 'padding']
+})
+```
+
+Default CSS properties: `overflow-y`, `overflow-x`, `position`, `max-height`, `display`, `flex-direction`, `flex-shrink`. Override with the `properties` array. Visibility, input state, and aria attributes are always checked regardless of `properties`.
+
 **getLatestLogs** - retrieve captured browser console logs and page errors (up to 5000 per page):
 
 Always use this helper when inspecting browser logs. Do not attach new `page.on('console')` listeners for debugging because they only see future events and can miss logs emitted during page startup or hydration.
 
+Uncaught errors from pages assigned directly to `state` keys also appear automatically in execute output. `getLatestLogs()` keeps the full page log history for filtering and deeper diagnosis.
+
 Use `sinceLastCall: true` after every action to get only new logs since the previous call. The first call returns all buffered logs including pre-existing ones. Logs persist across navigations so you never miss errors from page transitions.
 
 ```js
-await getLatestLogs({ page?, count?, search?, sinceLastCall? })
+await getLatestLogs({ page: state.page, count?, search?, sinceLastCall? })
 // After every action: get only new logs
 const newLogs = await getLatestLogs({ page: state.page, sinceLastCall: true })
-// Search all logs (ignores cursor):
-const errors = await getLatestLogs({ search: /error/i, count: 50 })
+const errors = await getLatestLogs({ page: state.page, search: /error/i, count: 50 })
 const pageLogs = await getLatestLogs({ page: state.page, count: 100 })
 const hydrationErrors = await getLatestLogs({ page: state.page, search: /hydration|pageerror|React/i })
 ```
@@ -948,7 +1137,7 @@ const info = await getReactComponentInfo({ locator: state.page.locator('[data-te
 // => { componentName, source, hierarchy, props } | null
 ```
 
-**inspectPinnedElement** - inspect a Playwriter pinned element and print the element `outerHTML` plus React component info when available. Used by the in-page toolbar and right-click copy flow.
+**inspectPinnedElement** - inspect a Playwriter pinned element and print the element `outerHTML` plus React component info when available. Used by the right-click **Copy Playwriter Locator** flow.
 
 ```js
 await inspectPinnedElement('https://example.com', 'globalThis.playwriterPinnedElem1')
@@ -1008,43 +1197,59 @@ Labels are color-coded: yellow=links, orange=buttons, coral=inputs, pink=checkbo
 
 **resizeImageForAgent** - shrink an image so it consumes fewer tokens when read back into context. The resized image is automatically included in the response (visible to the LLM). `await resizeImageForAgent({ input: '/absolute/path/to/screenshot.png' })`. Also accepts `width`, `height`, `maxDimension`, `quality`, `format` (default: `'png'`), `output`. Alias: `resizeImage`.
 
-**recording.start / recording.stop** - record the page as a video at native FPS (30-60fps). Uses `chrome.tabCapture` so **recording survives page navigation**. Auto-overlays a ghost cursor that follows mouse actions. Requires user to have clicked the Playwriter extension icon on the tab. Auto-resizes viewport to 16:9 (override with `aspectRatio: null`). Auto-stops after 15 min (override with `maxDurationMs`).
+**recording.start** - record the page as a video with Chrome's native recorder (**Chrome 153+**), up to 4K 60 fps. Returns a handle; keep it in `state` to stop it in a later call. No user click needed; works in every mode (extension, direct CDP, headless, cloud, remote). **Recording survives page navigation**. Auto-overlays a ghost cursor that follows mouse actions. Auto-resizes viewport to 16:9 (only shrinks, override with `aspectRatio: null`). **Set the viewport before start**: output size is fixed at start. Output is H.264 `.mp4`/`.mov`/`.mkv` (`ffmpeg` **must be on PATH**) or `codec: 'av1'` (no ffmpeg, also `.webm`). Auto-stops after 60 min and saves the file (override with `maxDurationMs`). A closed page also saves the file; the next output shows a warning. One recording per page; a recording tab cannot stream or show the live view. `audio: true` records tab audio.
 
 For demos, use interaction methods (`locator.click()`, `page.mouse.move()`) instead of `goto()` to show realistic cursor motion.
 
 ```js
-await recording.start({
+state.video = await recording.start({
   page: state.page,
-  outputPath: '/absolute/path/to/recording.mp4',
-  frameRate: 30, // default
-  audio: false, // default (tab audio)
-  videoBitsPerSecond: 2500000,
+  outputPath: 'demo.mp4', // relative to the session cwd
+  codec: 'h264', // default. 'av1' needs no ffmpeg
+  frameRate: 60, // default, max 120
+  clock: 'real', // default. 'manual' records only inside wait(ms), see below
+  audio: false, // default
+  maxSize: 3840, // default, longest output edge. Pass 1920 for X uploads
   aspectRatio: { width: 16, height: 9 }, // default, set null to skip
-  maxDurationMs: 15 * 60 * 1000, // default, set 0 to disable
+  maxDurationMs: 60 * 60 * 1000, // default, set 0 to disable
 })
 
 // Recording survives navigation
 await state.page.click('a')
 await state.page.waitForLoadState('domcontentloaded')
 
-// Stop — save full result including executionTimestamps for createDemoVideo
-state.recordingResult = await recording.stop({ page: state.page })
+await state.video.setPage(otherPage) // record another tab from now on
 
-// Other: recording.isRecording({ page }), recording.cancel({ page })
+// Stop — save full result including executionTimestamps for createDemoVideo
+state.recordingResult = await state.video.stop() // { path, duration, size, endReason, executionTimestamps }
+
+// Lost the handle: await recording.stop({ page: state.page })
+// Other: state.video.isRecording, state.video.cancel(), console.log(state.video) for elapsed time and bytes
 ```
 
-**ghostCursor.show / ghostCursor.hide** - the ghost cursor overlay is always on: the extension injects it on every Playwriter-attached tab and it stays visible at the last spot Playwright clicked or moved. These methods only matter if you want to change the cursor style or temporarily hide it:
+**Prefer `clock: 'manual'` for demo videos.** With the default `'real'` clock every second you spend thinking is in the video. `'manual'` writes frames only inside `wait(ms)`; the page runs normally in between, so the video has no idle time:
+
+```js
+state.video = await recording.start({ page: state.page, outputPath: '/abs/demo.mp4', clock: 'manual' })
+await state.page.getByRole('button', { name: 'Open' }).click()
+await state.video.wait(800) // records the next 800ms, animation included
+await state.video.stop()
+```
+
+Put each action and its `wait()` in the **same execute call**, or the animation is over before recording resumes. Use `wait(ms)` instead of `waitForTimeout()` when the viewer should see time pass.
+
+**ghostCursor.show / ghostCursor.hide** - the ghost cursor overlay is always on: the extension injects it hidden on every Playwriter-attached tab, it appears on the first Playwright mouse action (click, move, wheel) and fades out after 5s idle. These methods only matter if you want to change the cursor style or temporarily hide it:
 
 ```js
 await ghostCursor.show({ page: state.page, style: 'screenstudio' }) // 'minimal' (default), 'dot', 'screenstudio'
 await ghostCursor.hide({ page: state.page }) // hide until next show() or hard navigation
 ```
 
-**createDemoVideo** - speeds up idle sections (time between execute() calls) while keeping interactions at normal speed. Requires `ffmpeg`/`ffprobe`. Timestamps are tracked automatically during recording and returned by `recording.stop()`. **Timeout**: can take 60–120+ seconds, always pass `--timeout 120000` or higher.
+**createDemoVideo** - for `clock: 'real'` recordings: speeds up idle sections (time between execute() calls) while keeping interactions at normal speed. Requires `ffmpeg`/`ffprobe`. Timestamps are tracked automatically during recording and returned by `state.video.stop()`. **Timeout**: can take 60–120+ seconds, always pass `--timeout 120000` or higher.
 
 ```js
-// After recording.stop(), save full result to state (executionTimestamps powers idle detection)
-state.recordingResult = await recording.stop({ page: state.page })
+// After stop(), save full result to state (executionTimestamps powers idle detection)
+state.recordingResult = await state.video.stop()
 
 // In a SEPARATE execute call with --timeout 120000:
 const demoPath = await createDemoVideo({
@@ -1057,7 +1262,7 @@ const demoPath = await createDemoVideo({
 
 ## pinned elements
 
-Users can right-click → "Copy Playwriter Element Reference" to store elements in `globalThis.playwriterPinnedElem1` (increments for each pin). The reference is copied to clipboard:
+Users can right-click → "Copy Playwriter Locator" (works even on tabs not yet enabled; it enables them) to store elements in `globalThis.playwriterPinnedElem1` (increments for each pin). The reference is copied to clipboard:
 
 ```js
 const el = await state.page.evaluateHandle(() => globalThis.playwriterPinnedElem1)
@@ -1161,10 +1366,7 @@ Clean up listeners when done: `state.page.removeAllListeners('request'); state.p
 await state.page.locator('button[name="Submit"]').click()
 await state.page.locator('text=Login').click({ button: 'right' })
 await state.page.locator('text=Login').dblclick()
-await state.page
-  .locator('a')
-  .first()
-  .click({ modifiers: ['Meta'] }) // cmd+click opens link in new background tab
+await state.page.getByRole('link', { name: 'Docs' }).click({ modifiers: ['Meta'] }) // cmd+click opens link in new background tab
 
 // By coordinates (when locators aren't available, e.g. canvas, maps, custom widgets)
 await state.page.mouse.click(450, 320) // left click

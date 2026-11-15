@@ -388,11 +388,11 @@ export declare class Debugger {
 ## Examples
 
 ```ts
-import { page, getCDPSession, createDebugger, console } from './debugger-examples-types.js'
+import { state, getCDPSession, createDebugger, console } from './debugger-examples-types.js'
 
 // Example: List available scripts and set a breakpoint
 async function listScriptsAndSetBreakpoint() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const dbg = createDebugger({ cdp })
   await dbg.enable()
 
@@ -407,7 +407,7 @@ async function listScriptsAndSetBreakpoint() {
 
 // Example: Inspect state when paused at a breakpoint
 async function inspectWhenPaused() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const dbg = createDebugger({ cdp })
   await dbg.enable()
 
@@ -428,7 +428,7 @@ async function inspectWhenPaused() {
 
 // Example: Step through code
 async function stepThroughCode() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const dbg = createDebugger({ cdp })
   await dbg.enable()
 
@@ -444,7 +444,7 @@ async function stepThroughCode() {
 
 // Example: Cleanup all breakpoints
 async function cleanupBreakpoints() {
-  const cdp = await getCDPSession({ page })
+  const cdp = await getCDPSession({ page: state.page })
   const dbg = createDebugger({ cdp })
 
   const breakpoints = dbg.listBreakpoints()

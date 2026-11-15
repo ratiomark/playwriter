@@ -1,6 +1,6 @@
 ---
 title: CLI Reference
-description: All CLI commands, flags, and usage patterns for controlling Chrome from the terminal.
+description: Playwriter CLI commands, flags, and usage patterns for controlling Chrome from the terminal with Playwright code.
 icon: lucide:terminal
 ---
 
@@ -21,20 +21,23 @@ Always use **single quotes** for `-e` to prevent bash from interpreting `$`, bac
 </Aside>
 
 ```bash
-# Navigate
-playwriter -s 1 -e 'await page.goto("https://example.com")'
+# Open a new tab and navigate (there is no default page)
+playwriter -s 1 -e 'state.page = await context.newPage(); await state.page.goto("https://example.com")'
+
+# Or use a tab the user already opened
+playwriter -s 1 -e 'state.page = context.pages().findLast((p) => p.url().includes("example.com"))'
 
 # Click
-playwriter -s 1 -e 'await page.locator("button").click()'
+playwriter -s 1 -e 'await state.page.locator("button").click()'
 
 # Get title
-playwriter -s 1 -e 'console.log(await page.title())'
+playwriter -s 1 -e 'console.log(await state.page.title())'
 
 # Screenshot
-playwriter -s 1 -e 'await page.screenshot({ path: "/tmp/shot.png", scale: "css" })'
+playwriter -s 1 -e 'await state.page.screenshot({ path: "/tmp/shot.png", scale: "css" })'
 
 # Accessibility snapshot
-playwriter -s 1 -e 'console.log(await snapshot({ page }))'
+playwriter -s 1 -e 'console.log(await snapshot({ page: state.page }))'
 ```
 
 ### Multiline code
@@ -43,9 +46,9 @@ Use a **heredoc** for complex scripts:
 
 ```bash
 playwriter -s 1 -e "$(cat <<'EOF'
-const links = await page.$$eval('a', els => els.map(e => e.href));
+const links = await state.page.$$eval('a', els => els.map(e => e.href));
 console.log('Found', links.length, 'links');
-const text = await page.locator('body').innerText();
+const text = await state.page.locator('body').innerText();
 const price = text.match(/\$[\d.]+/);
 EOF
 )"
@@ -55,8 +58,8 @@ Or `$'...'` syntax for simpler multiline:
 
 ```bash
 playwriter -s 1 -e $'
-const title = await page.title();
-const url = page.url();
+const title = await state.page.title();
+const url = state.page.url();
 console.log({ title, url });
 '
 ```
@@ -92,8 +95,6 @@ playwriter session new --direct
 
 This requires the user to accept a debugging approval dialog in Chrome. Enable debugging first at `chrome://inspect/#remote-debugging` or launch Chrome with `--remote-debugging-port=9222`.
 
-**Limitations:** screen recording is unavailable in direct mode.
-
 ## Browser management
 
 ```bash
@@ -102,7 +103,7 @@ playwriter browser start /path/to/bin # launch specific binary
 playwriter browser list               # list all available browsers
 ```
 
-`browser start` launches Chrome with recording flags enabled and the bundled extension pre-loaded.
+`browser start` launches Chrome with the bundled extension pre-loaded.
 
 ## Remote connection
 
@@ -119,7 +120,7 @@ Or with environment variables:
 export PLAYWRITER_HOST=https://my-machine-tunnel.traforo.dev
 export PLAYWRITER_TOKEN=SECRET
 playwriter session new
-playwriter -s 1 -e 'await page.goto("https://example.com")'
+playwriter -s 1 -e 'state.page = await context.newPage(); await state.page.goto("https://example.com")'
 ```
 
 See [Remote Access](./remote-access.mdx) for the full guide.
@@ -135,6 +136,21 @@ playwriter serve --token MY_SECRET --replace  # kill existing server first
 ```
 
 The relay starts automatically when you use the CLI locally. Use `serve` explicitly when you need it running persistently for remote clients.
+
+## Skill recorder
+
+Record a workflow you perform manually in the browser as events an agent can turn
+into a reusable skill. See [Skill Recorder](/docs/skill-recorder) for the full guide:
+
+```bash
+playwriter recorder start                 # start recording user actions (runs in relay daemon)
+playwriter recorder start -s 1            # attach to an existing session
+playwriter recorder stop                  # stop the only active recording
+playwriter recorder stop 3                # stop recording 3 when several are active
+playwriter recorder events                # thin event timeline of the latest recording
+playwriter recorder events 4 7            # full details of events 4 and 7
+playwriter recorder status                # list active recordings and their page urls
+```
 
 ## Other commands
 
@@ -161,7 +177,6 @@ Code executed with `-e` or `-f` has access to:
 
 | Variable | Description |
 |---|---|
-| `page` | Default page (may be shared with other agents) |
 | `context` | Browser context, access all pages via `context.pages()` |
 | `state` | Object persisted between calls within your session |
 | `require` | Load Node.js modules (e.g. `require('node:fs')`) |
@@ -175,5 +190,7 @@ Code executed with `-e` or `-f` has access to:
 | `getCleanHTML` | Get cleaned HTML from page |
 | `getPageMarkdown` | Extract article content as text |
 | `waitForPageLoad` | Smart load detection |
+
+There is no default `page` global. Reading `page` throws. Create a tab with `context.newPage()` and store it in `state.page`.
 
 See [Agent Reference](./skill.mdx) for the full API documentation.

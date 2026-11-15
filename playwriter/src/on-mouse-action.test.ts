@@ -194,11 +194,9 @@ describe('onMouseAction callback', () => {
     await safeCloseCDPBrowser(directBrowser)
   }, 30000)
 
-  // Always-on ghost cursor: the Chrome extension injects the ghost-cursor-client.js
-  // bundle into MAIN world the moment it attaches a tab (see attachTab in
-  // extension/src/background.ts). This test verifies the cursor element exists on
-  // a freshly-attached tab WITHOUT any explicit enableGhostCursor call.
-  it('should inject ghost cursor into attached tabs without explicit enable', async () => {
+  // Always-on ghost cursor: enabled by default, drawn on the first agent mouse action. It lives in
+  // playwriter's isolated world, so the page sees no global, only the cursor element.
+  it('should draw the ghost cursor on the first mouse action without a page global', async () => {
     const browserContext = testCtx!.browserContext
     const serviceWorker = await getExtensionServiceWorker(browserContext)
 
@@ -213,14 +211,48 @@ describe('onMouseAction callback', () => {
       setTimeout(r, 300)
     })
 
-    const cursorPresent = await page.evaluate(() => {
-      return {
-        apiPresent: Boolean((globalThis as any).__playwriterGhostCursor),
-        elementPresent: Boolean(document.getElementById('__playwriter_ghost_cursor__')),
-      }
-    })
+    const readCursor = () => {
+      return page.evaluate(() => {
+        const el = document.getElementById('__playwriter_ghost_cursor__')
+        const html = el?.innerHTML || ''
+        return {
+          apiPresent: Boolean((globalThis as any).__playwriterGhostCursor),
+          elementPresent: Boolean(el),
+          hasInlineSvg: html.includes('<svg'),
+          usesDataSvg: html.includes('data:image/svg'),
+          transform: el?.style.transform,
+        }
+      })
+    }
 
-    expect(cursorPresent.apiPresent).toBe(true)
-    expect(cursorPresent.elementPresent).toBe(true)
+    expect(await readCursor()).toMatchInlineSnapshot(`
+      {
+        "apiPresent": false,
+        "elementPresent": false,
+        "hasInlineSvg": false,
+        "transform": undefined,
+        "usesDataSvg": false,
+      }
+    `)
+
+    const directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    try {
+      const targetPage = directBrowser.contexts()[0].pages().find((p) => p.url().includes('always-on-cursor'))!
+      await applyGhostCursorMouseAction({
+        page: targetPage,
+        event: { type: 'move', x: 80, y: 60, button: 'none' },
+      })
+    } finally {
+      await safeCloseCDPBrowser(directBrowser)
+    }
+    expect(await readCursor()).toMatchInlineSnapshot(`
+      {
+        "apiPresent": false,
+        "elementPresent": true,
+        "hasInlineSvg": true,
+        "transform": "translate3d(78px, 59px, 0px)",
+        "usesDataSvg": false,
+      }
+    `)
   }, 30000)
 })

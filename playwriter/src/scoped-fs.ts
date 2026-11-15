@@ -48,7 +48,7 @@ export class ScopedFS {
 
     if (!this.isPathAllowed(resolved)) {
       const error = new Error(
-        `EPERM: operation not permitted, access outside allowed directories: ${filePath}`,
+        `EPERM: operation not permitted, access outside allowed directories: ${filePath} (allowed: ${this.allowedDirs.join(', ')})`,
       ) as NodeJS.ErrnoException
       error.code = 'EPERM'
       error.errno = -1

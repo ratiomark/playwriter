@@ -17,7 +17,7 @@ playwriter session new    # => 2
 playwriter session list
 # ID  State Keys
 # --------------
-# 1   myPage, userData
+# 1   page, userData
 # 2   -
 ```
 
@@ -34,7 +34,7 @@ The `state` object persists between execute calls **within the same session**. U
 
 ```js
 // Call 1: store data
-state.page = context.pages().find(p => p.url() === 'about:blank') ?? await context.newPage()
+state.page = await context.newPage()
 await state.page.goto('https://example.com')
 state.results = []
 
@@ -45,16 +45,16 @@ state.results.push(await state.page.title())
 
 ## Pages are shared, state is not
 
-`context.pages()` returns all browser tabs with Playwriter enabled, **shared across all sessions**. Multiple agents see the same tabs. To avoid interference, always **get your own page**:
+`context.pages()` returns all browser tabs with Playwriter enabled, **shared across all sessions**. Multiple agents see the same tabs. There is **no default page**. Always **create your own page**:
 
 ```js
-// First call: grab an empty tab or create one, navigate immediately
-state.page = context.pages().find(p => p.url() === 'about:blank') ?? await context.newPage()
+// First call: create a tab and navigate immediately
+state.page = await context.newPage()
 await state.page.goto('https://example.com')
-// Store in state.page and use it for ALL subsequent operations
+// Use state.page for ALL subsequent operations
 ```
 
-Navigate **in the same call** as creating the page. This prevents another agent from grabbing the same `about:blank` tab between execute calls.
+Navigate **in the same call** as creating the page.
 
 ## Handle page closures
 
@@ -62,20 +62,241 @@ The user may close your tab. Always check before using it:
 
 ```js
 if (!state.page || state.page.isClosed()) {
-  state.page = context.pages().find(p => p.url() === 'about:blank') ?? await context.newPage()
+  state.page = await context.newPage()
 }
 await state.page.goto('https://example.com')
 ```
 
 ## Using existing pages
 
-Only use a page from `context.pages()` if the user explicitly asks you to control a specific tab:
+Only use a page from `context.pages()` if the user points you to a specific tab. Find it by URL. `findLast` picks the most recently opened match:
 
 ```js
-const pages = context.pages().filter(x => x.url().includes('myapp.com'))
-if (pages.length === 0) throw new Error('No myapp.com page found')
-state.targetPage = pages[0]
+state.page = context.pages().findLast((p) => p.url().includes('myapp.com'))
+if (!state.page) throw new Error('No myapp.com page found')
 ```
+
+## Tab groups per session
+
+Tabs a session creates are grouped in a Chrome **tab group** named `playwriter` by default. Use the shortest clear single-word name with no spaces, such as `docs`, `shop`, `test`, or `scrape`.
+
+```bash
+# Tabs created by this session join a group named "docs"
+playwriter session new --tab-group docs
+
+# Pick the group color yourself (any Chrome color)
+playwriter session new --tab-group docs --tab-group-color blue
+
+# Rename the group later — moves the session's existing tabs
+playwriter session update 1 --tab-group research
+
+# Change only the color — also works on the default playwriter group
+playwriter session update 1 --tab-group-color red
+```
+
+**Park work on another screen.** Give the session its own group, then right-click the group and choose **Move group to new window**. New tabs from that session follow the group, even if the window is minimized:
+
+```bash
+playwriter session new --tab-group scrape --tab-group-color grey
+```
+
+**Split concurrent agents.** Each agent should use its own `--tab-group`. That keeps many open tabs readable instead of one mixed strip:
+
+```bash
+playwriter session new --tab-group agent1 --tab-group-color blue
+playwriter session new --tab-group agent2 --tab-group-color pink
+```
+
+**Collapse groups you don't care about.** Click the group name in Chrome to collapse it. Use a clear name so leftover work takes less space without closing the tabs:
+
+```bash
+playwriter session new --tab-group done --tab-group-color grey
+```
+
+Renaming a session that still uses the default `playwriter` group only moves tabs **that session created**. Manually enabled tabs and other sessions' tabs stay in the default group. Renaming a custom group moves everything in it, including tabs you dragged in.
+
+Without `--tab-group-color`, each custom group gets a deterministic color derived from its name (the default `playwriter` group stays green). The flag accepts every Chrome group color: `grey`, `blue`, `red`, `yellow`, `green`, `pink`, `purple`, `cyan`, `orange`. `playwriter session list` shows the group per session in the `GROUP` column.
+
+Tab groups are **cosmetic**:
+
+- Dragging a tab between playwriter groups is fine — the connection is kept and the tab simply adopts the new group.
+- Dragging a tab out of all playwriter groups disconnects it (same as before).
+- Dragging an unrelated tab into any playwriter group connects it.
+- Moving a whole group to another window (Chrome's "Move group to new window") keeps the tabs connected.
+
+Only extension sessions support tab groups. Headless, direct CDP, and cloud sessions have no browser UI to group.
+
+## Patchright
+
+Use `--patchright` for production sites where the user is logged in with their own account. Never for localhost or tunnels. The session connects with [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (`@playwriter/patchright-core`) instead of Playwright, and its input behaves like a person: curved mouse paths, press timing like a hand, wheel flicks for scrolling, and 30-110 ms between key presses. Every action gets slower.
+
+```bash
+playwriter session new --tab-group shop --patchright
+```
+
+Switch an existing session at any time, also after pages loaded. The session reconnects: tabs stay open, `state` is cleared.
+
+```bash
+playwriter session update 1 --patchright
+playwriter session update 1 --patchright false  # back to Playwright
+```
+
+| | Playwright (default) | Patchright |
+|---|---|---|
+| Input | Instant, except on sites like x.com, amazon and google | Human-like on every page |
+| `page.evaluate` | Main world, sees page globals | Main world, sees page globals. Pass `true` as fourth argument for an isolated world that pages cannot see |
+| `getLatestLogs` | All console messages | May miss console messages |
+
+The Node API takes the same option: `connectViaExtension({ patchright: true })`. It applies to extension and remote control sessions. For the MCP, start it with `playwriter --patchright`.
+
+## Node API
+
+Use `connectViaExtension()` from the `playwriter` package. It starts the relay if needed, waits for the Chrome extension, creates a session, and connects over CDP.
+
+```ts
+import { connectViaExtension } from 'playwriter'
+
+await using connection = await connectViaExtension({
+  tabGroup: 'email-check',
+  tabGroupColor: 'grey',
+})
+// the page closes its tab when the scope ends, also on throw
+await using page = await connection.browser.contexts()[0].newPage()
+await page.goto('https://example.com')
+```
+
+`tabGroupColor` is typed as Chrome's tab group colors: `grey`, `blue`, `red`, `yellow`, `green`, `pink`, `purple`, `cyan`, `orange`. `await using` calls `close()` at scope end: it disconnects CDP and deletes the session. It needs Node 24+ (or a TypeScript 5.2+ / tsx build). Without `await using`, call `await connection.close()` in `finally`.
+
+**Close your own tabs.** `connection.close()` does not close any tab. Use `await using page` or call `page.close()` for every tab your script opens. Pass `closeTabsOnEnd: true` to make `close()` also close every tab this connection opened, plus popups they opened (never other sessions' tabs).
+
+### Keeping tabs across processes
+
+A tab you do not close stays open. A later process finds it in `context.pages()`:
+
+```ts
+// process A
+await using a = await connectViaExtension({ tabGroup: 'job' })
+await (await a.browser.contexts()[0].newPage()).goto('https://example.com')
+
+// process B, later
+await using b = await connectViaExtension({ tabGroup: 'job' })
+const page = b.browser.contexts()[0].pages().findLast((p) => p.url() === 'https://example.com/')
+```
+
+Match tabs by their **exact** url, never `startsWith` or `includes`. `context.pages()` lists every Playwriter tab, also tabs other sessions opened for unrelated work (a download tab, a song page), and a loose match picks one of those.
+
+### Sharing one tab between processes
+
+Scripts that only call `fetch` inside a signed-in site can share **one tab** instead of each loading the site again. Two rules make it safe:
+
+- Never pass `closeTabsOnEnd: true`. It closes the tab when the session that **created** it ends, while another process still uses it.
+- Keep the holder list **inside the tab** with `page.evaluate`. The page runs JS on one thread, so each evaluate is atomic. The **last** holder closes the tab.
+
+```
+process A ──▶ no tab with exact url ──▶ open it ──▶ window.__shared = { holders: [A] }
+process B ──▶ finds it ──▶ evaluate: closing? no ──▶ holders: [A, B]
+A leaves  ──▶ evaluate: holders: [B]                       tab stays open
+B leaves  ──▶ evaluate: holders: [], closing = true ──▶ page.close()
+```
+
+```ts
+import { randomUUID } from 'node:crypto'
+import { connectViaExtension, type Page, type PlaywriterBrowserConnection } from 'playwriter'
+
+type Shared = { holders: string[]; closing: boolean }
+
+const APP_URL = 'https://example.com/app' // exact url of the shared tab
+const me = `${process.pid}:${randomUUID()}`
+
+const alive = (holder: string) => {
+  try {
+    process.kill(Number(holder.split(':')[0]), 0)
+    return true
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+// false when the tab is not set up yet (loading, reloaded), closing, or closed
+const join = (page: Page) =>
+  page
+    .evaluate((me) => {
+      const shared = (window as any).__shared as Shared | undefined
+      if (!shared || shared.closing) return false
+      shared.holders.push(me)
+      return true
+    }, me)
+    .catch(() => false)
+
+// true when we were the last live holder
+async function leave(page: Page) {
+  const holders: string[] = await page.evaluate(() => (window as any).__shared?.holders ?? [])
+  const remove = [me, ...holders.filter((h) => !alive(h))] // crashed processes never block the close
+  return page.evaluate((remove) => {
+    const shared = (window as any).__shared as Shared | undefined
+    if (!shared) return false // list wiped by a reload: never close a tab we cannot account for
+    shared.holders = shared.holders.filter((h) => !remove.includes(h))
+    if (shared.holders.length === 0) shared.closing = true
+    return shared.closing
+  }, remove)
+}
+
+async function claim(connection: PlaywriterBrowserConnection) {
+  const context = connection.browser.contexts()[0]
+  for (const page of context.pages().filter((p) => p.url() === APP_URL)) {
+    if (await join(page)) return page
+  }
+  const page = await context.newPage()
+  let ready = false
+  try {
+    await page.goto(APP_URL, { waitUntil: 'load' })
+    await page.evaluate((me) => {
+      ;(window as any).__shared = { holders: [me], closing: false } satisfies Shared
+    }, me)
+    ready = true
+    return page
+  } finally {
+    if (!ready) await page.close().catch(() => {}) // never leak a half-set-up tab
+  }
+}
+
+await using connection = await connectViaExtension({ tabGroup: 'app' })
+const page = await claim(connection)
+try {
+  const user = await page.evaluate(() => fetch('/api/me').then((r) => r.json()))
+} finally {
+  if (await leave(page).catch(() => false)) await page.close().catch(() => {})
+}
+```
+
+- **No race with a closing tab**: the last holder sets `closing` in the same evaluate that empties the list, so a joiner either gets in first or skips that tab and opens a new one.
+- **Ctrl+C**: `finally` does not run when the process is killed by a signal. Handle `SIGINT`/`SIGTERM` by running the same `leave()` first. Holders of crashed processes are dropped by the next `leave()`.
+- **Never navigate or reload** the shared page. It wipes `window.__shared`, and the tab is then never closed. Open your own tab for navigation, and close it yourself.
+- Two processes that start at the same moment with no tab open may both open one. Each tab still closes correctly.
+- The pid check works only for processes on the **same machine**.
+
+### Choosing a browser
+
+If the extension runs in more than one browser or profile (Chrome, Brave, Ghost, a work profile), pass `selectBrowser`. It gets every connected browser and returns the one to use. Without it, connecting fails when more than one browser is connected.
+
+```ts
+import { connectViaExtension, listBrowsers } from 'playwriter'
+
+await using connection = await connectViaExtension({
+  selectBrowser: (browsers) => {
+    // [{ id, browser: 'Brave', email: 'me@work.com', activeTabs, playwriterVersion }]
+    return browsers.find((b) => b.browser === 'Brave' && b.email === 'me@work.com')
+  },
+})
+console.log(connection.extensionBrowser.id)
+
+// same list, without connecting
+const browsers = await listBrowsers()
+```
+
+`id` is stable across restarts, so you can save it and match on it later. `email` is `null` when the profile is not signed in.
+
+Do not POST `/cli/session/new` yourself. Do not call `chromium.connectOverCDP(getCdpUrl(...))` unless you already have a session from the CLI.
 
 ## Session management
 
@@ -97,13 +318,14 @@ Every session has access to these globals:
 | Variable | Description |
 |---|---|
 | `state` | Persisted object, isolated per session |
-| `page` | Default page (shared, prefer `state.page`) |
 | `context` | Browser context, access all pages via `context.pages()` |
 | `require` | Load Node.js modules (`path`, `fs`, `crypto`, etc.) |
 | `fetch` | Standard fetch API |
 | `Buffer`, `URL`, `URLSearchParams` | Standard globals |
 | `setTimeout`, `setInterval` | Timers |
 | `crypto`, `process` | Node.js globals |
+
+There is no default `page` global. Reading `page` throws. Store your own page in `state.page`.
 
 ## Popup handling
 

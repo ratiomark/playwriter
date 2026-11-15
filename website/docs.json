@@ -16,7 +16,15 @@
     "light": "#FF9500",
     "dark": "#FF9500"
   },
-  "knownPaths": ["/README", "/api/*", "/login", "/dashboard", "/device"],
+  "knownPaths": ["/api/*", "/login", "/dashboard", "/device", "/privacy"],
+  "redirects": [
+    { "source": "/changelog/intro", "destination": "https://github.com/remorses/playwriter/releases", "permanent": true },
+    { "source": "/changelog", "destination": "https://github.com/remorses/playwriter/releases", "permanent": true }
+  ],
+  "decorativeLines": "none",
+  "layout": {
+    "mode": "compact"
+  },
   "navigation": {
     "tabs": [
       {
@@ -47,7 +55,8 @@
               "docs/streaming",
               "docs/headless",
               "docs/profiling",
-              "docs/security"
+              "docs/security",
+              "docs/remote-control"
             ]
           },
           {
@@ -63,26 +72,26 @@
               "docs/vs-playwright-mcp",
               "docs/vs-playwright-cli",
               "docs/vs-browser-mcp",
+              "docs/vs-agent-browser",
               "docs/vs-claude-extension"
             ]
           },
           {
             "group": "Reference",
             "icon": "lucide:book-text",
-            "pages": ["docs/skill", "docs/configuration"]
+            "pages": ["docs/skill", "docs/configuration", "privacy"]
           }
         ]
+      },
+      {
+        "tab": "Skill Recorder",
+        "icon": "lucide:circle-dot",
+        "pages": ["docs/skill-recorder"]
       },
       {
         "tab": "Cloud Browsers",
         "icon": "lucide:dollar-sign",
         "pages": ["docs/cloud-browsers"]
-      },
-      {
-        "tab": "Changelog",
-        "icon": "lucide:newspaper",
-        "changelog": "https://github.com/remorses/playwriter",
-        "initialContent": "changelog/intro"
       }
     ],
     "global": {
@@ -92,6 +101,11 @@
           "icon": "github",
           "href": "https://github.com/remorses/playwriter",
           "placement": "tabs"
+        },
+        {
+          "anchor": "Changelog",
+          "icon": "lucide:newspaper",
+          "href": "https://github.com/remorses/playwriter/releases"
         }
       ]
     }
@@ -99,7 +113,7 @@
   "navbar": {
     "primary": {
       "label": "Cloud Login",
-      "href": "/dashboard"
+      "href": "/login"
     }
   },
   "footer": {
@@ -107,7 +121,9 @@
       {
         "header": "platform",
         "items": [
-          { "label": "Rent Cloud Browsers", "href": "/dashboard" },
+          { "label": "Rent Cloud Browsers", "href": "/login" },
+          { "label": "Changelog", "href": "https://github.com/remorses/playwriter/releases" },
+          { "label": "Privacy", "href": "/privacy" },
           { "label": "GitHub", "href": "https://github.com/remorses/playwriter" },
           {
             "label": "Chrome Extension",

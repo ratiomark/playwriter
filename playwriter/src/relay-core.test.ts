@@ -2,8 +2,10 @@ import { createMCPClient } from './mcp-client.js'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { chromium } from '@xmorse/playwright-core'
 import { getCDPSessionForPage } from './cdp-session.js'
-import { getCdpUrl, LOG_CDP_FILE_PATH } from './utils.js'
+import { getCdpUrl } from './utils.js'
 import fs from 'node:fs'
+import http from 'node:http'
+import path from 'node:path'
 import {
   setupTestContext,
   cleanupTestContext,
@@ -14,10 +16,13 @@ import {
   tryJsonParse,
   createSimpleServer,
   safeCloseCDPBrowser,
+  findTestPageJs,
 } from './test-utils.js'
 import './test-declarations.js'
 
 const TEST_PORT = 19987
+const SERVER_URL = `http://127.0.0.1:${TEST_PORT}`
+const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
 describe('Relay Core Tests', () => {
   let client: Awaited<ReturnType<typeof createMCPClient>>['client']
@@ -64,6 +69,33 @@ describe('Relay Core Tests', () => {
 
     await new Promise((r) => {
       setTimeout(r, 100)
+    })
+  }
+
+  const createCliSession = async (): Promise<string> => {
+    const response = await fetch(`${SERVER_URL}/cli/session/new`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    })
+    const result = (await response.json()) as { id: string }
+    return result.id
+  }
+
+  const executeCli = async ({ sessionId, code, timeout }: { sessionId: string; code: string; timeout?: number }) => {
+    const response = await fetch(`${SERVER_URL}/cli/execute`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ sessionId, code, timeout }),
+    })
+    return (await response.json()) as { text: string; isError: boolean }
+  }
+
+  const deleteCliSession = async (sessionId: string): Promise<void> => {
+    await fetch(`${SERVER_URL}/cli/session/delete`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ sessionId }),
     })
   }
 
@@ -127,15 +159,8 @@ describe('Relay Core Tests', () => {
   it('should emit download events for both Browser and Page domains in extension mode', async () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
-    const logFilePath = LOG_CDP_FILE_PATH
-    const logLineCountBefore = fs.existsSync(logFilePath)
-      ? fs
-          .readFileSync(logFilePath, 'utf-8')
-          .split('\n')
-          .filter((line) => {
-            return line.trim().length > 0
-          }).length
-      : 0
+    const cdpLogger = testCtx!.cdpLogger
+    const startedAt = new Date().toISOString()
 
     const server = await createSimpleServer({
       routes: {
@@ -211,20 +236,19 @@ describe('Relay Core Tests', () => {
     await page.close()
     await server.close()
 
-    const logLinesAfter = fs
-      .readFileSync(logFilePath, 'utf-8')
+    // The logger batches writes; flush so the file has every entry of this test
+    await cdpLogger.flush()
+    const newEntries = fs
+      .readFileSync(cdpLogger.logFilePath, 'utf-8')
       .split('\n')
-      .filter((line) => {
-        return line.trim().length > 0
-      })
-      .slice(logLineCountBefore)
-
-    const newEntries = logLinesAfter
       .map((line) => {
         return tryJsonParse(line)
       })
-      .filter((entry): entry is { direction: string; message: { method?: string } } => {
+      .filter((entry): entry is { timestamp: string; direction: string; message: { method?: string } } => {
         return Boolean(entry && typeof entry === 'object' && 'direction' in entry && 'message' in entry)
+      })
+      .filter((entry) => {
+        return entry.timestamp >= startedAt
       })
 
     const methods = newEntries
@@ -391,6 +415,75 @@ describe('Relay Core Tests', () => {
     expect(unexpectedRelayCrashes).toEqual([])
   }, 60000)
 
+  it('keeps an in-flight evaluate and handles alive when a second CDP client connects', async () => {
+    const browserContext = getBrowserContext()
+    const serviceWorker = await getExtensionServiceWorker(browserContext)
+    const server = await createSimpleServer({ routes: { '/': '<!doctype html><body><button>hi</button></body>' } })
+    const page = await browserContext.newPage()
+    let browserA: Awaited<ReturnType<typeof chromium.connectOverCDP>> | null = null
+    let browserB: Awaited<ReturnType<typeof chromium.connectOverCDP>> | null = null
+    try {
+      await page.goto(server.baseUrl)
+      await page.bringToFront()
+      await serviceWorker.evaluate(async () => {
+        await globalThis.toggleExtensionForActiveTab()
+      })
+
+      browserA = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+      const pageA = browserA
+        .contexts()[0]
+        .pages()
+        .find((p) => {
+          return p.url() === server.baseUrl + '/'
+        })!
+      const button = await pageA.$('button')
+      const errorLine = (error: Error) => {
+        return error.message.split('\n')[0]
+      }
+      const pending = pageA
+        .evaluate(() => {
+          return new Promise((resolve) => {
+            setTimeout(() => {
+              resolve('done')
+            }, 1000)
+          })
+        })
+        .catch(errorLine)
+
+      browserB = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+      const pageB = browserB
+        .contexts()[0]
+        .pages()
+        .find((p) => {
+          return p.url() === server.baseUrl + '/'
+        })!
+
+      const results = await Promise.all([
+        pending,
+        button!.textContent().catch(errorLine),
+        pageB.evaluate(() => {
+          return document.querySelector('button')!.textContent
+        }),
+      ])
+      expect(results).toMatchInlineSnapshot(`
+        [
+          "done",
+          "hi",
+          "hi",
+        ]
+      `)
+    } finally {
+      if (browserA) {
+        await safeCloseCDPBrowser(browserA)
+      }
+      if (browserB) {
+        await safeCloseCDPBrowser(browserB)
+      }
+      await page.close()
+      await server.close()
+    }
+  }, 60000)
+
   it('should execute code and capture console output', async () => {
     await client.callTool({
       name: 'execute',
@@ -429,17 +522,27 @@ describe('Relay Core Tests', () => {
     expect(result.content).toBeDefined()
   }, 30000)
 
-  // Repro test for https://github.com/remorses/playwriter/issues/66.
-  // Current limitation: extension-mode routing does not support root-session
-  // Storage.getCookies in playwriter. MUST use Network.getCookies via page CDP
-  // session instead (see test below), so this repro stays skipped.
-  it.skip('should reproduce page.route failure in MCP execute path (issue #66)', async () => {
-    const server = await createSimpleServer({
-      routes: {
-        '/': '<!doctype html><html><body>route issue repro</body></html>',
-        '/api/data': '{"ok":true}',
-      },
+  // Regression test for https://github.com/remorses/playwriter/issues/66.
+  // route.fetch(), context.cookies() and context.addCookies() use root-session
+  // Storage.getCookies/setCookies, which the relay runs as Network commands on a tab.
+  it('should support route.fetch and context cookies in extension mode (issue #66)', async () => {
+    const server = http.createServer((req, res) => {
+      if (req.url === '/api/data') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'fromApi=1; Path=/' })
+        res.end(JSON.stringify({ cookie: req.headers.cookie || '' }))
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html' })
+      res.end('<!doctype html><html><body>route issue repro</body></html>')
     })
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve)
+    })
+    const address = server.address()
+    if (!address || typeof address === 'string') {
+      throw new Error('test server has no port')
+    }
+    const baseUrl = `http://127.0.0.1:${address.port}`
 
     try {
       const result = await client.callTool({
@@ -448,57 +551,91 @@ describe('Relay Core Tests', () => {
           code: js`
             const newPage = await context.newPage();
             state.issue66Page = newPage;
-            await newPage.goto('${server.baseUrl}', { waitUntil: 'domcontentloaded' });
+            await newPage.goto('${baseUrl}', { waitUntil: 'domcontentloaded' });
+            await context.addCookies([{ name: 'fromTest', value: 'abc', url: '${baseUrl}' }]);
 
-            let routeFetchError = null;
             await newPage.route('**/api/**', async (route) => {
-              try {
-                const response = await route.fetch();
-                await route.fulfill({ response });
-              } catch (error) {
-                routeFetchError = error instanceof Error ? error.message : String(error);
-                await route.abort();
-              }
+              const response = await route.fetch();
+              await route.fulfill({ response });
             });
-
-            await newPage.evaluate(async () => {
-              await fetch('/api/data').catch(() => null);
+            const body = await newPage.evaluate(async () => {
+              return await fetch('/api/data').then((r) => r.json());
             });
-
-            return { routeFetchError };
+            const cookies = await context.cookies('${baseUrl}');
+            const names = cookies.map((c) => c.name).sort();
+            const clearError = await context.clearCookies().then(() => null, (e) => e.message.split('\\n')[0]);
+            return { body, names, clearError };
           `,
         },
       })
 
-      const resultWithContent = result as { content?: unknown }
-      const content = Array.isArray(resultWithContent.content) ? resultWithContent.content : []
-      const firstContent = content[0]
-      const output =
-        typeof firstContent === 'object' && firstContent !== null && 'text' in firstContent
-          ? String((firstContent as { text?: unknown }).text ?? '')
-          : ''
-      expect(output).toContain('routeFetchError')
-      expect(output).toContain('Storage.getCookies')
-      expect(output).toContain('No tab found for method Storage.getCookies')
-    } finally {
-      try {
-        await client.callTool({
-          name: 'execute',
-          arguments: {
-            code: js`
-              if (state.issue66Page && !state.issue66Page.isClosed()) {
-                await state.issue66Page.close();
-              }
-              delete state.issue66Page;
-            `,
+      expect(result.content).toMatchInlineSnapshot(`
+        [
+          {
+            "text": "[return value] {
+          body: { cookie: 'fromTest=abc' },
+          names: [ 'fromApi', 'fromTest' ],
+          clearError: 'browserContext.clearCookies: Protocol error (Storage.clearCookies): context.clearCookies() is not supported: in the user browser it deletes cookies for every site in the profile. Delete cookies by name with Network.deleteCookies on a page CDP session.'
+        }",
+            "type": "text",
           },
-        })
-      } catch {
-        // Ignore cleanup failure if MCP disconnected due to the repro.
-      }
-      await server.close()
+        ]
+      `)
+    } finally {
+      await client.callTool({
+        name: 'execute',
+        arguments: {
+          code: js`
+            await state.issue66Page?.close();
+            delete state.issue66Page;
+          `,
+        },
+      })
+      server.closeAllConnections()
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve())
+      })
     }
   }, 30000)
+
+  it('should expose cloud cookie transfer in local CLI sessions', async () => {
+    const createResponse = await fetch(`${SERVER_URL}/cli/session/new`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    })
+    const { id: sessionId } = (await createResponse.json()) as { id: string }
+
+    try {
+      const response = await fetch(`${SERVER_URL}/cli/execute`, {
+        method: 'POST',
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          sessionId,
+          code: `return {
+            browsersList: typeof cloud.browsers.list,
+            sendCookies: typeof cloud.sendCookies,
+          }`,
+        }),
+      })
+      const result = (await response.json()) as { text: string; isError: boolean }
+      expect(result).toMatchInlineSnapshot(`
+        {
+          "images": [],
+          "isCloud": false,
+          "isError": false,
+          "screenshots": [],
+          "text": "[return value] { browsersList: 'function', sendCookies: 'function' }",
+        }
+      `)
+    } finally {
+      await fetch(`${SERVER_URL}/cli/session/delete`, {
+        method: 'POST',
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ sessionId }),
+      })
+    }
+  })
 
   it('should read cookies via Network.getCookies through page CDP session', async () => {
     const browserContext = getBrowserContext()
@@ -594,7 +731,7 @@ describe('Relay Core Tests', () => {
       expectedContent: ['role=link', 'Hacker News'],
       waitForCode: js`
         await state.page.locator('a[href="news"]').first().waitFor({ timeout: 10000 });
-        await state.page.locator('a.hnuser').first().waitFor({ timeout: 10000 });
+        await state.page.locator('a[href^="user?id="]').first().waitFor({ timeout: 10000 });
       `,
     },
     {
@@ -602,7 +739,10 @@ describe('Relay Core Tests', () => {
       url: 'https://ui.shadcn.com/',
       expectedContent: ['shadcn'],
       waitForCode: js`
-        await state.page.locator('text=shadcn/ui').first().waitFor({ timeout: 10000 });
+        await state.page.getByRole('link', { name: 'Get Started' }).first().waitFor({ timeout: 10000 });
+        // shadcn.com is a Next.js SPA that keeps navigating/hydrating after load;
+        // wait for the network to settle so snapshot() is not captured mid-navigation.
+        await state.page.waitForLoadState('networkidle');
       `,
     },
   ]
@@ -625,6 +765,9 @@ describe('Relay Core Tests', () => {
       const interactiveResult = await client.callTool({
         name: 'execute',
         arguments: {
+          // goto + waitFor each allow up to 10s; the default 10s exec window is
+          // too tight for slow external sites, so widen it for this one call.
+          timeout: 40000,
           code: js`
               // External pages can expose a partial AX tree right after domcontentloaded,
               // so wait for stable page-specific content before snapshotting.
@@ -743,7 +886,7 @@ describe('Relay Core Tests', () => {
       name: 'execute',
       arguments: {
         code: js`
-          const logs = await getLatestLogs();
+          const logs = await getLatestLogs({ page: state.testLogPage });
           logs.forEach(log => console.log(log));
         `,
       },
@@ -760,7 +903,7 @@ describe('Relay Core Tests', () => {
       name: 'execute',
       arguments: {
         code: js`
-          const logs = await getLatestLogs({ search: 'error' });
+          const logs = await getLatestLogs({ page: state.testLogPage, search: 'error' });
           logs.forEach(log => console.log(log));
         `,
       },
@@ -842,6 +985,265 @@ describe('Relay Core Tests', () => {
         `,
       },
     })
+  }, 30000)
+
+  it('returns a structured error when the selected extension disconnected', async () => {
+    const response = await fetch(`${SERVER_URL}/cli/session/new`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ extensionId: 'disconnected-extension' }),
+    })
+
+    expect(response.status).toBe(404)
+    expect(await response.json()).toEqual({
+      code: 'extension_connection_lost',
+      error: 'Extension not connected: disconnected-extension',
+    })
+  })
+
+  it('serializes executions within one CLI session', async () => {
+    await ensureConnectedTabForExecute()
+    const sessionId = await createCliSession()
+    const signalPath = path.join(process.cwd(), 'tmp', `execution-started-${sessionId}`)
+    fs.mkdirSync(path.dirname(signalPath), { recursive: true })
+    fs.rmSync(signalPath, { force: true })
+
+    try {
+      const first = executeCli({
+        sessionId,
+        code: `
+          state.order = ['first-start']
+          require('node:fs').writeFileSync(${JSON.stringify(signalPath)}, 'started')
+          await new Promise((resolve) => setTimeout(resolve, 150))
+          state.order.push('first-end')
+        `,
+      })
+      await withTimeout({
+        promise: (async () => {
+          while (!fs.existsSync(signalPath)) {
+            await new Promise<void>((resolve) => {
+              setTimeout(resolve, 10)
+            })
+          }
+        })(),
+        timeoutMs: 2000,
+        errorMessage: 'First session execution did not start',
+      })
+      const second = executeCli({ sessionId, code: `state.order.push('second'); return state.order` })
+
+      const [firstResult, secondResult] = await Promise.all([first, second])
+      expect(firstResult.isError).toBe(false)
+      expect(secondResult).toMatchObject({
+        isError: false,
+        text: expect.stringContaining("[ 'first-start', 'first-end', 'second' ]"),
+      })
+    } finally {
+      fs.rmSync(signalPath, { force: true })
+      await deleteCliSession(sessionId)
+    }
+  })
+
+  it('aborts a timed-out script so the next execute runs at once without interleaving', async () => {
+    await ensureConnectedTabForExecute()
+    const sessionId = await createCliSession()
+
+    try {
+      const timedOut = await executeCli({
+        sessionId,
+        timeout: 300,
+        code: `
+          await new Promise((resolve) => setTimeout(resolve, 600))
+          state.signalAborted = signal.aborted
+          await context.pages()[0].title()
+          state.afterBrowserCall = true
+        `,
+      })
+      expect(timedOut.isError).toBe(true)
+      expect(timedOut.text).toContain('timed out after 300ms and was aborted')
+
+      // Runs while the old script is still sleeping; its own Playwright calls must work
+      const next = await executeCli({ sessionId, code: `await context.pages()[0].title(); return 'next ran'` })
+      expect(next).toMatchObject({ isError: false, text: expect.stringContaining('next ran') })
+
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 600)
+      })
+      const after = await executeCli({ sessionId, code: `return [state.signalAborted, state.afterBrowserCall]` })
+      expect(after.isError).toBe(false)
+      expect(after.text).toContain('[ true, undefined ]')
+    } finally {
+      await deleteCliSession(sessionId)
+    }
+  }, 30000)
+
+  it('cancels a Playwright action still running when execute times out', async () => {
+    await ensureConnectedTabForExecute()
+    const sessionId = await createCliSession()
+
+    try {
+      const timedOut = await executeCli({ sessionId, timeout: 300, code: `await context.pages()[0].click('#late-button')` })
+      expect(timedOut.isError).toBe(true)
+
+      // Without server-side cancel, the pending click would fire once the button appears
+      const result = await executeCli({
+        sessionId,
+        code: `
+          const target = context.pages()[0]
+          await target.evaluate(() => {
+            const button = document.createElement('button')
+            button.id = 'late-button'
+            button.onclick = () => { window.lateClicked = true }
+            document.body.append(button)
+          })
+          await target.waitForTimeout(1500)
+          const clicked = await target.evaluate(() => window.lateClicked === true)
+          await target.evaluate(() => document.getElementById('late-button').remove())
+          return clicked
+        `,
+      })
+      expect(result).toMatchObject({ isError: false, text: expect.stringContaining('false') })
+    } finally {
+      await deleteCliSession(sessionId)
+    }
+  }, 30000)
+
+  it('restores the page UI when a screenshot capture fails', async () => {
+    await ensureConnectedTabForExecute()
+    const sessionId = await createCliSession()
+
+    try {
+      const result = await executeCli({
+        sessionId,
+        code: `
+          const target = context.pages()[0]
+          const cdp = await getCDPSession({ page: target })
+          let captureError = null
+          try {
+            await cdp.send('Page.captureScreenshot', { format: 'not-a-format' })
+          } catch (error) {
+            captureError = error.message
+          }
+          const stillHidden = await target.evaluate(() => getComputedStyle(document.documentElement).scrollbarWidth === 'none')
+          return { captureFailed: Boolean(captureError), stillHidden }
+        `,
+      })
+      expect(result.isError).toBe(false)
+      expect(result.text).toContain('captureFailed: true')
+      expect(result.text).toContain('stillHidden: false')
+    } finally {
+      await deleteCliSession(sessionId)
+    }
+  }, 30000)
+
+  it('invalidates snapshot refs and diff state after navigation', async () => {
+    await ensureConnectedTabForExecute()
+    const pageServer = await createSimpleServer({
+      routes: {
+        '/old': '<!doctype html><button>Old page</button>',
+        '/new': '<!doctype html><button>New page</button>',
+      },
+    })
+    const sessionId = await createCliSession()
+
+    try {
+      const first = await executeCli({
+        sessionId,
+        code: `
+        state.page = await context.newPage()
+        await state.page.goto('${pageServer.baseUrl}/old')
+        await snapshot({ page: state.page })
+        state.oldRef = Array.from({ length: 20 }, (_, index) => 'e' + index).find((ref) => {
+          return refToLocator({ ref, page: state.page })?.includes('Old page')
+        })
+        return state.oldRef
+      `,
+      })
+      expect(first.text).toContain('[return value] e')
+      expect(first.isError).toBe(false)
+
+      const second = await executeCli({
+        sessionId,
+        code: `
+        await state.page.goto('${pageServer.baseUrl}/new')
+        const staleLocator = refToLocator({ ref: state.oldRef, page: state.page })
+        const nextSnapshot = await snapshot({ page: state.page })
+        return { staleLocator, nextSnapshot }
+      `,
+      })
+      expect(second).toMatchObject({
+        isError: false,
+        text: expect.stringContaining('staleLocator: null'),
+      })
+      expect(second.text).toContain('New page')
+      expect(second.text).not.toContain('Old page')
+      expect(second.text).not.toContain('snapshot diff')
+    } finally {
+      await executeCli({ sessionId, code: `if (state.page && !state.page.isClosed()) await state.page.close()` })
+      await deleteCliSession(sessionId)
+      await pageServer.close()
+    }
+  })
+
+  it('should include uncaught errors from only the CLI session tracked page', async () => {
+    const browserContext = getBrowserContext()
+    const serviceWorker = await getExtensionServiceWorker(browserContext)
+    const pageA = await browserContext.newPage()
+    const pageB = await browserContext.newPage()
+
+    let sessionA = ''
+    let sessionB = ''
+    try {
+      await pageA.goto('data:text/html,<title>tracked-agent-a</title>')
+      await pageA.bringToFront()
+      await serviceWorker.evaluate(async () => {
+        await globalThis.toggleExtensionForActiveTab()
+      })
+      await pageB.goto('data:text/html,<title>tracked-agent-b</title>')
+      await pageB.bringToFront()
+      await serviceWorker.evaluate(async () => {
+        await globalThis.toggleExtensionForActiveTab()
+      })
+
+      sessionA = await createCliSession()
+      sessionB = await createCliSession()
+      await executeCli({
+        sessionId: sessionA,
+        code: `state.page = context.pages().find((page) => page.url().includes('tracked-agent-a'))`,
+      })
+      await executeCli({
+        sessionId: sessionB,
+        code: `state.page = context.pages().find((page) => page.url().includes('tracked-agent-b')); state.pageError = state.page.waitForEvent('pageerror')`,
+      })
+
+      const sessionAResult = await executeCli({
+        sessionId: sessionA,
+        code: js`
+          const otherPage = context.pages().find((page) => page.url().includes('tracked-agent-b'));
+          const pageError = state.page.waitForEvent('pageerror');
+          await state.page.evaluate(() => setTimeout(() => { throw new Error('tracked-agent-a-error'); }, 0));
+          await otherPage.evaluate(() => setTimeout(() => { throw new Error('tracked-agent-b-error'); }, 0));
+          await pageError;
+        `,
+      })
+      expect(sessionAResult.text).toContain('[PAGE ERROR] tracked-agent-a-error')
+      expect(sessionAResult.text).not.toContain('tracked-agent-b-error')
+      expect(sessionAResult.isError).toBe(false)
+
+      const sessionBResult = await executeCli({
+        sessionId: sessionB,
+        code: 'await state.pageError; return state.page.url()',
+      })
+      expect(sessionBResult.text).toContain('[PAGE ERROR] tracked-agent-b-error')
+      expect(sessionBResult.text).not.toContain('tracked-agent-a-error')
+      expect(sessionBResult.isError).toBe(false)
+    } finally {
+      await Promise.all([pageA.close(), pageB.close()])
+      await Promise.all(
+        [sessionA, sessionB].filter(Boolean).map(async (sessionId) => {
+          await deleteCliSession(sessionId)
+        }),
+      )
+    }
   }, 30000)
 
   it('should keep logs separate between different pages', async () => {
@@ -936,7 +1338,10 @@ describe('Relay Core Tests', () => {
       name: 'execute',
       arguments: {
         code: js`
-          const logs = await getLatestLogs();
+          const logs = [
+            ...(await getLatestLogs({ page: state.pageA })),
+            ...(await getLatestLogs({ page: state.pageB })),
+          ];
           console.log('All logs:', logs.length);
           logs.forEach(log => console.log(log));
         `,
@@ -1010,7 +1415,7 @@ describe('Relay Core Tests', () => {
       name: 'execute',
       arguments: {
         code: js`
-          const logs = await getLatestLogs();
+          const logs = await getLatestLogs({ page: state.pageB });
           console.log('All logs after closing page A:', logs.length);
           logs.forEach(log => console.log(log));
         `,
@@ -1193,19 +1598,13 @@ describe('Relay Core Tests', () => {
     await serviceWorker.evaluate(async () => {
       await globalThis.toggleExtensionForActiveTab()
     })
-    await new Promise((r) => setTimeout(r, 400))
 
     // Test basic getCleanHTML
     const result = await client.callTool({
       name: 'execute',
       arguments: {
         code: js`
-                    let testPage;
-                    for (const p of context.pages()) {
-                        const html = await p.content();
-                        if (html.includes('Hello World')) { testPage = p; break; }
-                    }
-                    if (!testPage) throw new Error('Test page not found');
+                    ${findTestPageJs('Hello World')}
                     const html = await getCleanHTML({ locator: testPage.locator('body') });
                     return html;
                 `,
@@ -1236,12 +1635,7 @@ describe('Relay Core Tests', () => {
       name: 'execute',
       arguments: {
         code: js`
-                    let testPage;
-                    for (const p of context.pages()) {
-                        const html = await p.content();
-                        if (html.includes('Hello World')) { testPage = p; break; }
-                    }
-                    if (!testPage) throw new Error('Test page not found');
+                    ${findTestPageJs('Hello World')}
                     const html = await getCleanHTML({ locator: testPage, search: /button/i });
                     return html;
                 `,
@@ -1294,19 +1688,13 @@ describe('Relay Core Tests', () => {
     await serviceWorker.evaluate(async () => {
       await globalThis.toggleExtensionForActiveTab()
     })
-    await new Promise((r) => setTimeout(r, 400))
 
     // Test basic getPageMarkdown
     const result = await client.callTool({
       name: 'execute',
       arguments: {
         code: js`
-                    let testPage;
-                    for (const p of context.pages()) {
-                        const html = await p.content();
-                        if (html.includes('Test Article Title')) { testPage = p; break; }
-                    }
-                    if (!testPage) throw new Error('Test page not found');
+                    ${findTestPageJs('Test Article Title')}
                     const content = await getPageMarkdown({ page: testPage });
                     console.log(content);
                 `,
@@ -1334,12 +1722,7 @@ describe('Relay Core Tests', () => {
       name: 'execute',
       arguments: {
         code: js`
-                    let testPage;
-                    for (const p of context.pages()) {
-                        const html = await p.content();
-                        if (html.includes('Test Article Title')) { testPage = p; break; }
-                    }
-                    if (!testPage) throw new Error('Test page not found');
+                    ${findTestPageJs('Test Article Title')}
                     const content = await getPageMarkdown({ page: testPage, search: /important/i, showDiffSinceLastCall: false });
                     return content;
                 `,
@@ -1352,89 +1735,6 @@ describe('Relay Core Tests', () => {
     expect(searchText).toContain('important')
 
     await page.close()
-  }, 60000)
-
-  it('should handle default page being closed and switch to another available page', async () => {
-    // This test verifies that when the default `page` in MCP scope is closed,
-    // the MCP automatically switches to another available page instead of failing
-    // with cryptic "page closed" errors.
-
-    const browserContext = getBrowserContext()
-    const serviceWorker = await getExtensionServiceWorker(browserContext)
-
-    // 1. Disconnect everything to start fresh
-    await serviceWorker.evaluate(async () => {
-      await globalThis.disconnectEverything()
-    })
-    await new Promise((r) => setTimeout(r, 100))
-
-    // 2. Create first page and enable extension
-    const page1 = await browserContext.newPage()
-    await page1.goto('https://example.com/first-page')
-    await page1.bringToFront()
-
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
-    await new Promise((r) => setTimeout(r, 100))
-
-    // 3. Reset MCP to ensure page1 becomes the default page (only page available)
-    const resetResult = await client.callTool({
-      name: 'reset',
-      arguments: {},
-    })
-    expect((resetResult as any).content[0].text).toContain('Connection reset successfully')
-
-    // 4. Verify initial page is accessible via default `page`
-    const initialResult = await client.callTool({
-      name: 'execute',
-      arguments: {
-        code: js`
-                    const url = page.url();
-                    console.log('Initial page URL:', url);
-                    return { url };
-                `,
-      },
-    })
-    expect((initialResult as any).content[0].text).toContain('first-page')
-
-    // 5. Create second page and enable extension
-    const page2 = await browserContext.newPage()
-    await page2.goto('https://example.com/second-page')
-    await page2.bringToFront()
-
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
-    await new Promise((r) => setTimeout(r, 100))
-
-    // 6. Close the first page (which is the default `page` in MCP scope)
-    await page1.close()
-    await new Promise((r) => setTimeout(r, 100))
-
-    // 7. Execute code via MCP - should NOT fail with "page closed" error
-    // Instead, it should automatically switch to the second page
-    const afterCloseResult = await client.callTool({
-      name: 'execute',
-      arguments: {
-        code: js`
-                    const url = page.url();
-                    console.log('Page URL after close:', url);
-                    const title = await page.title();
-                    return { url, title };
-                `,
-      },
-    })
-
-    // Should succeed and return the second page's info
-    expect((afterCloseResult as any).isError).toBeFalsy()
-    const output = (afterCloseResult as any).content[0].text
-    expect(output).toContain('second-page')
-    expect(output).not.toContain('page closed')
-    expect(output).not.toContain('Target closed')
-
-    // Cleanup
-    await page2.close()
   }, 60000)
 
   it('should show descriptive error when clicking a hidden element', async () => {
@@ -1463,33 +1763,58 @@ describe('Relay Core Tests', () => {
         `,
       },
     })
-    expect(result).toMatchInlineSnapshot(`
-      {
-        "content": [
-          {
-            "text": "
+    expect(result.isError).toBe(true)
+    // the call log retry lines depend on timing, keep the message and check the reason
+    const text = (result.content as any)[0].text as string
+    expect(text.slice(0, text.indexOf('Call log:'))).toMatchInlineSnapshot(`
+      "
       Error executing code: page.click: Timeout 100ms exceeded. Element is not visible — it may be hidden by CSS, inside a collapsed <details>, inactive tab, or closed accordion. Try: interact with the page to reveal it first, or use { force: true } to skip visibility checks
-      Call log:
-      [2m  - waiting for locator('#hidden-btn')[22m
-      [2m    - locator resolved to <button id="hidden-btn">Hidden Button</button>[22m
-      [2m  - attempting click action[22m
-      [2m    2 × waiting for element to be visible, enabled and stable[22m
-      [2m      - element is not visible[22m
-      [2m    - retrying click action[22m
-      [2m    - waiting 20ms[22m
-      [2m    - waiting for element to be visible, enabled and stable[22m
-      [2m    - element is not visible[22m
-      [2m  - retrying click action[22m
-      [2m    - waiting 100ms[22m
-      ",
-            "type": "text",
-          },
-        ],
-        "isError": true,
-      }
+      "
     `)
+    expect(text).toContain('element is not visible')
     // Cleanup
     await client.callTool({ name: 'execute', arguments: { code: js`await state.errorTestPage.close(); delete state.errorTestPage;` } })
+  }, 30000)
+
+  it('should list every match on strict mode violation so agents can pick one', async () => {
+    await ensureConnectedTabForExecute()
+
+    await client.callTool({
+      name: 'execute',
+      arguments: {
+        code: js`
+          state.strictTestPage = await context.newPage();
+          await state.strictTestPage.setContent(\`
+            <div role="dialog">
+              <button>From</button>
+              <button>Send</button>
+              <button>Discard</button>
+            </div>
+          \`);
+        `,
+      },
+    })
+    const result = await client.callTool({
+      name: 'execute',
+      arguments: {
+        code: js`
+          await state.strictTestPage.locator('[role=dialog] button').click({ timeout: 1000 });
+        `,
+      },
+    })
+    expect(result.isError).toBe(true)
+    // stack trace has machine-specific paths, keep only the message
+    const text = (result.content as any)[0].text as string
+    expect(text.slice(0, text.indexOf('Call log:'))).toMatchInlineSnapshot(`
+      "
+      Error executing code: locator.click: Error: strict mode violation: locator('[role=dialog] button') resolved to 3 elements:
+          1) <button>From</button> aka getByRole('button', { name: 'From' })
+          2) <button>Send</button> aka getByRole('button', { name: 'Send' })
+          3) <button>Discard</button> aka getByRole('button', { name: 'Discard' })
+
+      "
+    `)
+    await client.callTool({ name: 'execute', arguments: { code: js`await state.strictTestPage.close(); delete state.strictTestPage;` } })
   }, 30000)
 
   it('should show descriptive error when clicking an element covered by another', async () => {
@@ -1517,37 +1842,15 @@ describe('Relay Core Tests', () => {
         `,
       },
     })
-    expect(result).toMatchInlineSnapshot(`
-      {
-        "content": [
-          {
-            "text": "
+    expect(result.isError).toBe(true)
+    // the call log retry lines depend on timing, keep the message and check the reason
+    const text = (result.content as any)[0].text as string
+    expect(text.slice(0, text.indexOf('Call log:'))).toMatchInlineSnapshot(`
+      "
       Error executing code: page.click: Timeout 100ms exceeded. <div id="overlay">Overlay</div> intercepts pointer events
-      Call log:
-      [2m  - waiting for locator('#covered-btn')[22m
-      [2m    - locator resolved to <button id="covered-btn">Covered</button>[22m
-      [2m  - attempting click action[22m
-      [2m    2 × waiting for element to be visible, enabled and stable[22m
-      [2m      - element is visible, enabled and stable[22m
-      [2m      - scrolling into view if needed[22m
-      [2m      - done scrolling[22m
-      [2m      - <div id="overlay">Overlay</div> intercepts pointer events[22m
-      [2m    - retrying click action[22m
-      [2m    - waiting 20ms[22m
-      [2m    - waiting for element to be visible, enabled and stable[22m
-      [2m    - element is visible, enabled and stable[22m
-      [2m    - scrolling into view if needed[22m
-      [2m    - done scrolling[22m
-      [2m    - <div id="overlay">Overlay</div> intercepts pointer events[22m
-      [2m  - retrying click action[22m
-      [2m    - waiting 100ms[22m
-      ",
-            "type": "text",
-          },
-        ],
-        "isError": true,
-      }
+      "
     `)
+    expect(text).toContain('intercepts pointer events')
     await client.callTool({ name: 'execute', arguments: { code: js`await state.errorTestPage.close(); delete state.errorTestPage;` } })
   }, 30000)
 
@@ -1571,32 +1874,214 @@ describe('Relay Core Tests', () => {
         `,
       },
     })
-    expect(result).toMatchInlineSnapshot(`
-      {
-        "content": [
-          {
-            "text": "
+    expect(result.isError).toBe(true)
+    // the call log retry lines depend on timing, keep the message and check the reason
+    const text = (result.content as any)[0].text as string
+    expect(text.slice(0, text.indexOf('Call log:'))).toMatchInlineSnapshot(`
+      "
       Error executing code: page.click: Timeout 100ms exceeded. Element is not visible — it may be hidden by CSS, inside a collapsed <details>, inactive tab, or closed accordion. Try: interact with the page to reveal it first, or use { force: true } to skip visibility checks
-      Call log:
-      [2m  - waiting for locator('#invisible')[22m
-      [2m    - locator resolved to <button id="invisible">Invisible</button>[22m
-      [2m  - attempting click action[22m
-      [2m    2 × waiting for element to be visible, enabled and stable[22m
-      [2m      - element is not visible[22m
-      [2m    - retrying click action[22m
-      [2m    - waiting 20ms[22m
-      [2m    - waiting for element to be visible, enabled and stable[22m
-      [2m    - element is not visible[22m
-      [2m  - retrying click action[22m
-      [2m    - waiting 100ms[22m
-      ",
-            "type": "text",
-          },
-        ],
-        "isError": true,
-      }
+      "
     `)
+    expect(text).toContain('element is not visible')
     await client.callTool({ name: 'execute', arguments: { code: js`await state.errorTestPage.close(); delete state.errorTestPage;` } })
   }, 30000)
 
+  // Sandbox escape tests (issue #105): process.getBuiltinModule and importModule()
+  // must respect ALLOWED_MODULES the same way require() does.
+  it('should block process.getBuiltinModule for disallowed modules', async () => {
+    await ensureConnectedTabForExecute()
+    const result = await client.callTool({
+      name: 'execute',
+      arguments: { code: js`return process.getBuiltinModule('node:child_process')` },
+    })
+    expect(result.isError).toBe(true)
+    expect(JSON.stringify(result.content)).toContain('not allowed in the sandbox')
+  }, 30000)
+
+  it('should block importModule() for disallowed modules', async () => {
+    await ensureConnectedTabForExecute()
+    const result = await client.callTool({
+      name: 'execute',
+      arguments: { code: js`const cp = await importModule('node:child_process'); return cp` },
+    })
+    expect(result.isError).toBe(true)
+    expect(JSON.stringify(result.content)).toContain('not allowed in the sandbox')
+  }, 30000)
+
+  it('should block getBuiltinModule via Object.getOwnPropertyDescriptor bypass', async () => {
+    await ensureConnectedTabForExecute()
+    const result = await client.callTool({
+      name: 'execute',
+      arguments: { code: js`
+        const desc = Object.getOwnPropertyDescriptor(process, 'getBuiltinModule')
+        return desc.value('node:child_process')
+      ` },
+    })
+    expect(result.isError).toBe(true)
+    expect(JSON.stringify(result.content)).toContain('not allowed in the sandbox')
+  }, 30000)
+
+  // clock: 'manual' writes frames only inside wait(ms), so agent latency between
+  // execute calls is cut. The handle in state works across execute calls.
+  it('records only wait() windows with a manual clock and switches tabs', async () => {
+    await ensureConnectedTabForExecute()
+    const page = (box: string) => {
+      return `<!doctype html><html><body style="margin:0">
+        <div id="box" style="width:80px;height:80px;background:${box};transition:transform 1s linear"></div>
+      </body></html>`
+    }
+    const server = await createSimpleServer({ routes: { '/a': page('red'), '/b': page('blue') } })
+    const outputPath = path.join(process.cwd(), 'tmp', 'manual-clock-recording.mp4')
+    try {
+      await client.callTool({
+        name: 'execute',
+        arguments: {
+          code: js`
+            state.clockA = await context.newPage()
+            await state.clockA.goto('${server.baseUrl}/a')
+            state.video = await recording.start({ page: state.clockA, outputPath: '${outputPath}', clock: 'manual', frameRate: 30 })
+            await state.clockA.evaluate(() => { document.getElementById('box').style.transform = 'translateX(300px)' })
+            await state.video.wait(500)
+          `,
+        },
+      })
+
+      const result = await client.callTool({
+        name: 'execute',
+        arguments: {
+          code: js`
+            // Agent latency: wall time passes, nothing is recorded
+            await new Promise((r) => setTimeout(r, 300))
+            state.clockB = await context.newPage()
+            await state.clockB.goto('${server.baseUrl}/b')
+            await state.video.setPage(state.clockB)
+            await state.clockB.evaluate(() => { document.getElementById('box').style.transform = 'translateX(300px)' })
+            await state.video.wait(100)
+            const { duration, executionTimestamps } = await state.video.stop()
+            for (const key of ['clockA', 'clockB']) {
+              const tab = state[key]
+              delete state[key]
+              await tab.close()
+            }
+            return { duration, executionTimestamps, isRecording: state.video.isRecording }
+          `,
+        },
+      })
+      expect(result.isError).toBeFalsy()
+      expect((result.content as Array<{ text: string }>)[0].text).toMatchInlineSnapshot(`"[return value] { duration: 600, executionTimestamps: [], isRecording: false }"`)
+
+      // 500ms + 100ms of video, the 300ms gap is cut. Both tabs have one frame size.
+      const { spawnSync } = await import('node:child_process')
+      const probe = spawnSync('ffprobe', [
+        '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=width,height:format=duration', '-of', 'json', outputPath,
+      ]).stdout.toString()
+      const { frames, format } = JSON.parse(probe) as { frames: Array<{ width: number; height: number }>; format: { duration: string } }
+      expect(new Set(frames.map((frame) => `${frame.width}x${frame.height}`)).size).toBe(1)
+      expect(Math.abs(Number(format.duration) - 0.6)).toBeLessThan(0.15)
+    } finally {
+      await server.close()
+      fs.rmSync(outputPath, { force: true })
+    }
+  }, 60000)
+
+  // Agents forget stop() and close tabs. Every ending keeps a playable file and warns.
+  it('auto-stops, keeps the file when the page closes, and warns', async () => {
+    await ensureConnectedTabForExecute()
+    const dir = path.join(process.cwd(), 'tmp', 'recording-endings')
+    fs.rmSync(dir, { recursive: true, force: true })
+    try {
+      const result = await client.callTool({
+        name: 'execute',
+        arguments: {
+          code: js`
+            const spin = '<div style="width:80px;height:80px;background:red;animation:s 1s linear infinite"></div><style>@keyframes s{to{transform:rotate(360deg)}}</style>'
+            state.endA = await context.newPage()
+            await state.endA.setContent(spin)
+            const auto = await recording.start({ page: state.endA, outputPath: 'tmp/recording-endings/auto.webm', maxDurationMs: 2500 })
+            const duplicate = await recording.start({ page: state.endA, outputPath: 'tmp/recording-endings/dup.mp4' }).then(() => 'started', (error) => error.message)
+            state.endB = await context.newPage()
+            await state.endB.setContent(spin)
+            const closed = await recording.start({ page: state.endB, outputPath: 'tmp/recording-endings/closed.mp4', codec: 'av1' })
+            await new Promise((r) => setTimeout(r, 3000))
+            const endB = state.endB
+            delete state.endB
+            await endB.close()
+            const autoResult = await auto.stop()
+            const closedResult = await closed.stop()
+            const endA = state.endA
+            delete state.endA
+            await endA.close()
+            return {
+              duplicate,
+              auto: autoResult.endReason,
+              autoRelative: autoResult.path.endsWith('tmp/recording-endings/auto.webm'),
+              closed: closedResult.endReason,
+              noneLeft: await recording.stop().then(() => 'stopped', (error) => error.message),
+            }
+          `,
+        },
+      })
+      expect(result.isError).toBeFalsy()
+      const text = (result.content as Array<{ text: string }>)[0].text.replaceAll(dir, '<dir>')
+      expect(text).toMatchInlineSnapshot(`
+        "[WARNING] Recording ended without stop() (max-duration). Saved <dir>/auto.webm
+        [WARNING] Recording ended without stop() (page-closed). Saved <dir>/closed.mp4
+        [return value] {
+          duplicate: 'This page is already recording to <dir>/auto.webm. Call recording.stop({ page }) first.',
+          auto: 'max-duration',
+          autoRelative: true,
+          closed: 'page-closed',
+          noneLeft: 'No active recording'
+        }"
+      `)
+      const { spawnSync } = await import('node:child_process')
+      for (const name of ['auto.webm', 'closed.mp4']) {
+        const probe = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', path.join(dir, name)])
+        expect(Number(probe.stdout.toString())).toBeGreaterThan(1.5)
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }, 60000)
+
+})
+
+describe('Relay extension timeouts', () => {
+  const PORT = 19969
+  let testCtx: TestContext | null = null
+
+  beforeAll(async () => {
+    testCtx = await setupTestContext({
+      port: PORT,
+      tempDirPrefix: 'pw-timeouts-',
+      toggleExtension: true,
+      relayOptions: { extensionTimeouts: { command: 1000 } },
+    })
+  }, 600000)
+
+  afterAll(async () => {
+    await cleanupTestContext(testCtx)
+    testCtx = null
+  })
+
+  it('lets an awaited evaluate run longer than the command timeout', async () => {
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: PORT }))
+    try {
+      const page = browser.contexts()[0].pages()[0]
+      const result = await page
+        .evaluate(() => {
+          return new Promise((resolve) => {
+            setTimeout(() => {
+              resolve('done')
+            }, 1500)
+          })
+        })
+        .catch((error: Error) => {
+          return error.message.split('\n')[0]
+        })
+      expect(result).toMatchInlineSnapshot(`"done"`)
+    } finally {
+      await safeCloseCDPBrowser(browser)
+    }
+  }, 30000)
 })

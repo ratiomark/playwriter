@@ -8006,3 +8006,18 @@ test('unwraps unnecessary nested wrapper divs', async () => {
     "
   `)
 })
+
+test('formats sibling actions on separate lines', async () => {
+  const result = await formatHtmlForPrompt({
+    html: '<div><a href="/one">One</a><button>Two</button><a href="/three">Three</a></div>',
+  })
+
+  expect(result).toMatchInlineSnapshot(`
+    "<div>
+     <a href="/one">One</a>
+     <button>Two</button>
+     <a href="/three">Three</a>
+    </div>
+    "
+  `)
+})

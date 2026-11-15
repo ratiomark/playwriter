@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting
-description: Debug connection issues, read relay logs, and fix common problems.
+description: Debug Playwriter connection issues. Read relay logs, inspect CDP traffic, and fix common Chrome debugger problems.
 icon: lucide:bug
 ---
 
@@ -77,7 +77,7 @@ Get-NetTCPConnection -LocalPort 19988 -ErrorAction SilentlyContinue | ForEach-Ob
 Increase the timeout for slow operations:
 
 ```bash
-playwriter -s 1 --timeout 30000 -e 'await page.goto("https://slow-site.com")'
+playwriter -s 1 --timeout 30000 -e 'await state.page.goto("https://slow-site.com")'
 ```
 
 The default timeout is 10 seconds.
@@ -94,3 +94,46 @@ PIDS=$(lsof -ti :19988)
 # Or use --replace flag
 playwriter serve --token MY_SECRET --replace
 ```
+
+### Skill recorder will not start, or stop is ambiguous
+
+The in-page **Record** button talks to the local relay. It no longer fails just because several playwriter sessions are open. If start still fails:
+
+1. Is the extension icon green on the tab?
+2. Is the relay up? Run any `playwriter` command or `playwriter serve`
+3. Read `playwriter logfile` and look for `Record start endpoint error`
+
+If `playwriter recorder stop` says **Multiple active recordings**, it prints each recording id with the current or last page URL. Pick the matching one:
+
+```bash
+playwriter recorder status
+playwriter recorder stop 3
+```
+
+See [Skill Recorder](/docs/skill-recorder) for the full command list and more cases.
+
+### Dialogs (alert, confirm, prompt) disappear instantly
+
+Playwright **auto-dismisses** JavaScript dialogs when no handler is registered. This is core Playwright behavior, not Playwriter-specific. When a dialog opens and nothing handles it:
+
+- **alert** is dismissed (same as clicking OK)
+- **confirm** is dismissed (same as clicking **Cancel**)
+- **prompt** is dismissed (same as clicking **Cancel**)
+- **beforeunload** is accepted (lets navigation proceed)
+
+This happens because an open JS dialog **blocks all JavaScript execution** on the page. Every `evaluate()`, click, and navigation hangs until the dialog is closed. Playwright auto-dismisses to prevent the page from freezing.
+
+The consequence for agents: `confirm()` dialogs always return `false` (cancelled) unless the agent explicitly handles them.
+
+**Fix:** register a dialog handler *before* the action that triggers the dialog:
+
+```js
+// Must be set up BEFORE clicking the button that opens the dialog
+state.page.on('dialog', async (dialog) => {
+  console.log(`Dialog: ${dialog.type()} - ${dialog.message()}`)
+  await dialog.accept()  // or dialog.dismiss()
+})
+await state.page.click('button.delete')
+```
+
+The handler must be registered first because Playwright fires the auto-dismiss synchronously when Chrome sends the CDP event. If there is no handler at that exact moment, the dialog is already gone.
