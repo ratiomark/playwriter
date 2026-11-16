@@ -38,7 +38,7 @@ export function presentExecutionConsoleEvents(events: readonly ExecutionConsoleE
       const text = event.text.replace(/(?:\r?\n)+$/u, '')
       return event.method === EXECUTION_CONSOLE_METHODS.log ? text : `[${event.method}] ${text}`
     })
-    .join('\n\n')
+    .join('\n')
 }
 
 export const EXECUTION_ERROR_KINDS = {

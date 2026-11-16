@@ -32,9 +32,9 @@ describe('execution return values', () => {
         { method: 'error', text: 'Request failed' },
       ]),
     ).toBe(
-      '- main:\n  - heading "Example"\n\n' +
-        '{"action":"fill","value":"hello"}\n\n' +
-        '[warn] Fallback used\n\n' +
+      '- main:\n  - heading "Example"\n' +
+        '{"action":"fill","value":"hello"}\n' +
+        '[warn] Fallback used\n' +
         '[error] Request failed',
     )
   })

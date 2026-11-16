@@ -2257,14 +2257,13 @@ export class PlaywrightExecutor {
         after: returnText,
       })
       const finalText = responseText.trim() || 'Code executed successfully (no output)'
-      // Agent text keeps console lines without the debug header; the return value is shown only when nothing
-      // was logged, because structured consumers read it from returnValue.
+      // Agent text is the output only, possibly empty; the consumer presents returnValue and an empty result itself.
+      // A return value that JSON can't carry stays in the text, or it would be lost.
       const consoleEvents = buildConsoleEvents()
-      const agentText =
-        boundExecuteOutput({
-          before: [presentExecutionConsoleEvents(consoleEvents), outputText.trim()].filter(Boolean).join('\n\n'),
-          after: formattedReturnValue && consoleEvents.length === 0 ? `[return value] ${formattedReturnValue}` : '',
-        }).trim() || 'Code executed successfully (no output)'
+      const agentText = boundExecuteOutput({
+        before: [presentExecutionConsoleEvents(consoleEvents), outputText.trim()].filter(Boolean).join('\n'),
+        after: formattedReturnValue && returnValue === undefined ? `[return value] ${formattedReturnValue}` : '',
+      }).trim()
 
       const images = [
         ...screenshotCollector.map((s) => ({ data: s.base64, mimeType: s.mimeType })),
@@ -2338,7 +2337,7 @@ export class PlaywrightExecutor {
       const errorText = isTimeoutError ? error.message : errorStack
       const errorOutput = `Error executing code: ${errorText}${resetHint}`
       const consoleEvents = buildConsoleEvents()
-      const priorOutput = [presentExecutionConsoleEvents(consoleEvents), outputText.trim()].filter(Boolean).join('\n\n')
+      const priorOutput = [presentExecutionConsoleEvents(consoleEvents), outputText.trim()].filter(Boolean).join('\n')
       return {
         text: boundExecuteOutput({
           before: outputText + logsText,
@@ -2346,7 +2345,7 @@ export class PlaywrightExecutor {
         }),
         agentText: boundExecuteOutput({
           before: priorOutput,
-          after: `\n\n${errorOutput}`,
+          after: `\n${errorOutput}`,
         }).trim(),
         consoleEvents,
         error: toExecutionError({
