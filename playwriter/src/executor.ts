@@ -1692,13 +1692,17 @@ export class PlaywrightExecutor {
           return withPageUrl(diffResult.content)
         }
 
+        const frameNote = frame
+          ? 'Locators above are relative to this frame: use frame.locator(...), not page.locator(...).'
+          : undefined
+
         if (!search) {
-          return withPageUrl(
-            `${snapshotStr}\n\nuse refToLocator({ ref: 'e3', page: state.page }) to get locators for ref strings.`,
-          )
+          const hint = frameNote ?? "use refToLocator({ ref: 'e3', page: state.page }) to get locators for ref strings."
+          return withPageUrl(`${snapshotStr}\n\n${hint}`)
         }
 
-        return withPageUrl(searchSnapshot({ snapshot: snapshotStr, search }))
+        const searched = searchSnapshot({ snapshot: snapshotStr, search })
+        return withPageUrl(frameNote ? `${searched}\n\n${frameNote}` : searched)
       }
 
       const refToLocator = (options: { ref: string; page?: Page }): string | null => {
