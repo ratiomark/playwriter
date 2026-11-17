@@ -449,7 +449,7 @@ function buildSnapshotLine({
   hasChildren: boolean
 }): SnapshotLine {
   const prefix = '  '.repeat(indent)
-  let text = `${prefix}- ${role}`
+  let text = `${prefix}${role}`
   if (name) {
     const escapedName = name.replace(/"/g, '\\"')
     text += ` "${escapedName}"`
@@ -463,7 +463,7 @@ function buildSnapshotLine({
 function buildTextLine(text: string, indent: number): SnapshotLine {
   const prefix = '  '.repeat(indent)
   const escaped = text.replace(/"/g, '\\"')
-  return { text: `${prefix}- text: "${escaped}"` }
+  return { text: `${prefix}text: "${escaped}"` }
 }
 
 export function buildSnapshotLines(nodes: SnapshotNode[], indent = 0): SnapshotLine[] {
@@ -783,8 +783,7 @@ function buildLocatorLineText({ line, locator }: { line: SnapshotLine; locator: 
     parts.push(line.state)
   }
 
-  const base = parts.length > 0 ? `${prefix}- ${parts.join(' ')}` : `${prefix}-`
-  return `${base} ${locator}`
+  return parts.length > 0 ? `${prefix}${parts.join(' ')} ${locator}` : `${prefix}${locator}`
 }
 
 function locatorIdentity(locator: string): string {

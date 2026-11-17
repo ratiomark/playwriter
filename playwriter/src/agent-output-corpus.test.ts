@@ -538,7 +538,7 @@ return { snapshot: snapshotText };
       const candidateAgentOutput = structured.agentText
         ?? presentExecutionConsoleEvents(structured.consoleEvents)
       expect(candidateSnapshot).not.toBe(upstreamSnapshot)
-      expect(candidateSnapshot.startsWith('- ')).toBe(true)
+      expect(candidateSnapshot.startsWith('- ')).toBe(false)
       expect(candidateAgentOutput).toBe(candidateSnapshot)
       for (const expectedText of corpusCase.expectedText) {
         expect(candidateSnapshot).toContain(expectedText)
