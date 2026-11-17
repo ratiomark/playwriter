@@ -427,7 +427,7 @@ export type SnapshotLine = {
   indent?: number
 }
 
-export type RoleLocatorMatches = Map<string, Protocol.DOM.BackendNodeId[]>
+export type RoleLocatorMatches = Map<string, Map<Protocol.DOM.BackendNodeId, number>>
 
 export type SnapshotNode = {
   role: string
@@ -855,7 +855,7 @@ export function buildRoleLocatorMatches(options: {
   excludedBackendIds: Set<Protocol.DOM.BackendNodeId>
   queryOrder: Map<Protocol.DOM.BackendNodeId, number>
 }): RoleLocatorMatches {
-  const matches: RoleLocatorMatches = new Map()
+  const matches = new Map<string, Protocol.DOM.BackendNodeId[]>()
   const add = (locator: string, backendNodeId: Protocol.DOM.BackendNodeId) => {
     const key = locatorIdentity(locator)
     const list = matches.get(key)
@@ -886,10 +886,12 @@ export function buildRoleLocatorMatches(options: {
   }
   visit(options.rootNodeId)
   const rank = (backendNodeId: Protocol.DOM.BackendNodeId) => options.queryOrder.get(backendNodeId) ?? 0
-  for (const list of matches.values()) {
+  const indexes: RoleLocatorMatches = new Map()
+  for (const [key, list] of matches) {
     list.sort((a, b) => rank(a) - rank(b))
+    indexes.set(key, new Map(list.map((backendNodeId, index) => [backendNodeId, index])))
   }
-  return matches
+  return indexes
 }
 
 export function finalizeSnapshotOutput(
@@ -917,10 +919,10 @@ export function finalizeSnapshotOutput(
     const index = locatorIndices.get(key) ?? 0
     locatorIndices.set(key, index + 1)
     // Playwright resolves role locators against the whole frame, not against the lines of this snapshot
-    const frameMatches = line.backendNodeId != null ? roleLocatorMatches?.get(key) : undefined
-    const frameIndex = frameMatches && line.backendNodeId != null ? frameMatches.indexOf(line.backendNodeId) : -1
-    if (frameMatches && frameIndex >= 0) {
-      acc.push(frameMatches.length > 1 ? `${line.baseLocator} >> nth=${frameIndex}` : line.baseLocator)
+    const frameMatches = roleLocatorMatches?.get(key)
+    const frameIndex = line.backendNodeId != null ? frameMatches?.get(line.backendNodeId) : undefined
+    if (frameMatches && frameIndex !== undefined) {
+      acc.push(frameMatches.size > 1 ? `${line.baseLocator} >> nth=${frameIndex}` : line.baseLocator)
       return acc
     }
     const locator = count > 1 ? `${line.baseLocator} >> nth=${index}` : line.baseLocator
