@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Protocol } from 'devtools-protocol'
 import {
+  alignFileInputNames,
   buildRawSnapshotTree,
   buildRoleLocatorMatches,
   buildRoleQueryOrder,
@@ -906,5 +907,43 @@ describe('wrapper names', () => {
          generic "Tooltip":
           text: "Hint text""
       `)
+  })
+})
+
+describe('file input names', () => {
+  it('uses Playwright name for file inputs Chrome names in UI language', () => {
+    const fileInput = (backendNodeId: number) => {
+      return { nodeId: backendNodeId, backendNodeId, nodeName: 'INPUT', attributes: new Map([['type', 'file']]) }
+    }
+    const domByBackendId = new Map([1, 2].map((backendNodeId) => [backendNodeId, fileInput(backendNodeId)]))
+    const axByBackendId = new Map<number, Protocol.Accessibility.AXNode>([
+      [
+        1,
+        {
+          nodeId: '1',
+          ignored: false,
+          role: roleValue('button'),
+          name: { type: 'computedString', value: 'Выберите файл', sources: [{ type: 'contents', value: nameValue('Выберите файл') }] },
+        },
+      ],
+      [
+        2,
+        {
+          nodeId: '2',
+          ignored: false,
+          role: roleValue('button'),
+          name: {
+            type: 'computedString',
+            value: 'Avatar',
+            sources: [
+              { type: 'relatedElement', value: nameValue('Avatar') },
+              { type: 'contents', superseded: true, value: nameValue('Выберите файл') },
+            ],
+          },
+        },
+      ],
+    ])
+    alignFileInputNames({ domByBackendId, axByBackendId })
+    expect([...axByBackendId.values()].map((node) => node.name?.value)).toEqual(['Choose File', 'Avatar'])
   })
 })

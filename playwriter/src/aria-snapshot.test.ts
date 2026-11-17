@@ -369,6 +369,20 @@ describe('aria-snapshot', () => {
     }
   }, 30000)
 
+  it('resolves refs to the same locator as their snapshot line', async () => {
+    const html = `<!doctype html><button>Save</button><section aria-label="Panel"><button>Save</button></section>`
+    const htmlServer = await createHtmlServer({ htmlByPath: { '/': html } })
+    try {
+      await page.goto(htmlServer.baseUrl, { waitUntil: 'domcontentloaded' })
+      const scoped = await getAriaSnapshot({ page, locator: page.getByRole('region', { name: 'Panel' }) })
+      const selectors = scoped.refs.map((entry) => scoped.getSelectorForRef(entry.ref))
+      expect(selectors).toEqual(['role=button[name="Save"i] >> nth=1'])
+      expect(await page.locator(selectors[0]!).count()).toBe(1)
+    } finally {
+      await htmlServer.close()
+    }
+  }, 30000)
+
   it('numbers role locators like Playwright when open shadow DOM comes first', async () => {
     const html = `<!doctype html><div id="host"></div><button data-where="light">Save</button>
       <script>document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<button data-where="shadow">Save</button>'</script>`

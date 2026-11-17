@@ -384,10 +384,14 @@ function getAxRole(node: Protocol.Accessibility.AXNode): string {
   return role.toLowerCase()
 }
 
+function findUsedNameSourceIndex(node: Protocol.Accessibility.AXNode): number {
+  return (node.name?.sources ?? []).findIndex((source) => source.value !== undefined && !source.superseded)
+}
+
 // Chrome names focused wrappers from their whole text, which then hides that text from the snapshot
 function getSnapshotName(node: Protocol.Accessibility.AXNode, role: string): string {
   const sources = node.name?.sources ?? []
-  const usedIndex = sources.findIndex((source) => source.value !== undefined && !source.superseded)
+  const usedIndex = findUsedNameSourceIndex(node)
   if (SKIP_WRAPPER_ROLES.has(role) && sources[usedIndex]?.type === 'contents') {
     const fallback = sources.slice(usedIndex + 1).find((source) => source.value !== undefined)
     return getAxValueString(fallback?.value).trim()
@@ -802,6 +806,22 @@ function locatorIdentity(locator: string): string {
 }
 
 const ELEMENT_NODE = 1
+
+// Chrome names unlabelled file inputs in UI language; Playwright always matches them as "Choose File"
+export function alignFileInputNames(options: {
+  domByBackendId: Map<Protocol.DOM.BackendNodeId, DomNodeInfo>
+  axByBackendId: Map<Protocol.DOM.BackendNodeId, Protocol.Accessibility.AXNode>
+}): void {
+  for (const [, domInfo] of options.domByBackendId) {
+    if (domInfo.nodeName !== 'INPUT' || domInfo.attributes.get('type')?.toLowerCase() !== 'file') {
+      continue
+    }
+    const axNode = options.axByBackendId.get(domInfo.backendNodeId)
+    if (axNode && axNode.name?.sources?.[findUsedNameSourceIndex(axNode)]?.type === 'contents') {
+      axNode.name = { type: 'computedString', value: 'Choose File' }
+    }
+  }
+}
 
 /** Element order of Playwright role engine: light DOM of a root first, then its open shadow roots. */
 export function buildRoleQueryOrder(options: {
@@ -1297,6 +1317,8 @@ export async function getAriaSnapshot({
       promotedContentEditableIds.add(domInfo.backendNodeId)
     }
 
+    alignFileInputNames({ domByBackendId, axByBackendId })
+
     const findFrameRootAxNodeId = (): Protocol.Accessibility.AXNodeId | null => {
       const rootWebArea = axNodes.find((node) => {
         return getAxRole(node) === 'rootwebarea'
@@ -1448,6 +1470,15 @@ export async function getAriaSnapshot({
       }
       refToSelector.set(ref, selector)
     }
+    const visitTree = (items: AriaSnapshotNode[]) => {
+      for (const item of items) {
+        if (item.ref && item.locator) {
+          refToSelector.set(item.ref, item.locator)
+        }
+        visitTree(item.children)
+      }
+    }
+    visitTree(result.tree)
 
     const snapshot = result.snapshot
 
