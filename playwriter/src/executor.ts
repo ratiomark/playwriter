@@ -33,6 +33,7 @@ import {
   screenshotWithAccessibilityLabels,
   getAriaSnapshot,
   resizeImageForAgent,
+  type DuplicateLocatorStyle,
   type ScreenshotResult,
   type SnapshotFormat,
 } from './aria-snapshot.js'
@@ -1622,6 +1623,7 @@ export class PlaywrightExecutor {
         interactiveOnly?: boolean
         /** Remove indentation contributed only by filtered-out accessibility wrappers (default: true). */
         normalizeIgnoredIndent?: boolean
+        duplicateLocator?: DuplicateLocatorStyle
       } = {}) => {
         const {
           page: targetPage,
@@ -1631,6 +1633,7 @@ export class PlaywrightExecutor {
           showDiffSinceLastCall = !search,
           interactiveOnly = false,
           normalizeIgnoredIndent = true,
+          duplicateLocator = 'nth',
         } = options
         const resolvedPage = resolveSandboxPage({ helper: 'snapshot', page: targetPage, locator, frame })
         const withPageUrl = (body: string) => `URL: ${resolvedPage.url()}\n${body}`
@@ -1647,6 +1650,7 @@ export class PlaywrightExecutor {
           locator,
           interactiveOnly,
           normalizeIgnoredIndent,
+          duplicateLocator,
         })
         const snapshotStr = rawSnapshot.toWellFormed?.() ?? rawSnapshot
         if ((this.pageDocumentGenerations.get(resolvedPage) || 0) !== documentGeneration) {
@@ -1665,7 +1669,7 @@ export class PlaywrightExecutor {
         const shouldCacheSnapshot = !frame
         // Cache keyed by locator selector so full-page and locator-scoped snapshots
         // don't pollute each other's diff baselines
-        const detail = `${interactiveOnly ? 'interactive' : 'all'}:ignored-indent:${normalizeIgnoredIndent ? 'normalized' : 'preserved'}`
+        const detail = `${interactiveOnly ? 'interactive' : 'all'}:ignored-indent:${normalizeIgnoredIndent ? 'normalized' : 'preserved'}:duplicates:${duplicateLocator}`
         const snapshotKey = locator ? `locator:${locator.selector()}:${detail}` : `page:${detail}`
         let pageSnapshots = this.lastSnapshots.get(resolvedPage)
         if (!pageSnapshots) {

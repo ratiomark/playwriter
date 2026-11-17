@@ -413,6 +413,45 @@ describe('aria-snapshot', () => {
     }
   }, 30000)
 
+  it('anchors repeated locators to a uniquely named ancestor when asked', async () => {
+    const html = `<!doctype html><ul>
+      <li aria-label="Row A"><button>Edit</button></li>
+      <li aria-label="Row B"><button>Edit</button></li>
+      <li aria-label="Row C"><button>Edit</button><button>Edit</button></li>
+    </ul>`
+    const htmlServer = await createHtmlServer({ htmlByPath: { '/': html } })
+    try {
+      await page.goto(htmlServer.baseUrl, { waitUntil: 'domcontentloaded' })
+      const anchored = await getAriaSnapshot({ page, duplicateLocator: 'ancestor' })
+      const locators = anchored.refs.map((entry) => anchored.getSelectorForRef(entry.ref) ?? '')
+      expect(locators).toEqual([
+        'role=listitem[name="Row A"i] >> role=button[name="Edit"i]',
+        'role=listitem[name="Row B"i] >> role=button[name="Edit"i]',
+        'role=button[name="Edit"i] >> nth=2',
+        'role=button[name="Edit"i] >> nth=3',
+      ])
+      const rows = await Promise.all(
+        locators.map(async (locator) => {
+          const target = page.locator(locator)
+          expect(await target.count()).toBe(1)
+          return target.evaluate((element) => element.closest('li')?.getAttribute('aria-label'))
+        }),
+      )
+      expect(rows).toEqual(['Row A', 'Row B', 'Row C', 'Row C'])
+
+      const bracketed = await getAriaSnapshot({ page, duplicateLocator: 'ancestor-bracketed' })
+      const editLines = bracketed.snapshot.split('\n').filter((line) => line.includes('Edit'))
+      expect(editLines.map((line) => line.trim())).toEqual([
+        'button "Edit" [role=listitem[name="Row A"i] >> role=button[name="Edit"i]]',
+        'button "Edit" [role=listitem[name="Row B"i] >> role=button[name="Edit"i]]',
+        'role=button[name="Edit"i] >> nth=2',
+        'role=button[name="Edit"i] >> nth=3',
+      ])
+    } finally {
+      await htmlServer.close()
+    }
+  }, 30000)
+
   it('numbers role locators like Playwright when open shadow DOM comes first', async () => {
     const html = `<!doctype html><div id="host"></div><button data-where="light">Save</button>
       <script>document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<button data-where="shadow">Save</button>'</script>`

@@ -433,6 +433,15 @@ export type SnapshotLine = {
 
 export type RoleLocatorMatches = Map<string, Map<Protocol.DOM.BackendNodeId, number>>
 
+export type DuplicateLocatorStyle = 'nth' | 'ancestor' | 'ancestor-bracketed'
+
+export type AncestorAnchors = Map<string, Map<Protocol.DOM.BackendNodeId, string>>
+
+export type DuplicateLocatorOptions = {
+  style: Exclude<DuplicateLocatorStyle, 'nth'>
+  anchors: AncestorAnchors
+}
+
 export type SnapshotNode = {
   role: string
   name: string
@@ -914,11 +923,84 @@ export function buildRoleLocatorMatches(options: {
   return indexes
 }
 
+export function buildAncestorAnchors(options: {
+  rootNodeId: Protocol.Accessibility.AXNodeId
+  axById: Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>
+  roleLocatorMatches: RoleLocatorMatches
+}): AncestorAnchors {
+  type Anchor = { nodeId: Protocol.Accessibility.AXNodeId; locator: string }
+  const memberships: Array<{ key: string; backendNodeId: Protocol.DOM.BackendNodeId; anchors: Anchor[] }> = []
+  const visit = (nodeId: Protocol.Accessibility.AXNodeId, anchors: Anchor[]) => {
+    const node = options.axById.get(nodeId)
+    if (!node) {
+      return
+    }
+    let childAnchors = anchors
+    const backendNodeId = node.backendDOMNodeId
+    if (!node.ignored && backendNodeId != null) {
+      const role = getAxRole(node)
+      const name = getAxValueString(node.name).trim()
+      const roleLocator = buildBaseLocator({ role, name: '', stable: null })
+      const namedLocator = name ? buildBaseLocator({ role, name, stable: null }) : undefined
+      for (const locator of namedLocator ? [roleLocator, namedLocator] : [roleLocator]) {
+        const key = locatorIdentity(locator)
+        const matches = options.roleLocatorMatches.get(key)
+        if (!matches?.has(backendNodeId)) {
+          continue
+        }
+        memberships.push({ key, backendNodeId, anchors })
+        if (locator === namedLocator && matches.size === 1) {
+          childAnchors = [{ nodeId, locator }, ...anchors]
+        }
+      }
+    }
+    for (const childId of node.childIds ?? []) {
+      visit(childId, childAnchors)
+    }
+  }
+  visit(options.rootNodeId, [])
+
+  const countKey = (anchor: Anchor, key: string) => `${anchor.nodeId}\u0000${key}`
+  const counts = new Map<string, number>()
+  for (const { key, anchors } of memberships) {
+    for (const anchor of anchors) {
+      counts.set(countKey(anchor, key), (counts.get(countKey(anchor, key)) ?? 0) + 1)
+    }
+  }
+
+  const result: AncestorAnchors = new Map()
+  for (const { key, backendNodeId, anchors } of memberships) {
+    if ((options.roleLocatorMatches.get(key)?.size ?? 0) < 2) {
+      continue
+    }
+    const anchor = anchors.find((candidate) => counts.get(countKey(candidate, key)) === 1)
+    if (!anchor) {
+      continue
+    }
+    const byElement = result.get(key) ?? new Map<Protocol.DOM.BackendNodeId, string>()
+    byElement.set(backendNodeId, anchor.locator)
+    result.set(key, byElement)
+  }
+  return result
+}
+
+function buildBracketedLocatorLineText({ line, locator }: { line: SnapshotLine; locator: string }): string {
+  const parts = [line.role ?? '']
+  if (line.name) {
+    parts.push(`"${line.name.replace(/"/g, '\\"')}"`)
+  }
+  if (line.state) {
+    parts.push(line.state)
+  }
+  return `${' '.repeat(line.indent ?? 0)}${parts.join(' ')} [${locator}]`
+}
+
 export function finalizeSnapshotOutput(
   lines: SnapshotLine[],
   nodes: SnapshotNode[],
   shortRefMap: Map<string, string>,
   roleLocatorMatches?: RoleLocatorMatches,
+  duplicateLocator?: DuplicateLocatorOptions,
 ): { snapshot: string; tree: AriaSnapshotNode[] } {
   const locatorCounts = lines.reduce<Map<string, number>>((acc, line) => {
     if (!line.baseLocator) {
@@ -930,6 +1012,7 @@ export function finalizeSnapshotOutput(
   }, new Map<string, number>())
 
   const locatorIndices = new Map<string, number>()
+  const anchoredLocators = new Set<number>()
   const locatorSequence = lines.reduce<string[]>((acc, line) => {
     if (!line.baseLocator) {
       return acc
@@ -942,6 +1025,12 @@ export function finalizeSnapshotOutput(
     const frameMatches = roleLocatorMatches?.get(key)
     const frameIndex = line.backendNodeId != null ? frameMatches?.get(line.backendNodeId) : undefined
     if (frameMatches && frameIndex !== undefined) {
+      const anchor = line.backendNodeId != null ? duplicateLocator?.anchors.get(key)?.get(line.backendNodeId) : undefined
+      if (frameMatches.size > 1 && anchor) {
+        anchoredLocators.add(acc.length)
+        acc.push(`${anchor} >> ${line.baseLocator}`)
+        return acc
+      }
       acc.push(frameMatches.size > 1 ? `${line.baseLocator} >> nth=${frameIndex}` : line.baseLocator)
       return acc
     }
@@ -956,8 +1045,9 @@ export function finalizeSnapshotOutput(
       let text = line.text
       if (line.baseLocator) {
         const locator = locatorSequence[lineLocatorIndex]
+        const bracketed = duplicateLocator?.style === 'ancestor-bracketed' && anchoredLocators.has(lineLocatorIndex)
         lineLocatorIndex += 1
-        text = buildLocatorLineText({ line, locator })
+        text = bracketed ? buildBracketedLocatorLineText({ line, locator }) : buildLocatorLineText({ line, locator })
       }
       if (line.hasChildren) {
         text += ':'
@@ -1173,6 +1263,7 @@ export async function getAriaSnapshot({
   refFilter,
   interactiveOnly = false,
   normalizeIgnoredIndent = false,
+  duplicateLocator = 'nth',
   cdp,
 }: {
   page: Page
@@ -1182,6 +1273,7 @@ export async function getAriaSnapshot({
   interactiveOnly?: boolean
   /** Remove indentation contributed only by filtered-out accessibility wrappers. */
   normalizeIgnoredIndent?: boolean
+  duplicateLocator?: DuplicateLocatorStyle
   cdp?: ICDPSession
 }): Promise<AriaSnapshotResult> {
   const session = cdp || (await getCDPSessionForPage({ page }))
@@ -1446,7 +1538,20 @@ export async function getAriaSnapshot({
     const snapshotLines = buildSnapshotLines(outputNodes)
 
     const shortRefMap = buildShortRefMap({ refs })
-    const finalized = finalizeSnapshotOutput(snapshotLines, outputNodes, shortRefMap, roleLocatorMatches)
+    const duplicateLocatorOptions: DuplicateLocatorOptions | undefined =
+      duplicateLocator !== 'nth' && roleLocatorMatches && frameRootAxNodeId
+        ? {
+            style: duplicateLocator,
+            anchors: buildAncestorAnchors({ rootNodeId: frameRootAxNodeId, axById, roleLocatorMatches }),
+          }
+        : undefined
+    const finalized = finalizeSnapshotOutput(
+      snapshotLines,
+      outputNodes,
+      shortRefMap,
+      roleLocatorMatches,
+      duplicateLocatorOptions,
+    )
     const refsWithShortRef: Array<AriaRef & { selector?: string }> = refs.map((entry) => {
       return {
         ...entry,
