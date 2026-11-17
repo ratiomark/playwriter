@@ -49,7 +49,7 @@ describe('aria-snapshot tree filters', () => {
       buildSnapshotLines(normalized)
         .map((line) => line.text)
         .join('\n'),
-    ).toBe('form "Account"\n  textbox "Email"\nbutton "Save"')
+    ).toBe('form "Account"\n textbox "Email"\nbutton "Save"')
     expect(normalized).toEqual([
       {
         role: 'form',
@@ -460,16 +460,16 @@ describe('aria-snapshot tree filters', () => {
     const result = finalizeSnapshotOutput(lines, filtered.nodes, new Map())
     expect(result.snapshot).toMatchInlineSnapshot(`
       "form "Account":
-        textbox "Email" [data-testid="email-input"]
-        button "Save" [id="save-primary"]
-        button "Save" [id="save-secondary"]"
+       textbox "Email" [data-testid="email-input"]
+       button "Save" [id="save-primary"]
+       button "Save" [id="save-secondary"]"
     `)
     expect(result).toMatchInlineSnapshot(`
       {
         "snapshot": "form "Account":
-        textbox "Email" [data-testid="email-input"]
-        button "Save" [id="save-primary"]
-        button "Save" [id="save-secondary"]",
+       textbox "Email" [data-testid="email-input"]
+       button "Save" [id="save-primary"]
+       button "Save" [id="save-secondary"]",
         "tree": [
           {
             "backendNodeId": undefined,
@@ -746,12 +746,12 @@ describe('aria-snapshot tree filters', () => {
     const result = finalizeSnapshotOutput(buildSnapshotLines(filtered.nodes), filtered.nodes, new Map())
     expect(result.snapshot).toMatchInlineSnapshot(`
       "main:
-        heading "Settings" [level=2]
-        checkbox "Alerts" [checked] [disabled] [id="alerts"]
-        [checked=mixed] role=checkbox[name="All"i]
-        [expanded] role=button[name="Menu"i]
-        [selected] role=tab[name="Profile"i]
-        listitem "Collapsed""
+       heading "Settings" [level=2]
+       checkbox "Alerts" [checked] [disabled] [id="alerts"]
+       [checked=mixed] role=checkbox[name="All"i]
+       [expanded] role=button[name="Menu"i]
+       [selected] role=tab[name="Profile"i]
+       listitem "Collapsed""
     `)
   })
 })
@@ -782,8 +782,8 @@ describe('role locator nth', () => {
   it('counts unnamed role locators against every element of that role in the frame', () => {
     expect(render('5')).toMatchInlineSnapshot(`
       "region "Panel":
-        role=button[name="Save"i] >> nth=1
-        role=button >> nth=3"
+       role=button[name="Save"i] >> nth=1
+       role=button >> nth=3"
     `)
   })
 })

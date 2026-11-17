@@ -448,7 +448,7 @@ function buildSnapshotLine({
   indent: number
   hasChildren: boolean
 }): SnapshotLine {
-  const prefix = '  '.repeat(indent)
+  const prefix = ' '.repeat(indent)
   let text = `${prefix}${role}`
   if (name) {
     const escapedName = name.replace(/"/g, '\\"')
@@ -461,7 +461,7 @@ function buildSnapshotLine({
 }
 
 function buildTextLine(text: string, indent: number): SnapshotLine {
-  const prefix = '  '.repeat(indent)
+  const prefix = ' '.repeat(indent)
   const escaped = text.replace(/"/g, '\\"')
   return { text: `${prefix}text: "${escaped}"` }
 }
@@ -763,7 +763,7 @@ export function filterFullSnapshotTree(options: {
 }
 
 function buildLocatorLineText({ line, locator }: { line: SnapshotLine; locator: string }): string {
-  const prefix = '  '.repeat(line.indent ?? 0)
+  const prefix = ' '.repeat(line.indent ?? 0)
   const role = line.role ?? ''
   const name = line.name ?? ''
   const escapedName = name.replace(/"/g, '\\"')
