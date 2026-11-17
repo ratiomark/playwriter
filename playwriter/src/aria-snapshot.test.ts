@@ -350,6 +350,25 @@ describe('aria-snapshot', () => {
     }
   }, 30000)
 
+  it('numbers role locators like Playwright when open shadow DOM comes first', async () => {
+    const html = `<!doctype html><div id="host"></div><button data-where="light">Save</button>
+      <script>document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<button data-where="shadow">Save</button>'</script>`
+    const htmlServer = await createHtmlServer({ htmlByPath: { '/': html } })
+    try {
+      await page.goto(htmlServer.baseUrl, { waitUntil: 'domcontentloaded' })
+      const { snapshot } = await getAriaSnapshot({ page })
+      const locators = snapshot
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith('role=button'))
+      expect(locators).toEqual(['role=button[name="Save"i] >> nth=1', 'role=button[name="Save"i] >> nth=0'])
+      const targets = await Promise.all(locators.map((locator) => page.locator(locator).getAttribute('data-where')))
+      expect(targets).toEqual(['shadow', 'light'])
+    } finally {
+      await htmlServer.close()
+    }
+  }, 30000)
+
   it('scopes snapshot to cross-origin iframe locator', async () => {
     const iframeServer = await createHtmlServer({
       htmlByPath: {

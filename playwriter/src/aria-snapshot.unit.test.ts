@@ -3,6 +3,7 @@ import type { Protocol } from 'devtools-protocol'
 import {
   buildRawSnapshotTree,
   buildRoleLocatorMatches,
+  buildRoleQueryOrder,
   buildSnapshotLines,
   filterFullSnapshotTree,
   filterInteractiveSnapshotTree,
@@ -758,7 +759,7 @@ describe('aria-snapshot tree filters', () => {
 
 describe('role locator nth', () => {
   const axNodes: Protocol.Accessibility.AXNode[] = [
-    { nodeId: '1', ignored: false, role: roleValue('RootWebArea'), childIds: ['2', '3', '4', '5', '6', '7'] },
+    { nodeId: '1', ignored: false, role: roleValue('RootWebArea'), childIds: ['2', '3', '4', '5'] },
     { nodeId: '2', ignored: false, role: roleValue('button'), name: nameValue('Home'), backendDOMNodeId: 2 as Protocol.DOM.BackendNodeId },
     { nodeId: '3', ignored: true, role: roleValue('button'), name: nameValue('Hidden'), backendDOMNodeId: 3 as Protocol.DOM.BackendNodeId },
     { nodeId: '4', ignored: false, role: roleValue('button'), name: nameValue('save'), backendDOMNodeId: 4 as Protocol.DOM.BackendNodeId },
@@ -775,7 +776,8 @@ describe('role locator nth', () => {
       domByBackendId: new Map(),
       createRefForNode: () => null,
     })
-    const roleLocatorMatches = buildRoleLocatorMatches({ rootNodeId: '1', axById, excludedBackendIds: new Set() })
+    const queryOrder = new Map([2, 3, 4, 5, 6, 7].map((backendNodeId, index) => [backendNodeId, index]))
+    const roleLocatorMatches = buildRoleLocatorMatches({ rootNodeId: '1', axById, excludedBackendIds: new Set(), queryOrder })
     return finalizeSnapshotOutput(buildSnapshotLines(filtered.nodes), filtered.nodes, new Map(), roleLocatorMatches).snapshot
   }
 
@@ -785,6 +787,61 @@ describe('role locator nth', () => {
        role=button[name="Save"i] >> nth=1
        role=button >> nth=3"
     `)
+  })
+})
+
+describe('role query order', () => {
+  const domNode = (node: Partial<Protocol.DOM.Node> & Pick<Protocol.DOM.Node, 'nodeId' | 'backendNodeId'>): Protocol.DOM.Node => {
+    return { nodeType: 1, nodeName: 'DIV', localName: 'div', nodeValue: '', ...node }
+  }
+  const shadowRoot = (nodeId: number, backendNodeId: number, shadowRootType: Protocol.DOM.ShadowRootType) => {
+    return domNode({ nodeId, backendNodeId, nodeType: 11, nodeName: '#document-fragment', localName: '', shadowRootType })
+  }
+  const domNodes: Protocol.DOM.Node[] = [
+    domNode({ nodeId: 50, parentId: 41, backendNodeId: 11, nodeName: 'BUTTON' }),
+    domNode({ nodeId: 40, parentId: 30, backendNodeId: 10, shadowRoots: [shadowRoot(41, 13, 'open')] }),
+    domNode({ nodeId: 51, parentId: 43, backendNodeId: 15, nodeName: 'BUTTON' }),
+    domNode({ nodeId: 44, parentId: 30, backendNodeId: 14, shadowRoots: [shadowRoot(43, 16, 'closed')] }),
+    domNode({ nodeId: 60, parentId: 61, backendNodeId: 17, nodeName: 'BUTTON' }),
+    domNode({ nodeId: 61, parentId: 45, backendNodeId: 18, nodeType: 9, nodeName: '#document' }),
+    domNode({ nodeId: 45, parentId: 30, backendNodeId: 19, nodeName: 'IFRAME' }),
+    domNode({ nodeId: 42, parentId: 30, backendNodeId: 12, nodeName: 'BUTTON' }),
+    domNode({ nodeId: 30, parentId: 1, backendNodeId: 20, nodeName: 'BODY' }),
+    domNode({ nodeId: 1, backendNodeId: 100, nodeType: 9, nodeName: '#document' }),
+  ]
+
+  it('visits light DOM before open shadow roots and skips closed roots and child frames', () => {
+    const order = buildRoleQueryOrder({ domNodes, documentBackendId: 100 })
+    expect([...order.keys()]).toEqual([20, 10, 14, 19, 12, 11])
+  })
+
+  it('numbers role locators in Playwright order when shadow content comes first in AX tree', () => {
+    const axNodes: Protocol.Accessibility.AXNode[] = [
+      { nodeId: '1', ignored: false, role: roleValue('main'), backendDOMNodeId: 100, childIds: ['2', '4'] },
+      { nodeId: '2', ignored: false, role: roleValue('generic'), backendDOMNodeId: 10, childIds: ['3'] },
+      { nodeId: '3', ignored: false, role: roleValue('button'), name: nameValue('Save'), backendDOMNodeId: 11 },
+      { nodeId: '4', ignored: false, role: roleValue('button'), name: nameValue('Save'), backendDOMNodeId: 12 },
+    ]
+    const axById = new Map(axNodes.map((node) => [node.nodeId, node]))
+    const rawTree = buildRawSnapshotTree({ nodeId: '1', axById, isNodeInScope: () => true })!
+    const filtered = filterFullSnapshotTree({
+      node: rawTree,
+      ancestorNames: [],
+      domByBackendId: new Map(),
+      createRefForNode: () => null,
+    })
+    const roleLocatorMatches = buildRoleLocatorMatches({
+      rootNodeId: '1',
+      axById,
+      excludedBackendIds: new Set(),
+      queryOrder: buildRoleQueryOrder({ domNodes, documentBackendId: 100 }),
+    })
+    expect(finalizeSnapshotOutput(buildSnapshotLines(filtered.nodes), filtered.nodes, new Map(), roleLocatorMatches).snapshot)
+      .toMatchInlineSnapshot(`
+        "main:
+         role=button[name="Save"i] >> nth=1
+         role=button[name="Save"i] >> nth=0"
+      `)
   })
 })
 

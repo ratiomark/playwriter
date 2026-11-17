@@ -803,10 +803,59 @@ function locatorIdentity(locator: string): string {
   return locator.startsWith('role=') ? locator.toUpperCase() : locator
 }
 
+const ELEMENT_NODE = 1
+
+/** Element order of Playwright role engine: light DOM of a root first, then its open shadow roots. */
+export function buildRoleQueryOrder(options: {
+  domNodes: Protocol.DOM.Node[]
+  documentBackendId: Protocol.DOM.BackendNodeId
+}): Map<Protocol.DOM.BackendNodeId, number> {
+  const childrenByParent = new Map<Protocol.DOM.NodeId, Protocol.DOM.Node[]>()
+  for (const node of options.domNodes) {
+    if (node.parentId === undefined) {
+      continue
+    }
+    const siblings = childrenByParent.get(node.parentId)
+    if (siblings) {
+      siblings.push(node)
+    } else {
+      childrenByParent.set(node.parentId, [node])
+    }
+  }
+
+  const order = new Map<Protocol.DOM.BackendNodeId, number>()
+  const queryRoot = (rootNodeId: Protocol.DOM.NodeId) => {
+    const shadowRootIds: Protocol.DOM.NodeId[] = []
+    const visit = (parentId: Protocol.DOM.NodeId) => {
+      for (const child of childrenByParent.get(parentId) ?? []) {
+        if (child.nodeType !== ELEMENT_NODE || child.pseudoType) {
+          continue
+        }
+        order.set(child.backendNodeId, order.size)
+        for (const shadowRoot of child.shadowRoots ?? []) {
+          if (shadowRoot.shadowRootType === 'open') {
+            shadowRootIds.push(shadowRoot.nodeId)
+          }
+        }
+        visit(child.nodeId)
+      }
+    }
+    visit(rootNodeId)
+    shadowRootIds.forEach(queryRoot)
+  }
+
+  const documentNode = options.domNodes.find((node) => node.backendNodeId === options.documentBackendId)
+  if (documentNode) {
+    queryRoot(documentNode.nodeId)
+  }
+  return order
+}
+
 export function buildRoleLocatorMatches(options: {
   rootNodeId: Protocol.Accessibility.AXNodeId
   axById: Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>
   excludedBackendIds: Set<Protocol.DOM.BackendNodeId>
+  queryOrder: Map<Protocol.DOM.BackendNodeId, number>
 }): RoleLocatorMatches {
   const matches: RoleLocatorMatches = new Map()
   const add = (locator: string, backendNodeId: Protocol.DOM.BackendNodeId) => {
@@ -824,7 +873,8 @@ export function buildRoleLocatorMatches(options: {
       return
     }
     const backendNodeId = node.backendDOMNodeId
-    if (!node.ignored && backendNodeId != null && !options.excludedBackendIds.has(backendNodeId)) {
+    const reachable = backendNodeId != null && options.queryOrder.has(backendNodeId)
+    if (!node.ignored && reachable && !options.excludedBackendIds.has(backendNodeId)) {
       const role = getAxRole(node)
       const name = getAxValueString(node.name).trim()
       add(buildBaseLocator({ role, name: '', stable: null }), backendNodeId)
@@ -837,6 +887,10 @@ export function buildRoleLocatorMatches(options: {
     }
   }
   visit(options.rootNodeId)
+  const rank = (backendNodeId: Protocol.DOM.BackendNodeId) => options.queryOrder.get(backendNodeId) ?? 0
+  for (const list of matches.values()) {
+    list.sort((a, b) => rank(a) - rank(b))
+  }
   return matches
 }
 
@@ -1265,13 +1319,16 @@ export async function getAriaSnapshot({
     const frameRootAxNodeId = findFrameRootAxNodeId()
     const scopedRootAxNodeId = scopeRootBackendId ? axByBackendId.get(scopeRootBackendId)?.nodeId : undefined
     const rootAxNodeId = scopedRootAxNodeId ?? frameRootAxNodeId
-    const roleLocatorMatches = frameRootAxNodeId
-      ? buildRoleLocatorMatches({
-          rootNodeId: frameRootAxNodeId,
-          axById,
-          excludedBackendIds: new Set([...playwriterUiBackendIds, ...promotedContentEditableIds]),
-        })
-      : undefined
+    const frameDocumentBackendId = frameRootAxNodeId ? axById.get(frameRootAxNodeId)?.backendDOMNodeId : undefined
+    const roleLocatorMatches =
+      frameRootAxNodeId && frameDocumentBackendId != null
+        ? buildRoleLocatorMatches({
+            rootNodeId: frameRootAxNodeId,
+            axById,
+            excludedBackendIds: new Set([...playwriterUiBackendIds, ...promotedContentEditableIds]),
+            queryOrder: buildRoleQueryOrder({ domNodes, documentBackendId: frameDocumentBackendId }),
+          })
+        : undefined
 
     const refCounts = new Map<string, number>()
     let fallbackCounter = 0
