@@ -384,6 +384,19 @@ function getAxRole(node: Protocol.Accessibility.AXNode): string {
   return role.toLowerCase()
 }
 
+function isNameFromContents(node: Protocol.Accessibility.AXNode): boolean {
+  const used = node.name?.sources?.find((source) => source.value !== undefined && !source.superseded)
+  return used?.type === 'contents'
+}
+
+// Chrome names focused wrappers from their whole text, which then hides that text from the snapshot
+function getSnapshotName(node: Protocol.Accessibility.AXNode, role: string): string {
+  if (SKIP_WRAPPER_ROLES.has(role) && isNameFromContents(node)) {
+    return ''
+  }
+  return getAxValueString(node.name).trim()
+}
+
 // Chrome reports an implicit level for every listitem, so only show it where it means something
 const LEVEL_ROLES = new Set(['heading', 'treeitem'])
 
@@ -512,7 +525,7 @@ export function buildRawSnapshotTree(options: {
   }
 
   const role = getAxRole(node)
-  const name = getAxValueString(node.name).trim()
+  const name = getSnapshotName(node, role)
   const children = (node.childIds ?? [])
     .map((childId) => {
       return buildRawSnapshotTree({

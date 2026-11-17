@@ -787,3 +787,54 @@ describe('role locator nth', () => {
     `)
   })
 })
+
+describe('wrapper names', () => {
+  const computedName = (value: string, sources: Protocol.Accessibility.AXValueSource[]): Protocol.Accessibility.AXValue => {
+    return { type: 'computedString', value, sources }
+  }
+  const axNodes: Protocol.Accessibility.AXNode[] = [
+    { nodeId: '1', ignored: false, role: roleValue('main'), childIds: ['2', '5'] },
+    {
+      nodeId: '2',
+      ignored: false,
+      role: roleValue('generic'),
+      name: computedName('Flow alpha Edit flow', [
+        { type: 'attribute', attribute: 'aria-label' },
+        { type: 'contents', value: nameValue('Flow alpha Edit flow') },
+      ]),
+      childIds: ['3', '4'],
+    },
+    { nodeId: '3', ignored: false, role: roleValue('StaticText'), name: nameValue('Flow alpha') },
+    { nodeId: '4', ignored: false, role: roleValue('button'), name: nameValue('Edit flow') },
+    {
+      nodeId: '5',
+      ignored: false,
+      role: roleValue('generic'),
+      name: computedName('Labelled panel', [
+        { type: 'attribute', attribute: 'aria-label', value: nameValue('Labelled panel') },
+        { type: 'contents', superseded: true, value: nameValue('Panel text') },
+      ]),
+      childIds: ['6'],
+    },
+    { nodeId: '6', ignored: false, role: roleValue('StaticText'), name: nameValue('Panel text') },
+  ]
+  const axById = new Map(axNodes.map((node) => [node.nodeId, node]))
+
+  it('ignores names wrappers get from their contents and keeps authored ones', () => {
+    const rawTree = buildRawSnapshotTree({ nodeId: '1', axById, isNodeInScope: () => true })!
+    const filtered = filterFullSnapshotTree({
+      node: rawTree,
+      ancestorNames: [],
+      domByBackendId: new Map(),
+      createRefForNode: () => null,
+    })
+    expect(finalizeSnapshotOutput(buildSnapshotLines(filtered.nodes), filtered.nodes, new Map()).snapshot)
+      .toMatchInlineSnapshot(`
+        "main:
+         text: "Flow alpha"
+         role=button[name="Edit flow"i]
+         generic "Labelled panel":
+          text: "Panel text""
+      `)
+  })
+})
