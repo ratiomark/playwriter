@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import http from 'node:http'
 import net from 'node:net'
-import { Page } from '@xmorse/playwright-core'
+import { Page, selectors } from '@xmorse/playwright-core'
 import fs from 'node:fs'
 import path from 'node:path'
 import dedent from 'string-dedent'
 import { getAriaSnapshot } from './aria-snapshot.js'
+import { registerAgentSelectorEngine } from './agent-locators.js'
 import { getCdpUrl } from './utils.js'
 import { getCDPSessionForPage } from './cdp-session.js'
 import { setupTestContext, cleanupTestContext, getExtensionServiceWorker, type TestContext } from './test-utils.js'
@@ -477,6 +478,82 @@ describe('aria-snapshot', () => {
         const expected = await page.locator(byNth.getSelectorForRef(byNth.refs[index]!.ref) ?? '').elementHandle()
         expect(await target.evaluate((element, other) => element === other, expected)).toBe(true)
       }
+    } finally {
+      await htmlServer.close()
+    }
+  }, 30000)
+
+  it('locates data-agent elements by role and name when unique, else by their narrowing attributes', async () => {
+    await registerAgentSelectorEngine(selectors)
+    const menu = (nodeId: string, sessionId: string) =>
+      `<button data-agent-scope="canvas" data-agent-role="node-actions-button" data-agent-node-id="${nodeId}" data-agent-session-id="${sessionId}" id="generated-${nodeId}-${sessionId}">Menu</button>`
+    const html = `<!doctype html>
+      <div data-agent-role="tab-content" aria-hidden="true" inert>${menu('n1', 's1')}</div>
+      <div data-agent-role="tab-content">
+        ${menu('n1', 's2')}${menu('n2', 's2')}
+        <div style="visibility: hidden">${menu('n1', 's3')}</div>
+        <input aria-label="Field" data-agent-role="field-input" data-agent-field-id="f1" data-agent-field="key">
+        <input aria-label="Field" data-agent-role="field-input" data-agent-field-id="f1" data-agent-field="value">
+        <button data-agent-role="twin">Twin</button><button data-agent-role="twin">Twin</button>
+        <button data-agent-role="spaced" data-agent-item-id="has space">Item</button>
+        <button data-agent-role="spaced" data-agent-item-id="plain">Item</button>
+        <button data-agent-role="solo" id="generated-solo">Solo</button>
+      </div>`
+    const htmlServer = await createHtmlServer({ htmlByPath: { '/': html } })
+    try {
+      await page.goto(htmlServer.baseUrl, { waitUntil: 'domcontentloaded' })
+      const result = await getAriaSnapshot({ page })
+      const locators = result.refs.map((entry) => result.getSelectorForRef(entry.ref) ?? '')
+      expect(locators).toEqual([
+        'agent=node-actions-button node-id=n1 session-id=s2',
+        'agent=node-actions-button node-id=n2',
+        'agent=field-input field=key',
+        'agent=field-input field=value',
+        'agent=twin >> nth=0',
+        'agent=twin >> nth=1',
+        'role=button[name="Item"i] >> nth=0',
+        'agent=spaced item-id=plain',
+        'role=button[name="Solo"i]',
+      ])
+      for (const locator of locators) {
+        expect(await page.locator(locator).count()).toBe(1)
+      }
+      expect(await page.locator(locators[0]!).getAttribute('id')).toBe('generated-n1-s2')
+      expect(result.snapshot).toContain('button "Menu" agent=node-actions-button node-id=n1 session-id=s2')
+    } finally {
+      await htmlServer.close()
+    }
+  }, 30000)
+
+  it('keeps data-agent locators exact when names, values, ids or attribute order could mislead', async () => {
+    await registerAgentSelectorEngine(selectors)
+    const html = `<!doctype html>
+      <div contenteditable="true" aria-label="Title" data-agent-role="editor"></div>
+      <input aria-label="Title">
+      <button data-agent-role="a>>nth=0">Arrow</button><button data-agent-role="a>>nth=0">Arrow</button>
+      <button id="save" data-agent-role="save-a">Go</button><button data-agent-role="save-b">Go</button>
+      <button data-agent-role="x" data-agent-b-id="B" data-agent-a-id="A">Same</button>
+      <button data-agent-role="x" data-agent-a-id="A2" data-agent-b-id="B2">Same</button>`
+    const htmlServer = await createHtmlServer({ htmlByPath: { '/': html } })
+    try {
+      await page.goto(htmlServer.baseUrl, { waitUntil: 'domcontentloaded' })
+      const result = await getAriaSnapshot({ page })
+      const locators = result.refs.map((entry) => result.getSelectorForRef(entry.ref) ?? '')
+      expect(locators).toEqual([
+        'agent=editor',
+        'role=textbox[name="Title"i]',
+        'role=button[name="Arrow"i] >> nth=0',
+        'role=button[name="Arrow"i] >> nth=1',
+        'agent=save-a',
+        'agent=save-b',
+        'agent=x a-id=A',
+        'agent=x a-id=A2',
+      ])
+      for (const locator of locators) {
+        expect(await page.locator(locator).count()).toBe(1)
+      }
+      expect(await page.locator(locators[0]!).getAttribute('contenteditable')).toBe('true')
+      expect((await result.getRefForLocator(page.locator('#save')))?.ref).toBe('save')
     } finally {
       await htmlServer.close()
     }

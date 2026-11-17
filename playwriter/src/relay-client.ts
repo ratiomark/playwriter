@@ -12,6 +12,7 @@ import { getListeningPidsForPort, killPid } from './kill-port.js'
 import { VERSION, getCdpUrl, sleep, LOG_FILE_PATH } from './utils.js'
 import { isRemoteExtensionKey } from './relay-state.js'
 import { getChromium, type Browser } from './playwright-import.js'
+import { addAgentSelectorEngine } from './agent-locators.js'
 import type { TabGroupColor } from './protocol.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -652,6 +653,9 @@ export async function connectViaExtension({
       await deleteRelaySession({ port, sessionId: session.id }).catch(() => undefined)
       throw cause
     })
+  for (const context of browser.contexts()) {
+    await addAgentSelectorEngine(context)
+  }
 
   // Memoized so close() followed by dispose (or double close) runs cleanup once.
   // browser.contexts() lists every Playwriter tab, including other sessions' tabs, so the

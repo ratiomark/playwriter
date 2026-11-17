@@ -20,6 +20,8 @@ export type {
 
 export type { BrowserType } from '@xmorse/playwright-core'
 
+import { registerAgentSelectorEngine } from './agent-locators.js'
+
 type Chromium = typeof import('@xmorse/playwright-core').chromium
 type EvaluateFunction<R> = string | ((...args: any[]) => R | Promise<R>)
 type EvaluateArg = object | string | number | boolean | null
@@ -36,11 +38,15 @@ export function getChromium({ patchright = false }: { patchright?: boolean } = {
     // Both packages ship the same types.d.ts (Playwright 1.64.1), but TS cannot relate the generic
     // conditional types (Unboxed<Arg>) of two separate declaration copies, so the cast stays.
     chromium = patchright
-      ? import('@playwriter/patchright-core').then((mod) => {
+      ? import('@playwriter/patchright-core').then(async (mod) => {
+          await registerAgentSelectorEngine(mod.selectors)
           patchrightChromium = mod.chromium as unknown as Chromium
           return patchrightChromium
         })
-      : import('@xmorse/playwright-core').then((mod) => mod.chromium)
+      : import('@xmorse/playwright-core').then(async (mod) => {
+          await registerAgentSelectorEngine(mod.selectors)
+          return mod.chromium
+        })
     chromiumByDriver.set(driver, chromium)
   }
   return chromium

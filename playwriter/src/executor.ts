@@ -46,6 +46,7 @@ import { createDemoVideo } from './ffmpeg.js'
 import { type GhostCursorClientOptions } from './ghost-cursor.js'
 import { GhostCursorController } from './ghost-cursor-controller.js'
 import { createCloudScope } from './cloud-scope.js'
+import { addAgentSelectorEngine } from './agent-locators.js'
 import { challengeWarning, detectChallenge, MAX_CHALLENGE_WAIT_MS, PROBE_TIMEOUT_MS } from './challenge-detection.js'
 import type { CloudAuth } from './cloud-client.js'
 import {
@@ -794,6 +795,13 @@ export class PlaywrightExecutor {
     return sandboxedRequire
   }
 
+  private async registerAgentEngine(context: BrowserContext): Promise<void> {
+    const err = await addAgentSelectorEngine(context)
+    if (err) {
+      this.logger.error('Failed to register agent= selector engine:', err)
+    }
+  }
+
   private async setDeviceScaleFactorForMacOS(context: BrowserContext): Promise<void> {
     if (os.platform() !== 'darwin') {
       return
@@ -1297,6 +1305,7 @@ export class PlaywrightExecutor {
       context.pages().forEach((p) => this.setupPageListeners(p))
 
       await this.setDeviceScaleFactorForMacOS(context)
+      await this.registerAgentEngine(context)
 
       // Block images, video, and fonts for cloud sessions with proxy enabled
       // to reduce residential proxy bandwidth costs. Uses Network.setBlockedURLs
@@ -1337,6 +1346,7 @@ export class PlaywrightExecutor {
     context.pages().forEach((p) => this.setupPageListeners(p))
 
     await this.setDeviceScaleFactorForMacOS(context)
+    await this.registerAgentEngine(context)
 
     return { browser, context }
   }
