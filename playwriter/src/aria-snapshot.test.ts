@@ -124,7 +124,7 @@ describe('aria-snapshot', () => {
       expect(snapshot).toMatch(/(?:\[id="|\[data-[\w-]+="|role=)/)
       const wrapperLines = snapshot.split('\n').filter((line) => {
         const trimmed = line.trim()
-        return /^-\s+(generic|group|none|presentation)\s*:?$/.test(trimmed)
+        return /^(generic|group|none|presentation)\s*:?$/.test(trimmed)
       })
       expect(wrapperLines).toEqual([])
       fs.writeFileSync(path.join(SNAPSHOTS_DIR, `${site.name}-raw.txt`), snapshot)
@@ -134,7 +134,7 @@ describe('aria-snapshot', () => {
         page,
         interactiveOnly: true,
       })
-      expect(interactiveSnapshot).not.toMatch(/^-\s+heading\b/m)
+      expect(interactiveSnapshot).not.toMatch(/^\s*heading\b/m)
       // Check for locator format: attribute selector or role selector
       expect(interactiveSnapshot).toMatch(/(?:\[id="|\[data-[\w-]+="|role=)/)
       fs.writeFileSync(path.join(SNAPSHOTS_DIR, `${site.name}-interactive.txt`), interactiveSnapshot)
