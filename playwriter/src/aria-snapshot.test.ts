@@ -343,8 +343,8 @@ describe('aria-snapshot', () => {
         getAriaSnapshot({ page }),
         getAriaSnapshot({ page, interactiveOnly: true }),
       ])
-      expect(full.snapshot).toMatchInlineSnapshot(`"  - role=button[name="Save"i]"`)
-      expect(interactive.snapshot).toMatchInlineSnapshot(`"  - role=button[name="Save"i]"`)
+      expect(full.snapshot).toMatchInlineSnapshot(`" role=button[name="Save"i]"`)
+      expect(interactive.snapshot).toMatchInlineSnapshot(`" role=button[name="Save"i]"`)
     } finally {
       await htmlServer.close()
     }
