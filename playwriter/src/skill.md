@@ -749,12 +749,11 @@ Example output:
 
 ```md
 URL: https://example.com/
-
-- banner:
-  - link "Home" [id="nav-home"]
-  - navigation:
-    - link "Docs" [data-testid="docs-link"]
-    - link "Blog" role=link[name="Blog"]
+banner:
+ link "Home" [id="nav-home"]
+ navigation:
+  link "Docs" [data-testid="docs-link"]
+  role=link[name="Blog"i]
 ```
 
 Each interactive line ends with a Playwright locator you can pass to `state.page.locator()`.
