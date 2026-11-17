@@ -384,15 +384,13 @@ function getAxRole(node: Protocol.Accessibility.AXNode): string {
   return role.toLowerCase()
 }
 
-function isNameFromContents(node: Protocol.Accessibility.AXNode): boolean {
-  const used = node.name?.sources?.find((source) => source.value !== undefined && !source.superseded)
-  return used?.type === 'contents'
-}
-
 // Chrome names focused wrappers from their whole text, which then hides that text from the snapshot
 function getSnapshotName(node: Protocol.Accessibility.AXNode, role: string): string {
-  if (SKIP_WRAPPER_ROLES.has(role) && isNameFromContents(node)) {
-    return ''
+  const sources = node.name?.sources ?? []
+  const usedIndex = sources.findIndex((source) => source.value !== undefined && !source.superseded)
+  if (SKIP_WRAPPER_ROLES.has(role) && sources[usedIndex]?.type === 'contents') {
+    const fallback = sources.slice(usedIndex + 1).find((source) => source.value !== undefined)
+    return getAxValueString(fallback?.value).trim()
   }
   return getAxValueString(node.name).trim()
 }

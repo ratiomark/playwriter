@@ -850,7 +850,7 @@ describe('wrapper names', () => {
     return { type: 'computedString', value, sources }
   }
   const axNodes: Protocol.Accessibility.AXNode[] = [
-    { nodeId: '1', ignored: false, role: roleValue('main'), childIds: ['2', '5'] },
+    { nodeId: '1', ignored: false, role: roleValue('main'), childIds: ['2', '5', '7'] },
     {
       nodeId: '2',
       ignored: false,
@@ -874,6 +874,17 @@ describe('wrapper names', () => {
       childIds: ['6'],
     },
     { nodeId: '6', ignored: false, role: roleValue('StaticText'), name: nameValue('Panel text') },
+    {
+      nodeId: '7',
+      ignored: false,
+      role: roleValue('generic'),
+      name: computedName('Hint text', [
+        { type: 'contents', value: nameValue('Hint text') },
+        { type: 'attribute', attribute: 'title', superseded: true, value: nameValue('Tooltip') },
+      ]),
+      childIds: ['8'],
+    },
+    { nodeId: '8', ignored: false, role: roleValue('StaticText'), name: nameValue('Hint text') },
   ]
   const axById = new Map(axNodes.map((node) => [node.nodeId, node]))
 
@@ -891,7 +902,9 @@ describe('wrapper names', () => {
          text: "Flow alpha"
          role=button[name="Edit flow"i]
          generic "Labelled panel":
-          text: "Panel text""
+          text: "Panel text"
+         generic "Tooltip":
+          text: "Hint text""
       `)
   })
 })

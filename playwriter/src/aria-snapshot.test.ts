@@ -350,6 +350,25 @@ describe('aria-snapshot', () => {
     }
   }, 30000)
 
+  it('keeps snapshot of focusable containers the same when they take focus', async () => {
+    const html = `<!doctype html>
+      <div id="plain" tabindex="0"><span>Flow alpha</span> <button>Edit</button></div>
+      <div id="titled" tabindex="0" title="Tooltip"><span>Hint text</span> <button>Act</button></div>`
+    const htmlServer = await createHtmlServer({ htmlByPath: { '/': html } })
+    try {
+      await page.goto(htmlServer.baseUrl, { waitUntil: 'domcontentloaded' })
+      const unfocused = (await getAriaSnapshot({ page })).snapshot
+      expect(unfocused).toContain('text: "Flow alpha"')
+      expect(unfocused).toContain('generic "Tooltip":')
+      for (const id of ['plain', 'titled']) {
+        await page.locator(`#${id}`).focus()
+        expect((await getAriaSnapshot({ page })).snapshot).toBe(unfocused)
+      }
+    } finally {
+      await htmlServer.close()
+    }
+  }, 30000)
+
   it('numbers role locators like Playwright when open shadow DOM comes first', async () => {
     const html = `<!doctype html><div id="host"></div><button data-where="light">Save</button>
       <script>document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<button data-where="shadow">Save</button>'</script>`
