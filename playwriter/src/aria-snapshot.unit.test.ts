@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { Protocol } from 'devtools-protocol'
 import {
   buildRawSnapshotTree,
+  buildRoleLocatorMatches,
   buildSnapshotLines,
   filterFullSnapshotTree,
   filterInteractiveSnapshotTree,
@@ -751,6 +752,38 @@ describe('aria-snapshot tree filters', () => {
         - [expanded] role=button[name="Menu"i]
         - [selected] role=tab[name="Profile"i]
         - listitem "Collapsed""
+    `)
+  })
+})
+
+describe('role locator nth', () => {
+  const axNodes: Protocol.Accessibility.AXNode[] = [
+    { nodeId: '1', ignored: false, role: roleValue('RootWebArea'), childIds: ['2', '3', '4', '5', '6', '7'] },
+    { nodeId: '2', ignored: false, role: roleValue('button'), name: nameValue('Home'), backendDOMNodeId: 2 as Protocol.DOM.BackendNodeId },
+    { nodeId: '3', ignored: true, role: roleValue('button'), name: nameValue('Hidden'), backendDOMNodeId: 3 as Protocol.DOM.BackendNodeId },
+    { nodeId: '4', ignored: false, role: roleValue('button'), name: nameValue('save'), backendDOMNodeId: 4 as Protocol.DOM.BackendNodeId },
+    { nodeId: '5', ignored: false, role: roleValue('region'), name: nameValue('Panel'), backendDOMNodeId: 5 as Protocol.DOM.BackendNodeId, childIds: ['6', '7'] },
+    { nodeId: '6', ignored: false, role: roleValue('button'), name: nameValue('Save'), backendDOMNodeId: 6 as Protocol.DOM.BackendNodeId },
+    { nodeId: '7', ignored: false, role: roleValue('button'), backendDOMNodeId: 7 as Protocol.DOM.BackendNodeId },
+  ]
+  const axById = new Map(axNodes.map((node) => [node.nodeId, node]))
+  const render = (rootNodeId: string) => {
+    const rawTree = buildRawSnapshotTree({ nodeId: rootNodeId, axById, isNodeInScope: () => true })!
+    const filtered = filterFullSnapshotTree({
+      node: rawTree,
+      ancestorNames: [],
+      domByBackendId: new Map(),
+      createRefForNode: () => null,
+    })
+    const roleLocatorMatches = buildRoleLocatorMatches({ rootNodeId: '1', axById, excludedBackendIds: new Set() })
+    return finalizeSnapshotOutput(buildSnapshotLines(filtered.nodes), filtered.nodes, new Map(), roleLocatorMatches).snapshot
+  }
+
+  it('counts unnamed role locators against every element of that role in the frame', () => {
+    expect(render('5')).toMatchInlineSnapshot(`
+      "- region "Panel":
+        - role=button[name="Save"i] >> nth=1
+        - role=button >> nth=3"
     `)
   })
 })

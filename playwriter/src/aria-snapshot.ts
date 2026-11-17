@@ -408,12 +408,15 @@ export function getAxState(node: Protocol.Accessibility.AXNode): string | undefi
 export type SnapshotLine = {
   text: string
   baseLocator?: string
+  backendNodeId?: Protocol.DOM.BackendNodeId
   hasChildren?: boolean
   role?: string
   name?: string
   state?: string
   indent?: number
 }
+
+export type RoleLocatorMatches = Map<string, Protocol.DOM.BackendNodeId[]>
 
 export type SnapshotNode = {
   role: string
@@ -433,6 +436,7 @@ function buildSnapshotLine({
   name,
   state,
   baseLocator,
+  backendNodeId,
   indent,
   hasChildren,
 }: {
@@ -440,6 +444,7 @@ function buildSnapshotLine({
   name: string
   state?: string
   baseLocator?: string
+  backendNodeId?: Protocol.DOM.BackendNodeId
   indent: number
   hasChildren: boolean
 }): SnapshotLine {
@@ -452,7 +457,7 @@ function buildSnapshotLine({
   if (state) {
     text += ` ${state}`
   }
-  return { text, baseLocator, hasChildren, role, name, state, indent }
+  return { text, baseLocator, backendNodeId, hasChildren, role, name, state, indent }
 }
 
 function buildTextLine(text: string, indent: number): SnapshotLine {
@@ -472,6 +477,7 @@ export function buildSnapshotLines(nodes: SnapshotNode[], indent = 0): SnapshotL
             name: node.name,
             state: node.state,
             baseLocator: node.baseLocator,
+            backendNodeId: node.backendNodeId,
             indent: nodeIndent,
             hasChildren: node.children.length > 0,
           })
@@ -785,10 +791,48 @@ function locatorIdentity(locator: string): string {
   return locator.startsWith('role=') ? locator.toUpperCase() : locator
 }
 
+export function buildRoleLocatorMatches(options: {
+  rootNodeId: Protocol.Accessibility.AXNodeId
+  axById: Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>
+  excludedBackendIds: Set<Protocol.DOM.BackendNodeId>
+}): RoleLocatorMatches {
+  const matches: RoleLocatorMatches = new Map()
+  const add = (locator: string, backendNodeId: Protocol.DOM.BackendNodeId) => {
+    const key = locatorIdentity(locator)
+    const list = matches.get(key)
+    if (list) {
+      list.push(backendNodeId)
+    } else {
+      matches.set(key, [backendNodeId])
+    }
+  }
+  const visit = (nodeId: Protocol.Accessibility.AXNodeId) => {
+    const node = options.axById.get(nodeId)
+    if (!node) {
+      return
+    }
+    const backendNodeId = node.backendDOMNodeId
+    if (!node.ignored && backendNodeId != null && !options.excludedBackendIds.has(backendNodeId)) {
+      const role = getAxRole(node)
+      const name = getAxValueString(node.name).trim()
+      add(buildBaseLocator({ role, name: '', stable: null }), backendNodeId)
+      if (name) {
+        add(buildBaseLocator({ role, name, stable: null }), backendNodeId)
+      }
+    }
+    for (const childId of node.childIds ?? []) {
+      visit(childId)
+    }
+  }
+  visit(options.rootNodeId)
+  return matches
+}
+
 export function finalizeSnapshotOutput(
   lines: SnapshotLine[],
   nodes: SnapshotNode[],
   shortRefMap: Map<string, string>,
+  roleLocatorMatches?: RoleLocatorMatches,
 ): { snapshot: string; tree: AriaSnapshotNode[] } {
   const locatorCounts = lines.reduce<Map<string, number>>((acc, line) => {
     if (!line.baseLocator) {
@@ -808,6 +852,13 @@ export function finalizeSnapshotOutput(
     const count = locatorCounts.get(key) ?? 0
     const index = locatorIndices.get(key) ?? 0
     locatorIndices.set(key, index + 1)
+    // Playwright resolves role locators against the whole frame, not against the lines of this snapshot
+    const frameMatches = line.backendNodeId != null ? roleLocatorMatches?.get(key) : undefined
+    const frameIndex = frameMatches && line.backendNodeId != null ? frameMatches.indexOf(line.backendNodeId) : -1
+    if (frameMatches && frameIndex >= 0) {
+      acc.push(frameMatches.length > 1 ? `${line.baseLocator} >> nth=${frameIndex}` : line.baseLocator)
+      return acc
+    }
     const locator = count > 1 ? `${line.baseLocator} >> nth=${index}` : line.baseLocator
     acc.push(locator)
     return acc
@@ -1180,13 +1231,7 @@ export async function getAriaSnapshot({
       promotedContentEditableIds.add(domInfo.backendNodeId)
     }
 
-    const findRootAxNodeId = (): Protocol.Accessibility.AXNodeId | null => {
-      if (scopeRootBackendId) {
-        const scoped = axByBackendId.get(scopeRootBackendId)
-        if (scoped) {
-          return scoped.nodeId
-        }
-      }
+    const findFrameRootAxNodeId = (): Protocol.Accessibility.AXNodeId | null => {
       const rootWebArea = axNodes.find((node) => {
         return getAxRole(node) === 'rootwebarea'
       })
@@ -1205,7 +1250,16 @@ export async function getAriaSnapshot({
       return topLevel ? topLevel.nodeId : null
     }
 
-    const rootAxNodeId = findRootAxNodeId()
+    const frameRootAxNodeId = findFrameRootAxNodeId()
+    const scopedRootAxNodeId = scopeRootBackendId ? axByBackendId.get(scopeRootBackendId)?.nodeId : undefined
+    const rootAxNodeId = scopedRootAxNodeId ?? frameRootAxNodeId
+    const roleLocatorMatches = frameRootAxNodeId
+      ? buildRoleLocatorMatches({
+          rootNodeId: frameRootAxNodeId,
+          axById,
+          excludedBackendIds: new Set([...playwriterUiBackendIds, ...promotedContentEditableIds]),
+        })
+      : undefined
 
     const refCounts = new Map<string, number>()
     let fallbackCounter = 0
@@ -1301,7 +1355,7 @@ export async function getAriaSnapshot({
     const snapshotLines = buildSnapshotLines(outputNodes)
 
     const shortRefMap = buildShortRefMap({ refs })
-    const finalized = finalizeSnapshotOutput(snapshotLines, outputNodes, shortRefMap)
+    const finalized = finalizeSnapshotOutput(snapshotLines, outputNodes, shortRefMap, roleLocatorMatches)
     const refsWithShortRef: Array<AriaRef & { selector?: string }> = refs.map((entry) => {
       return {
         ...entry,
