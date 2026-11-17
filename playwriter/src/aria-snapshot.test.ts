@@ -452,6 +452,36 @@ describe('aria-snapshot', () => {
     }
   }, 30000)
 
+  it('keeps ancestor anchors on DOM descendants when aria-owns or slots move AX children', async () => {
+    const html = `<!doctype html>
+      <div role="group" aria-label="Panel" aria-owns="owned"></div>
+      <div id="owned"><button>Edit</button></div>
+      <slot-host><button>Edit</button></slot-host>
+      <button>Edit</button>
+      <script>
+        customElements.define('slot-host', class extends HTMLElement {
+          connectedCallback() {
+            this.attachShadow({ mode: 'open' }).innerHTML = '<div role="group" aria-label="Slotted"><slot></slot></div>'
+          }
+        })
+      </script>`
+    const htmlServer = await createHtmlServer({ htmlByPath: { '/': html } })
+    try {
+      await page.goto(htmlServer.baseUrl, { waitUntil: 'domcontentloaded' })
+      const byNth = await getAriaSnapshot({ page })
+      const anchored = await getAriaSnapshot({ page, duplicateLocator: 'ancestor' })
+      expect(anchored.refs.length).toBe(byNth.refs.length)
+      for (const [index, entry] of anchored.refs.entries()) {
+        const target = page.locator(anchored.getSelectorForRef(entry.ref) ?? '')
+        expect(await target.count()).toBe(1)
+        const expected = await page.locator(byNth.getSelectorForRef(byNth.refs[index]!.ref) ?? '').elementHandle()
+        expect(await target.evaluate((element, other) => element === other, expected)).toBe(true)
+      }
+    } finally {
+      await htmlServer.close()
+    }
+  }, 30000)
+
   it('numbers role locators like Playwright when open shadow DOM comes first', async () => {
     const html = `<!doctype html><div id="host"></div><button data-where="light">Save</button>
       <script>document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<button data-where="shadow">Save</button>'</script>`

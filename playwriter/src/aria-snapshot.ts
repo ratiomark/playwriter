@@ -923,19 +923,42 @@ export function buildRoleLocatorMatches(options: {
   return indexes
 }
 
+/** Parent element of each DOM node, stepping from a shadow root to its host, as Playwright scoping does. */
+export function buildComposedParents(
+  domNodes: Protocol.DOM.Node[],
+): Map<Protocol.DOM.BackendNodeId, Protocol.DOM.BackendNodeId> {
+  const backendByNodeId = new Map<Protocol.DOM.NodeId, Protocol.DOM.BackendNodeId>()
+  for (const node of domNodes) {
+    backendByNodeId.set(node.nodeId, node.backendNodeId)
+  }
+  for (const node of domNodes) {
+    for (const shadowRoot of node.shadowRoots ?? []) {
+      backendByNodeId.set(shadowRoot.nodeId, node.backendNodeId)
+    }
+  }
+  const parents = new Map<Protocol.DOM.BackendNodeId, Protocol.DOM.BackendNodeId>()
+  for (const node of domNodes) {
+    const parent = node.parentId === undefined ? undefined : backendByNodeId.get(node.parentId)
+    if (parent !== undefined) {
+      parents.set(node.backendNodeId, parent)
+    }
+  }
+  return parents
+}
+
 export function buildAncestorAnchors(options: {
   rootNodeId: Protocol.Accessibility.AXNodeId
   axById: Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>
   roleLocatorMatches: RoleLocatorMatches
+  composedParents: Map<Protocol.DOM.BackendNodeId, Protocol.DOM.BackendNodeId>
 }): AncestorAnchors {
-  type Anchor = { nodeId: Protocol.Accessibility.AXNodeId; locator: string }
-  const memberships: Array<{ key: string; backendNodeId: Protocol.DOM.BackendNodeId; anchors: Anchor[] }> = []
-  const visit = (nodeId: Protocol.Accessibility.AXNodeId, anchors: Anchor[]) => {
+  const anchorLocators = new Map<Protocol.DOM.BackendNodeId, string>()
+  const memberships: Array<{ key: string; backendNodeId: Protocol.DOM.BackendNodeId }> = []
+  const visit = (nodeId: Protocol.Accessibility.AXNodeId) => {
     const node = options.axById.get(nodeId)
     if (!node) {
       return
     }
-    let childAnchors = anchors
     const backendNodeId = node.backendDOMNodeId
     if (!node.ignored && backendNodeId != null) {
       const role = getAxRole(node)
@@ -948,37 +971,55 @@ export function buildAncestorAnchors(options: {
         if (!matches?.has(backendNodeId)) {
           continue
         }
-        memberships.push({ key, backendNodeId, anchors })
+        memberships.push({ key, backendNodeId })
         if (locator === namedLocator && matches.size === 1) {
-          childAnchors = [{ nodeId, locator }, ...anchors]
+          anchorLocators.set(backendNodeId, locator)
         }
       }
     }
     for (const childId of node.childIds ?? []) {
-      visit(childId, childAnchors)
+      visit(childId)
     }
   }
-  visit(options.rootNodeId, [])
+  visit(options.rootNodeId)
 
-  const countKey = (anchor: Anchor, key: string) => `${anchor.nodeId}\u0000${key}`
+  // Playwright scopes `anchor >> target` by DOM descent, which differs from AX nesting under aria-owns and slots
+  const anchorsByElement = new Map<Protocol.DOM.BackendNodeId, Protocol.DOM.BackendNodeId[]>()
+  const anchorsOf = (backendNodeId: Protocol.DOM.BackendNodeId) => {
+    const cached = anchorsByElement.get(backendNodeId)
+    if (cached) {
+      return cached
+    }
+    const anchors: Protocol.DOM.BackendNodeId[] = []
+    for (let current = options.composedParents.get(backendNodeId); current !== undefined; current = options.composedParents.get(current)) {
+      if (anchorLocators.has(current)) {
+        anchors.push(current)
+      }
+    }
+    anchorsByElement.set(backendNodeId, anchors)
+    return anchors
+  }
+
+  const countKey = (anchor: Protocol.DOM.BackendNodeId, key: string) => `${anchor}\u0000${key}`
   const counts = new Map<string, number>()
-  for (const { key, anchors } of memberships) {
-    for (const anchor of anchors) {
+  for (const { key, backendNodeId } of memberships) {
+    for (const anchor of anchorsOf(backendNodeId)) {
       counts.set(countKey(anchor, key), (counts.get(countKey(anchor, key)) ?? 0) + 1)
     }
   }
 
   const result: AncestorAnchors = new Map()
-  for (const { key, backendNodeId, anchors } of memberships) {
+  for (const { key, backendNodeId } of memberships) {
     if ((options.roleLocatorMatches.get(key)?.size ?? 0) < 2) {
       continue
     }
-    const anchor = anchors.find((candidate) => counts.get(countKey(candidate, key)) === 1)
-    if (!anchor) {
+    const anchor = anchorsOf(backendNodeId).find((candidate) => counts.get(countKey(candidate, key)) === 1)
+    const anchorLocator = anchor === undefined ? undefined : anchorLocators.get(anchor)
+    if (!anchorLocator) {
       continue
     }
     const byElement = result.get(key) ?? new Map<Protocol.DOM.BackendNodeId, string>()
-    byElement.set(backendNodeId, anchor.locator)
+    byElement.set(backendNodeId, anchorLocator)
     result.set(key, byElement)
   }
   return result
@@ -1542,7 +1583,12 @@ export async function getAriaSnapshot({
       duplicateLocator !== 'nth' && roleLocatorMatches && frameRootAxNodeId
         ? {
             style: duplicateLocator,
-            anchors: buildAncestorAnchors({ rootNodeId: frameRootAxNodeId, axById, roleLocatorMatches }),
+            anchors: buildAncestorAnchors({
+              rootNodeId: frameRootAxNodeId,
+              axById,
+              roleLocatorMatches,
+              composedParents: buildComposedParents(domNodes),
+            }),
           }
         : undefined
     const finalized = finalizeSnapshotOutput(
