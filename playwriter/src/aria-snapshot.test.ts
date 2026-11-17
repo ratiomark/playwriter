@@ -383,6 +383,36 @@ describe('aria-snapshot', () => {
     }
   }, 30000)
 
+  it('gives file inputs locators that Playwright resolves to the same input', async () => {
+    const inputs = {
+      plain: '<input type="file">',
+      title: '<input type="file" title="Upload avatar">',
+      labelledby: '<span id="lb">Report file</span><input type="file" aria-labelledby="lb">',
+      placeholder: '<input type="file" placeholder="Pick one">',
+      multiple: '<input type="file" multiple>',
+      directory: '<input type="file" webkitdirectory>',
+      label: '<label>Avatar <input type="file"></label>',
+    }
+    const html = `<!doctype html>${Object.entries(inputs)
+      .map(([name, input]) => `<section aria-label="${name}">${input}</section>`)
+      .join('')}`
+    const htmlServer = await createHtmlServer({ htmlByPath: { '/': html } })
+    try {
+      await page.goto(htmlServer.baseUrl, { waitUntil: 'domcontentloaded' })
+      const result = await getAriaSnapshot({ page })
+      const resolved = await Promise.all(
+        result.refs.map(async (entry) => {
+          const target = page.locator(result.getSelectorForRef(entry.ref)!)
+          expect(await target.count()).toBe(1)
+          return target.evaluate((element) => element.closest('section')?.getAttribute('aria-label'))
+        }),
+      )
+      expect(resolved).toEqual(Object.keys(inputs))
+    } finally {
+      await htmlServer.close()
+    }
+  }, 30000)
+
   it('numbers role locators like Playwright when open shadow DOM comes first', async () => {
     const html = `<!doctype html><div id="host"></div><button data-where="light">Save</button>
       <script>document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<button data-where="shadow">Save</button>'</script>`
